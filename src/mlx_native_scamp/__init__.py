@@ -10,7 +10,10 @@ from .core import (
     selfjoin_sum,
 )
 
+__version__ = "dev"
+
 __all__ = [
+    "__version__",
     "abjoin",
     "abjoin_knn",
     "abjoin_matrix",

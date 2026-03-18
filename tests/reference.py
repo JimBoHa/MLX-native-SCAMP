@@ -86,6 +86,13 @@ def reduce_sum_thresh(dm, thresh):
     return np.sum(dm2, dtype=np.float64, axis=0)
 
 
+def corr_to_euclidean(corr, m):
+    corr = np.asarray(corr, dtype=np.float64)
+    out = np.sqrt(np.maximum(2.0 * m * (1.0 - corr), 0.0)).astype(np.float32)
+    out[corr < -1.0] = np.nan
+    return out
+
+
 def reduce_matrix(dm_orig, rows, cols, self_join):
     dm = np.copy(dm_orig)
     if self_join:

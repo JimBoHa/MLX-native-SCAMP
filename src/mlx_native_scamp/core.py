@@ -9,6 +9,7 @@ import numpy as np
 SENTINEL = -2.0
 FLATNESS_EPSILON = 1e-13
 VALID_PRECISIONS = {"single", "mixed", "double", "ultra"}
+BLOCK_ROWS = 256
 
 
 @dataclass(slots=True)
@@ -19,11 +20,19 @@ class PreparedSeries:
 
 
 def gpu_supported() -> bool:
-    return True
+    try:
+        return mx.default_device() == mx.gpu
+    except Exception:
+        return False
 
 
-def _ensure_1d_array(values: Any, name: str) -> np.ndarray:
-    array = np.asarray(values, dtype=np.float32)
+def _ensure_1d_array(values: Any, name: str) -> Any:
+    if isinstance(values, mx.array):
+        array = values
+        if array.dtype != mx.float32:
+            array = array.astype(mx.float32)
+    else:
+        array = mx.array(values, dtype=mx.float32)
     if array.ndim != 1:
         raise ValueError(f"{name} must be a 1D array")
     return array
@@ -83,7 +92,7 @@ def _sliding_valid_mask(finite_mask: Any, m: int) -> Any:
 
 
 def _prepare_series(values: Any, m: int) -> PreparedSeries:
-    x = mx.array(values, dtype=mx.float32)
+    x = values
     finite = mx.isfinite(x)
     clean = mx.where(finite, x, mx.zeros_like(x))
     windows = _window_view(clean, m)
@@ -133,17 +142,18 @@ def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
         row_valid = mx.take(prepared_b.valid, row_indices, axis=0)
         block = block_b @ prepared_a.windows.T
         valid_mask = row_valid[:, None] & prepared_a.valid[None, :]
-        block = mx.where(valid_mask, block, mx.full(block.shape, SENTINEL, dtype=mx.float32))
+        sentinel_block = mx.full(block.shape, SENTINEL, dtype=mx.float32)
+        block = mx.where(valid_mask, block, sentinel_block)
         if self_join and exclusion > 0:
             diag_mask = mx.abs(row_indices[:, None] - col_indices[None, :]) < exclusion
-            block = mx.where(diag_mask, mx.full(block.shape, SENTINEL, dtype=mx.float32), block)
+            block = mx.where(diag_mask, sentinel_block, block)
         yield row_start, row_end, row_indices, block
 
 
 def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, self_join: bool) -> tuple[np.ndarray, np.ndarray]:
     best_corr = mx.full((prepared_a.subsequences,), SENTINEL, dtype=mx.float32)
     best_idx = mx.full((prepared_a.subsequences,), -1, dtype=mx.int32)
-    for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=256):
+    for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         block_best_corr = mx.max(block, axis=0)
         block_best_idx = mx.argmax(block, axis=0) + row_start
         update = block_best_corr > best_corr
@@ -157,7 +167,7 @@ def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, 
 
 def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, threshold: float, self_join: bool) -> np.ndarray:
     accum = mx.zeros((prepared_a.subsequences,), dtype=mx.float32)
-    for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=256):
+    for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         filtered = mx.where(block > threshold, block, mx.zeros_like(block))
         accum = accum + mx.sum(filtered, axis=0)
     return np.asarray(accum, dtype=np.float64)
@@ -166,27 +176,33 @@ def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSerie
 def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, threshold: float, rows: int, cols: int, self_join: bool) -> np.ndarray:
     row_edges = np.ceil(np.arange(rows + 1) * prepared_b.subsequences / rows).astype(int)
     col_edges = np.ceil(np.arange(cols + 1) * prepared_a.subsequences / cols).astype(int)
-    summary = np.full((rows, cols), SENTINEL, dtype=np.float32)
+    col_ranges = [(int(col_edges[c]), int(col_edges[c + 1])) for c in range(cols)]
+    col_indices = mx.arange(prepared_a.subsequences, dtype=mx.int32)
+    summary = mx.full((rows, cols), SENTINEL, dtype=mx.float32)
 
-    for row_start, row_end, row_indices, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=256):
+    for row_start, row_end, row_indices, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         if self_join:
-            upper_mask = row_indices[:, None] <= mx.arange(prepared_a.subsequences, dtype=mx.int32)[None, :]
+            upper_mask = row_indices[:, None] <= col_indices[None, :]
             block = mx.where(upper_mask, block, mx.full(block.shape, SENTINEL, dtype=mx.float32))
+        block_rows_summary: list[Any] = []
         for r in range(rows):
             rs = int(max(row_start, row_edges[r]))
             re = int(min(row_end, row_edges[r + 1]))
             if rs >= re:
+                block_rows_summary.append(mx.full((cols,), SENTINEL, dtype=mx.float32))
                 continue
             row_slice = block[rs - row_start : re - row_start]
+            block_cols_summary: list[Any] = []
             for c in range(cols):
-                cs = int(col_edges[c])
-                ce = int(col_edges[c + 1])
+                cs, ce = col_ranges[c]
                 if cs >= ce:
+                    block_cols_summary.append(mx.array(SENTINEL, dtype=mx.float32))
                     continue
-                value = float(np.asarray(mx.max(row_slice[:, cs:ce])))
-                if value > summary[r, c]:
-                    summary[r, c] = value
+                block_cols_summary.append(mx.max(row_slice[:, cs:ce]))
+            block_rows_summary.append(mx.stack(block_cols_summary, axis=0))
+        summary = mx.maximum(summary, mx.stack(block_rows_summary, axis=0))
 
+    summary = np.asarray(summary, dtype=np.float32)
     summary[summary < -1.0] = np.nan
     if threshold is not None:
         summary[summary < threshold] = np.nan
@@ -202,7 +218,7 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
     best_corr = mx.full((k, n_cols), SENTINEL, dtype=mx.float32)
     best_idx = mx.full((k, n_cols), -1, dtype=mx.int32)
 
-    for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=256):
+    for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         local_order = _topk_desc_axis0(block, min(k, int(block.shape[0])))
         local_corr = mx.take_along_axis(block, local_order, axis=0)
         local_idx = local_order + row_start
@@ -231,12 +247,12 @@ def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: flo
     series_a = _ensure_1d_array(a, "a")
     if m <= 0:
         raise ValueError("m must be greater than 0")
-    if len(series_a) < m:
+    if int(series_a.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(a)")
 
     has_b = b is not None
     series_b = _ensure_1d_array(b, "b") if has_b else series_a
-    if len(series_b) < m:
+    if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
 
     prepared_a = _prepare_series(series_a, m)

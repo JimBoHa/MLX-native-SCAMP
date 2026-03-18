@@ -1,4 +1,5 @@
 from mlx_native_scamp import (
+    __version__,
     abjoin,
     abjoin_knn,
     abjoin_matrix,
@@ -11,6 +12,7 @@ from mlx_native_scamp import (
 )
 
 __all__ = [
+    "__version__",
     "abjoin",
     "abjoin_knn",
     "abjoin_matrix",

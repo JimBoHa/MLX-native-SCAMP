@@ -2,7 +2,7 @@
 
 `MLX-native-SCAMP` is an Apple Silicon port of SCAMP's Python-facing API built on top of Apple MLX.
 
-The package provides a `pyscamp`-compatible import surface for the most common callable API:
+The package provides an MLX-native `pyscamp`-compatible import surface for the full upstream Python API:
 
 - `gpu_supported`
 - `selfjoin`
@@ -15,6 +15,7 @@ The package provides a `pyscamp`-compatible import surface for the most common c
 - `abjoin_knn`
 
 The implementation is pure Python plus MLX and is meant to be called by other apps without requiring CUDA.
+All nine upstream `pyscamp` callables are implemented in the local MLX engine rather than delegated back to CUDA SCAMP.
 
 ## Install
 
@@ -37,6 +38,7 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
 
 ## Notes
 
-- The compute-heavy matrix profile kernels are MLX-native.
+- The compute-heavy matrix profile kernels are MLX-native on Apple Silicon.
+- Inputs can be NumPy arrays, Python sequences, or MLX arrays.
 - Compatibility kwargs like `gpus`, `threads`, and `precision` are accepted for API compatibility, but CUDA-specific behavior is not reproduced.
 - The implementation currently targets dense 1D numeric arrays.
