@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-native-scamp"
+version = "0.1.0"
+description = "An MLX-native SCAMP-compatible matrix profile library for Apple Silicon."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "JimBoHa" }
+]
+dependencies = [
+  "mlx>=0.15.0",
+  "numpy>=1.26.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/JimBoHa/MLX-native-SCAMP"
+Repository = "https://github.com/JimBoHa/MLX-native-SCAMP"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
