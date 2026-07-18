@@ -102,6 +102,21 @@ class PyScampCompatTests(unittest.TestCase):
         matches = mp.abjoin_knn(self.a, self.b, self.m, 3, threshold=0.2, pearson=True)
         self._assert_knn_matches_reference(matches, self.dm_ab, 0.2)
 
+    def test_knn_neighbor_count_must_be_a_positive_integer(self):
+        for call in (
+            lambda k: mp.selfjoin_knn(self.a, self.m, k),
+            lambda k: mp.abjoin_knn(self.a, self.b, self.m, k),
+        ):
+            with self.subTest(join=call):
+                matches = call(np.int64(2))
+                self.assertIsInstance(matches, list)
+                for invalid in (2.5, "2", None):
+                    with self.subTest(invalid=invalid), self.assertRaisesRegex(TypeError, "integer"):
+                        call(invalid)
+                for invalid in (0, -1):
+                    with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "greater than 0"):
+                        call(invalid)
+
     def test_nan_windows_are_excluded(self):
         arr = self.a.copy()
         arr[10] = np.nan

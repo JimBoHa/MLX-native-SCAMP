@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
 from typing import Any
 
@@ -244,6 +245,14 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
 
 
 def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: float = 0.0, mheight: int = 50, mwidth: int = 50, profile: str, k: int | None = None):
+    if profile == "knn":
+        try:
+            k = operator.index(k)
+        except TypeError:
+            raise TypeError("k must be an integer") from None
+        if k <= 0:
+            raise ValueError("k must be greater than 0")
+
     series_a = _ensure_1d_array(a, "a")
     if m <= 0:
         raise ValueError("m must be greater than 0")
@@ -266,8 +275,6 @@ def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: flo
     if profile == "matrix":
         return _matrix_summary(prepared_a, prepared_b, m, pearson, threshold, mheight, mwidth, self_join)
     if profile == "knn":
-        if k is None or k <= 0:
-            raise ValueError("k must be greater than 0")
         return _knn_profile(prepared_a, prepared_b, m, k, threshold, pearson, self_join)
     raise ValueError(f"Unknown profile type: {profile}")
 
