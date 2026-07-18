@@ -275,6 +275,56 @@ def _best_match_profile(
     return _convert_profile_output(corr_np, m, pearson), idx_np
 
 
+def _bidirectional_best_match_profile(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    pearson: bool,
+    use_metal_kernel: bool,
+) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+    if use_metal_kernel:
+        from ._metal_1nn import bidirectional_best_match
+
+        corr_a, idx_a, corr_b, idx_b = bidirectional_best_match(
+            prepared_a, prepared_b, m
+        )
+    else:
+        best_corr_a = mx.full(
+            (prepared_a.subsequences,),
+            SENTINEL,
+            dtype=prepared_a.windows.dtype,
+        )
+        best_idx_a = mx.full((prepared_a.subsequences,), -1, dtype=mx.int32)
+        corr_b_chunks: list[Any] = []
+        idx_b_chunks: list[Any] = []
+        for row_start, _, _, block in _iterate_blocks(
+            prepared_a,
+            prepared_b,
+            m,
+            self_join=False,
+            block_rows=BLOCK_ROWS,
+        ):
+            block_best_corr = mx.max(block, axis=0)
+            block_best_idx = mx.argmax(block, axis=0) + row_start
+            update = block_best_corr > best_corr_a
+            best_corr_a = mx.where(update, block_best_corr, best_corr_a)
+            best_idx_a = mx.where(update, block_best_idx, best_idx_a)
+            corr_b_chunks.append(mx.max(block, axis=1))
+            idx_b_chunks.append(mx.argmax(block, axis=1))
+
+        corr_a = np.asarray(best_corr_a, dtype=np.float32)
+        idx_a = np.asarray(best_idx_a, dtype=np.int32)
+        corr_b = np.asarray(mx.concatenate(corr_b_chunks), dtype=np.float32)
+        idx_b = np.asarray(mx.concatenate(idx_b_chunks), dtype=np.int32)
+        idx_a[corr_a < -1.0] = -1
+        idx_b[corr_b < -1.0] = -1
+
+    return (
+        (_convert_profile_output(corr_a, m, pearson), idx_a),
+        (_convert_profile_output(corr_b, m, pearson), idx_b),
+    )
+
+
 def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, threshold: float, self_join: bool) -> np.ndarray:
     accum = mx.zeros((prepared_a.subsequences,), dtype=prepared_a.windows.dtype)
     for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
@@ -390,12 +440,22 @@ def _run_profile(
     prepared_b = _prepare_series(series_b, m)
     self_join = not has_b
 
-    if profile == "1nn":
+    if profile in {"1nn", "1nn_bidirectional"}:
         use_metal_1nn = (
             use_metal_1nn
             and float32_sources
             and _metal_recurrence_is_safe(prepared_a, prepared_b, m)
         )
+        if profile == "1nn_bidirectional":
+            if not has_b:
+                raise ValueError("bidirectional profiles require an AB-join")
+            return _bidirectional_best_match_profile(
+                prepared_a,
+                prepared_b,
+                m,
+                pearson,
+                use_metal_1nn,
+            )
         return _best_match_profile(
             prepared_a,
             prepared_b,
@@ -486,6 +546,25 @@ def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarra
         m,
         pearson=params["pearson"],
         profile="1nn",
+    )
+
+
+def abjoin_bidirectional(
+    a: Any,
+    b: Any,
+    m: int,
+    **kwargs: Any,
+) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+    """Compute indexed AB-join profiles for both distance-matrix axes."""
+
+    params = _parse_common_kwargs(kwargs)
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        profile="1nn_bidirectional",
     )
 
 
