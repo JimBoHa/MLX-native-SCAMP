@@ -164,6 +164,7 @@ def best_match(
     prepared_b: Any,
     m: int,
     self_join: bool,
+    threadgroup_width: int = 256,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute a float32 1NN profile with SCAMP's diagonal recurrence."""
 
@@ -191,7 +192,7 @@ def best_match(
         prepared_b.recurrence_dg,
         config,
     ]
-    threadgroup_width = min(256, diagonal_count)
+    threadgroup_width = min(threadgroup_width, diagonal_count)
     best = _PROFILE_KERNEL(
         inputs=inputs,
         output_shapes=[(n_a,)],

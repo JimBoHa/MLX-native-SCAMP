@@ -7,10 +7,18 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from ._autotune import (
+    DEFAULT_BLOCK_ROWS,
+    DEFAULT_THREADGROUP_WIDTH,
+    TuningConfig,
+    autotune,
+    load_tuning,
+)
+
 SENTINEL = -2.0
 FLATNESS_EPSILON = 1e-13
 VALID_PRECISIONS = {"single", "double", "ultra"}
-BLOCK_ROWS = 256
+BLOCK_ROWS = DEFAULT_BLOCK_ROWS
 
 
 @dataclass(slots=True)
@@ -252,18 +260,28 @@ def _best_match_profile(
     pearson: bool,
     self_join: bool,
     use_metal_kernel: bool,
+    block_rows: int,
+    metal_threadgroup_width: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     if use_metal_kernel:
         from ._metal_1nn import best_match
 
-        corr_np, idx_np = best_match(prepared_a, prepared_b, m, self_join)
+        corr_np, idx_np = best_match(
+            prepared_a,
+            prepared_b,
+            m,
+            self_join,
+            threadgroup_width=metal_threadgroup_width,
+        )
         return _convert_profile_output(corr_np, m, pearson), idx_np
 
     best_corr = mx.full(
         (prepared_a.subsequences,), SENTINEL, dtype=prepared_a.windows.dtype
     )
     best_idx = mx.full((prepared_a.subsequences,), -1, dtype=mx.int32)
-    for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
+    for row_start, _, _, block in _iterate_blocks(
+        prepared_a, prepared_b, m, self_join, block_rows=block_rows
+    ):
         block_best_corr = mx.max(block, axis=0)
         block_best_idx = mx.argmax(block, axis=0) + row_start
         update = block_best_corr > best_corr
@@ -275,22 +293,43 @@ def _best_match_profile(
     return _convert_profile_output(corr_np, m, pearson), idx_np
 
 
-def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, threshold: float, self_join: bool) -> np.ndarray:
+def _sum_threshold_profile(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    threshold: float,
+    self_join: bool,
+    block_rows: int,
+) -> np.ndarray:
     accum = mx.zeros((prepared_a.subsequences,), dtype=prepared_a.windows.dtype)
-    for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
+    for _, _, _, block in _iterate_blocks(
+        prepared_a, prepared_b, m, self_join, block_rows=block_rows
+    ):
         filtered = mx.where(block > threshold, block, mx.zeros_like(block))
         accum = accum + mx.sum(filtered, axis=0)
     return np.asarray(accum, dtype=np.float64)
 
 
-def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, threshold: float, rows: int, cols: int, self_join: bool) -> np.ndarray:
+def _matrix_summary(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    pearson: bool,
+    threshold: float,
+    rows: int,
+    cols: int,
+    self_join: bool,
+    block_rows: int,
+) -> np.ndarray:
     row_edges = np.ceil(np.arange(rows + 1) * prepared_b.subsequences / rows).astype(int)
     col_edges = np.ceil(np.arange(cols + 1) * prepared_a.subsequences / cols).astype(int)
     col_ranges = [(int(col_edges[c]), int(col_edges[c + 1])) for c in range(cols)]
     col_indices = mx.arange(prepared_a.subsequences, dtype=mx.int32)
     summary = mx.full((rows, cols), SENTINEL, dtype=prepared_a.windows.dtype)
 
-    for row_start, row_end, row_indices, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
+    for row_start, row_end, row_indices, block in _iterate_blocks(
+        prepared_a, prepared_b, m, self_join, block_rows=block_rows
+    ):
         if self_join:
             upper_mask = row_indices[:, None] <= col_indices[None, :]
             block = mx.where(upper_mask, block, mx.full(block.shape, SENTINEL, dtype=block.dtype))
@@ -323,12 +362,23 @@ def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
     return out
 
 
-def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, k: int, threshold: float, pearson: bool, self_join: bool) -> list[tuple[int, int, float]]:
+def _knn_profile(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    k: int,
+    threshold: float,
+    pearson: bool,
+    self_join: bool,
+    block_rows: int,
+) -> list[tuple[int, int, float]]:
     n_cols = prepared_a.subsequences
     best_corr = mx.full((k, n_cols), SENTINEL, dtype=prepared_a.windows.dtype)
     best_idx = mx.full((k, n_cols), -1, dtype=mx.int32)
 
-    for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
+    for row_start, _, _, block in _iterate_blocks(
+        prepared_a, prepared_b, m, self_join, block_rows=block_rows
+    ):
         local_order = _topk_desc_axis0(block, min(k, int(block.shape[0])))
         local_corr = mx.take_along_axis(block, local_order, axis=0)
         local_idx = local_order + row_start
@@ -366,6 +416,8 @@ def _run_profile(
     profile: str,
     k: int | None = None,
     use_metal_1nn: bool = False,
+    block_rows: int = BLOCK_ROWS,
+    metal_threadgroup_width: int = DEFAULT_THREADGROUP_WIDTH,
 ):
     has_b = b is not None
     float32_sources = _is_float32_input(a) and (
@@ -403,9 +455,13 @@ def _run_profile(
             pearson,
             self_join,
             use_metal_1nn,
+            block_rows,
+            metal_threadgroup_width,
         )
     if profile == "sum":
-        return _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
+        return _sum_threshold_profile(
+            prepared_a, prepared_b, m, threshold, self_join, block_rows
+        )
     if profile == "matrix":
         return _matrix_summary(
             prepared_a,
@@ -416,19 +472,44 @@ def _run_profile(
             mheight,
             mwidth,
             self_join,
+            block_rows,
         )
     if profile == "knn":
         if k is None or k <= 0:
             raise ValueError("k must be greater than 0")
         return _knn_profile(
-            prepared_a, prepared_b, m, k, threshold, pearson, self_join
+            prepared_a,
+            prepared_b,
+            m,
+            k,
+            threshold,
+            pearson,
+            self_join,
+            block_rows,
         )
     raise ValueError(f"Unknown profile type: {profile}")
 
 
-def _resolve_execution_stream(params: dict[str, Any]) -> Any | None:
+def _resolve_execution_stream(
+    params: dict[str, Any],
+    tuning: TuningConfig | None = None,
+    profile: str = "1nn",
+) -> Any | None:
     execution_stream = _select_execution_stream(params["gpus"], params["threads"])
     if params["precision"] == "single":
+        if (
+            tuning is not None
+            and params["gpus"] is None
+            and params["threads"] == 0
+        ):
+            preferred_backend = (
+                tuning.preferred_1nn_backend
+                if profile == "1nn"
+                else tuning.preferred_portable_backend
+            )
+            if preferred_backend == "metal" and mx.metal.is_available():
+                return mx.default_stream(mx.gpu)
+            return mx.default_stream(mx.cpu)
         return execution_stream
 
     if execution_stream is not None and execution_stream.device == mx.gpu:
@@ -440,7 +521,10 @@ def _resolve_execution_stream(params: dict[str, Any]) -> Any | None:
 
 
 def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
-    execution_stream = _resolve_execution_stream(params)
+    tuning = load_tuning()
+    execution_stream = _resolve_execution_stream(
+        params, tuning, profile=str(kwargs.get("profile", "1nn"))
+    )
     execution_device = (
         mx.default_device()
         if execution_stream is None
@@ -451,6 +535,15 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
         and execution_device == mx.gpu
         and mx.metal.is_available()
     )
+    if tuning is None:
+        block_rows = BLOCK_ROWS
+        metal_threadgroup_width = DEFAULT_THREADGROUP_WIDTH
+    elif execution_device == mx.gpu:
+        block_rows = tuning.metal_block_rows
+        metal_threadgroup_width = tuning.metal_threadgroup_width
+    else:
+        block_rows = tuning.cpu_block_rows
+        metal_threadgroup_width = DEFAULT_THREADGROUP_WIDTH
     stream_context = (
         nullcontext()
         if execution_stream is None
@@ -461,7 +554,39 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
             *args,
             precision=params["precision"],
             use_metal_1nn=use_metal_1nn,
+            block_rows=block_rows,
+            metal_threadgroup_width=metal_threadgroup_width,
             **kwargs,
+        )
+
+
+def _autotune_benchmark_candidate(
+    workload: str,
+    device: str,
+    block_rows: int,
+    threadgroup_width: int,
+    series: np.ndarray,
+    window: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if workload not in {"portable_1nn", "metal_1nn"}:
+        raise ValueError(f"Unknown autotune workload: {workload}")
+    if device not in {"cpu", "metal"}:
+        raise ValueError(f"Unknown autotune device: {device}")
+    if workload == "metal_1nn" and device != "metal":
+        raise ValueError("The Metal diagonal workload requires device='metal'")
+
+    execution_device = mx.cpu if device == "cpu" else mx.gpu
+    with mx.stream(execution_device):
+        return _run_profile(
+            series,
+            None,
+            window,
+            pearson=True,
+            precision="single",
+            profile="1nn",
+            use_metal_1nn=workload == "metal_1nn",
+            block_rows=block_rows,
+            metal_threadgroup_width=threadgroup_width,
         )
 
 

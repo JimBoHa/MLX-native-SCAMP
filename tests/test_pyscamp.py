@@ -11,6 +11,7 @@ from reference import corr_to_euclidean, distance_matrix, reduce_1nn_index, redu
 
 
 EXPECTED_PUBLIC_CALLABLES = {
+    "autotune",
     "gpu_supported",
     "selfjoin",
     "abjoin",
