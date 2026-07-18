@@ -18,6 +18,11 @@ class PreparedSeries:
     windows: Any
     valid: Any
     subsequences: int
+    recurrence_clean: Any | None = None
+    recurrence_means: Any | None = None
+    recurrence_inv_norm: Any | None = None
+    recurrence_df: Any | None = None
+    recurrence_dg: Any | None = None
 
 
 def gpu_supported() -> bool:
@@ -133,7 +138,66 @@ def _prepare_series(values: Any, m: int) -> PreparedSeries:
     valid = _sliding_valid_mask(finite, m) & (norms_sq > FLATNESS_EPSILON)
     inv_norm = mx.where(valid, 1.0 / mx.sqrt(mx.maximum(norms_sq, FLATNESS_EPSILON)), 0.0)
     normalized = centered * inv_norm[:, None]
-    return PreparedSeries(windows=normalized, valid=valid, subsequences=int(normalized.shape[0]))
+    means = means[:, 0]
+    df = mx.concatenate(
+        [(clean[m:] - clean[:-m]) * 0.5, mx.zeros((1,), dtype=clean.dtype)]
+    )
+    dg = mx.concatenate(
+        [
+            (clean[m:] - means[1:]) + (clean[:-m] - means[:-1]),
+            mx.zeros((1,), dtype=clean.dtype),
+        ]
+    )
+    return PreparedSeries(
+        windows=normalized,
+        valid=valid,
+        subsequences=int(normalized.shape[0]),
+        recurrence_clean=clean,
+        recurrence_means=means,
+        recurrence_inv_norm=inv_norm,
+        recurrence_df=df,
+        recurrence_dg=dg,
+    )
+
+
+def _is_float32_input(values: Any) -> bool:
+    if isinstance(values, mx.array):
+        return values.dtype == mx.float32
+    try:
+        return np.asarray(values).dtype == np.dtype(np.float32)
+    except (TypeError, ValueError):
+        return False
+
+
+def _metal_recurrence_is_safe(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+) -> bool:
+    recurrence_arrays = (
+        prepared_a.recurrence_clean,
+        prepared_a.recurrence_means,
+        prepared_a.recurrence_inv_norm,
+        prepared_a.recurrence_df,
+        prepared_a.recurrence_dg,
+        prepared_b.recurrence_clean,
+        prepared_b.recurrence_means,
+        prepared_b.recurrence_inv_norm,
+        prepared_b.recurrence_df,
+        prepared_b.recurrence_dg,
+    )
+    if any(value is None or value.dtype != mx.float32 for value in recurrence_arrays):
+        return False
+
+    max_a = float(np.asarray(mx.max(mx.abs(prepared_a.recurrence_clean))))
+    max_b = float(np.asarray(mx.max(mx.abs(prepared_b.recurrence_clean))))
+    longest_diagonal = max(prepared_a.subsequences, prepared_b.subsequences)
+    conservative_bound = (
+        8.0 * (m + 2 * longest_diagonal) * max_a * max_b
+    )
+    return np.isfinite(conservative_bound) and (
+        conservative_bound <= float(np.finfo(np.float32).max)
+    )
 
 
 def _topk_desc_axis0(values: Any, k: int) -> Any:
@@ -181,8 +245,23 @@ def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
         yield row_start, row_end, row_indices, block
 
 
-def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, self_join: bool) -> tuple[np.ndarray, np.ndarray]:
-    best_corr = mx.full((prepared_a.subsequences,), SENTINEL, dtype=prepared_a.windows.dtype)
+def _best_match_profile(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    pearson: bool,
+    self_join: bool,
+    use_metal_kernel: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    if use_metal_kernel:
+        from ._metal_1nn import best_match
+
+        corr_np, idx_np = best_match(prepared_a, prepared_b, m, self_join)
+        return _convert_profile_output(corr_np, m, pearson), idx_np
+
+    best_corr = mx.full(
+        (prepared_a.subsequences,), SENTINEL, dtype=prepared_a.windows.dtype
+    )
     best_idx = mx.full((prepared_a.subsequences,), -1, dtype=mx.int32)
     for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         block_best_corr = mx.max(block, axis=0)
@@ -286,7 +365,12 @@ def _run_profile(
     mwidth: int = 50,
     profile: str,
     k: int | None = None,
+    use_metal_1nn: bool = False,
 ):
+    has_b = b is not None
+    float32_sources = _is_float32_input(a) and (
+        not has_b or _is_float32_input(b)
+    )
     compute_dtype = mx.float32 if precision == "single" else mx.float64
     # Metal does not provide native float64. The execution resolver places
     # double and ultra on MLX CPU; single can stay on the selected Metal GPU.
@@ -298,7 +382,6 @@ def _run_profile(
     if int(series_a.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(a)")
 
-    has_b = b is not None
     series_b = _ensure_1d_array(b, "b", compute_dtype) if has_b else series_a
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
@@ -308,7 +391,19 @@ def _run_profile(
     self_join = not has_b
 
     if profile == "1nn":
-        return _best_match_profile(prepared_a, prepared_b, m, pearson, self_join)
+        use_metal_1nn = (
+            use_metal_1nn
+            and float32_sources
+            and _metal_recurrence_is_safe(prepared_a, prepared_b, m)
+        )
+        return _best_match_profile(
+            prepared_a,
+            prepared_b,
+            m,
+            pearson,
+            self_join,
+            use_metal_1nn,
+        )
     if profile == "sum":
         return _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
     if profile == "matrix":
@@ -346,13 +441,28 @@ def _resolve_execution_stream(params: dict[str, Any]) -> Any | None:
 
 def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
     execution_stream = _resolve_execution_stream(params)
+    execution_device = (
+        mx.default_device()
+        if execution_stream is None
+        else execution_stream.device
+    )
+    use_metal_1nn = (
+        params["precision"] == "single"
+        and execution_device == mx.gpu
+        and mx.metal.is_available()
+    )
     stream_context = (
         nullcontext()
         if execution_stream is None
         else mx.stream(execution_stream)
     )
     with stream_context:
-        return _run_profile(*args, precision=params["precision"], **kwargs)
+        return _run_profile(
+            *args,
+            precision=params["precision"],
+            use_metal_1nn=use_metal_1nn,
+            **kwargs,
+        )
 
 
 def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:

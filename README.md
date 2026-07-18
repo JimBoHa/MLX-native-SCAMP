@@ -39,6 +39,17 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 ## Notes
 
 - The compute-heavy matrix profile kernels are MLX-native on Apple Silicon.
+- Single-precision `selfjoin` and `abjoin` use a custom Metal kernel that
+  follows SCAMP's rolling-covariance diagonal algorithm. Other profiles and
+  execution modes use the portable MLX implementation.
+- The diagonal kernel is selected only for native float32 inputs whose raw
+  rolling covariance is safe in float32. Non-float32 and extreme-magnitude
+  inputs retain the normalized-window path so precision and overflow fixes can
+  be applied there without being bypassed.
+- The 1NN kernel keeps profile output state linear in the series length, but it
+  currently walks each diagonal in one Metal dispatch. Checkpointed/tiled
+  dispatch—and integration with the separate `max_tile_size` work—remains a
+  follow-up for exceptionally long joins.
 - Inputs can be NumPy arrays, Python sequences, or MLX arrays.
 - `gpus=[]` or a positive `threads` value selects MLX CPU execution; `gpus=[0]`
   selects the Metal GPU. With neither, the current MLX default device is
