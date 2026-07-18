@@ -109,6 +109,35 @@ class PyScampCompatTests(unittest.TestCase):
         self.assertTrue(np.isnan(out_dist[:11]).any())
         self.assertIn(-1, out_idx.tolist())
 
+    def test_normalization_is_stable_for_large_finite_values(self):
+        series = np.array([1e20, 2e20, 3e20], dtype=np.float32)
+
+        out_corr, out_idx = mp.abjoin(series, series, 3, pearson=True)
+        out_dist, dist_idx = mp.abjoin(series, series, 3, pearson=False)
+
+        np.testing.assert_array_equal(out_corr, np.array([1.0], dtype=np.float32))
+        np.testing.assert_array_equal(out_idx, np.array([0], dtype=np.int32))
+        np.testing.assert_array_equal(out_dist, np.array([0.0], dtype=np.float32))
+        np.testing.assert_array_equal(dist_idx, np.array([0], dtype=np.int32))
+
+    def test_scaling_preserves_flat_subsequence_detection(self):
+        series = np.array([1e-8, 2e-8, 3e-8], dtype=np.float32)
+
+        out_corr, out_idx = mp.abjoin(series, series, 3, pearson=True)
+
+        self.assertTrue(np.isnan(out_corr[0]))
+        np.testing.assert_array_equal(out_idx, np.array([-1], dtype=np.int32))
+
+    def test_scaling_is_independent_for_each_window(self):
+        # Upstream SCAMP keeps all three windows valid. A single series-wide
+        # scale makes the first two underflow when the final sample is huge.
+        series = np.array([1.0, 2.0, 3.0, 4.0, 1e38], dtype=np.float32)
+
+        out_corr, out_idx = mp.abjoin(series, series, 3, pearson=True)
+
+        np.testing.assert_allclose(out_corr, np.ones(3, dtype=np.float32), atol=1e-6)
+        np.testing.assert_array_equal(out_idx, np.array([0, 0, 2], dtype=np.int32))
+
     def test_mlx_array_inputs_are_supported(self):
         valid_dist, valid_idx = reduce_1nn_index(self.dm_ab)
         out_dist, out_idx = mp.abjoin(mx.array(self.a), mx.array(self.b), self.m, pearson=True)
