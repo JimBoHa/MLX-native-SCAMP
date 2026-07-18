@@ -50,7 +50,11 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
   is rejected rather than silently ignoring one or claiming SCAMP's
   heterogeneous-worker behavior.
 - `precision="single"` computes in float32 on the selected MLX device (normally Metal).
-- The default `precision="double"` and `precision="ultra"` compute in float64 on the MLX CPU backend because Metal does not support float64.
+- The default `precision="double"` and `precision="ultra"` share a float64
+  MLX CPU implementation because Metal does not support float64. Upstream
+  SCAMP gives `ultra` a separate recurrence; this port computes normalized
+  window dot products directly, so the two modes currently have identical
+  numerical behavior.
 - Explicit `gpus=[0]` requests with `double` or `ultra` are rejected instead of
   silently moving float64 work to CPU.
 - The implementation currently targets dense 1D numeric arrays.

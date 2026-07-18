@@ -288,6 +288,10 @@ def _run_profile(
     k: int | None = None,
 ):
     compute_dtype = mx.float32 if precision == "single" else mx.float64
+    # Metal does not provide native float64. The execution resolver places
+    # double and ultra on MLX CPU; single can stay on the selected Metal GPU.
+    # Upstream's ultra mode changes its sliding recurrence, while this direct
+    # normalized-window implementation uses the same float64 path for both.
     series_a = _ensure_1d_array(a, "a", compute_dtype)
     if m <= 0:
         raise ValueError("m must be greater than 0")
