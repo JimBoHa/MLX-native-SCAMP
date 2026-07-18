@@ -51,7 +51,9 @@ python -m mlx_native_scamp.distributed --backend auto
 The protocol uses compact float32 byte buffers for the single-precision MLX
 path instead of upstream's repeated-double payloads. See
 [Distributed MLX runtime](docs/distributed.md) for coordinator usage, protocol
-details, and the remaining upstream distributed features.
+details, and the remaining upstream distributed features. Non-loopback binds
+require the explicit `--allow-insecure-remote` opt-in while TLS/authentication
+remain follow-up work.
 
 ## Notes
 

@@ -68,6 +68,7 @@ message WorkerCapabilities {
   repeated ProfileKind profile_kinds = 13;
   repeated Precision precisions = 14;
   uint64 max_message_bytes = 15;
+  uint64 max_tile_working_set_bytes = 16;
 }
 
 message WorkerHealth {

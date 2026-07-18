@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import platform
 import unittest
+from unittest import mock
 
 import grpc
 import numpy as np
@@ -16,6 +17,8 @@ from mlx_native_scamp.distributed import (
     messages,
 )
 from mlx_native_scamp.distributed.codec import decode_array, encode_array
+from mlx_native_scamp.distributed.execution import execute_1nn_tile
+from mlx_native_scamp.distributed import runtime
 
 
 def _normalized_windows(values: np.ndarray, window: int) -> np.ndarray:
@@ -73,6 +76,7 @@ class DistributedWorkerTests(unittest.TestCase):
         self.assertEqual("test-mlx-worker", capabilities.worker_id)
         self.assertTrue(capabilities.mlx_version)
         self.assertTrue(capabilities.device_name)
+        self.assertGreater(capabilities.max_tile_working_set_bytes, 0)
         self.assertIn(messages.PROFILE_KIND_1NN_INDEX, capabilities.profile_kinds)
         self.assertEqual([messages.PRECISION_SINGLE], list(capabilities.precisions))
         if platform.system() == "Darwin" and platform.machine() == "arm64":
@@ -223,6 +227,95 @@ class DistributedWorkerTests(unittest.TestCase):
             )
         self.assertEqual(grpc.StatusCode.FAILED_PRECONDITION, caught.exception.code())
         self.assertIn("supports 1", caught.exception.details())
+
+    def test_worker_rejects_a_tile_above_its_working_set_before_execution(self):
+        with WorkerServer(
+            backend="cpu",
+            worker_id="bounded-worker",
+            max_tile_working_set_bytes=1024,
+        ) as server:
+            with WorkerClient(server.target) as client:
+                request = make_tile_request(self.a, self.b, window=self.window)
+                with self.assertRaises(grpc.RpcError) as caught:
+                    client.execute_tile(request)
+        self.assertEqual(grpc.StatusCode.RESOURCE_EXHAUSTED, caught.exception.code())
+        self.assertIn("working set", caught.exception.details())
+
+    def test_uint32_aliasing_cannot_create_a_false_exclusion(self):
+        values = np.arange(12, dtype=np.float32)
+        output = execute_1nn_tile(
+            values,
+            values,
+            4,
+            row_start=2**32,
+            row_stop=2**32 + 9,
+            column_start=0,
+            column_stop=9,
+            exclusion_zone=1,
+            compute_rows=False,
+            compute_columns=True,
+            device=self.server.service.device,
+            series_a_offset=0,
+            series_b_offset=2**32,
+        )
+        np.testing.assert_allclose(output.column_values, np.ones(9), atol=2e-6)
+        self.assertTrue(np.all(output.column_indices >= 2**32))
+
+    def test_client_rejects_mismatched_response_identity(self):
+        request = make_tile_request(self.a, self.b, window=self.window)
+        bad_result = messages.ProfileTileResult(
+            api_version=API_VERSION,
+            request_id="a-different-request",
+        )
+        with mock.patch.object(
+            self.client.stub, "ExecuteProfileTile", return_value=bad_result
+        ):
+            with self.assertRaisesRegex(ValueError, "request_id"):
+                self.client.execute_tile(request)
+
+
+class DistributedValidationTests(unittest.TestCase):
+    def test_reducer_rejects_inconsistent_or_non_correlation_slices(self):
+        cases = (
+            (np.array([np.nan], dtype=np.float32), np.array([0], dtype=np.int64)),
+            (np.array([1.1], dtype=np.float32), np.array([0], dtype=np.int64)),
+            (np.array([0.9], dtype=np.float32), np.array([-1], dtype=np.int64)),
+            (np.array([-2.0], dtype=np.float32), np.array([3], dtype=np.int64)),
+        )
+        for values, indices in cases:
+            with self.subTest(values=values, indices=indices):
+                result = messages.ProfileTileResult(
+                    api_version=API_VERSION,
+                    column_profile=messages.ProfileSlice(
+                        values=encode_array(values), indices=encode_array(indices)
+                    ),
+                )
+                with self.assertRaises(ValueError):
+                    merge_1nn_slices([result], 1)
+
+    def test_non_loopback_worker_requires_explicit_insecure_opt_in(self):
+        with self.assertRaisesRegex(ValueError, "allow_insecure_remote"):
+            WorkerServer(host="0.0.0.0", backend="cpu")
+
+    def test_worker_pool_does_not_retry_permanent_rpc_errors(self):
+        class PermanentError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.INVALID_ARGUMENT
+
+        first = mock.Mock()
+        first.health.return_value = messages.WorkerHealth(
+            state=messages.WORKER_STATE_SERVING
+        )
+        first.execute_tile.side_effect = PermanentError()
+        second = mock.Mock()
+        second.health.return_value = messages.WorkerHealth(
+            state=messages.WORKER_STATE_SERVING
+        )
+        with mock.patch.object(runtime, "WorkerClient", side_effect=[first, second]):
+            pool = runtime.WorkerPool(["first", "second"])
+        with self.assertRaises(PermanentError):
+            pool.execute_tile(messages.ProfileTileRequest())
+        second.execute_tile.assert_not_called()
 
 
 if __name__ == "__main__":

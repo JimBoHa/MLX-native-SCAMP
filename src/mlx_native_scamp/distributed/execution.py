@@ -11,6 +11,23 @@ import numpy as np
 from mlx_native_scamp.core import SENTINEL, _prepare_series
 
 
+MAX_PROFILE_INDEX = int(np.iinfo(np.int64).max)
+
+
+def estimate_1nn_tile_working_set_bytes(
+    row_count: int, column_count: int, window: int
+) -> int:
+    """Conservatively estimate peak bytes for the current dense MLX tile."""
+
+    if row_count <= 0 or column_count <= 0 or window <= 0:
+        raise ValueError("tile dimensions and window must be positive")
+    matrix_cells = row_count * column_count
+    window_cells = (row_count + column_count) * window
+    # The lazy graph may retain the GEMM result, validity/sentinel selections,
+    # and normalized-window intermediates until reduction is evaluated.
+    return matrix_cells * 20 + window_cells * 16 + (row_count + column_count) * 32
+
+
 @dataclass(frozen=True, slots=True)
 class TileExecution:
     """Partial profiles produced by one rectangular similarity tile."""
@@ -52,6 +69,8 @@ def execute_1nn_tile(
         raise ValueError("exclusion_zone cannot be negative")
     if series_a_offset < 0 or series_b_offset < 0:
         raise ValueError("series payload offsets cannot be negative")
+    if row_stop > MAX_PROFILE_INDEX or column_stop > MAX_PROFILE_INDEX:
+        raise ValueError("global profile bounds exceed the signed 64-bit index range")
 
     input_a = np.asarray(series_a)
     input_b = input_a if series_b is None else np.asarray(series_b)
@@ -93,39 +112,62 @@ def execute_1nn_tile(
         tile_b = prepared_b.windows
         block = tile_b @ tile_a.T
         valid = prepared_b.valid[:, None] & prepared_a.valid[None, :]
-        block = mx.where(valid, block, mx.full(block.shape, SENTINEL, dtype=mx.float32))
+        block = mx.where(
+            valid,
+            mx.clip(block, -1.0, 1.0),
+            mx.full(block.shape, SENTINEL, dtype=mx.float32),
+        )
 
         if exclusion_zone:
-            row_indices = mx.arange(row_start, row_stop, dtype=mx.int32)
-            column_indices = mx.arange(column_start, column_stop, dtype=mx.int32)
-            trivial = (
-                mx.abs(row_indices[:, None] - column_indices[None, :]) < exclusion_zone
+            separated = (
+                row_start >= column_stop + exclusion_zone - 1
+                or column_start >= row_stop + exclusion_zone - 1
             )
-            block = mx.where(
-                trivial, mx.full(block.shape, SENTINEL, dtype=mx.float32), block
-            )
+            if not separated:
+                base_delta = row_start - column_start
+                int32 = np.iinfo(np.int32)
+                if not int32.min <= base_delta <= int32.max:
+                    raise ValueError("overlapping tile offset cannot be represented safely")
+                row_indices = mx.arange(row_stop - row_start, dtype=mx.int32)
+                column_indices = mx.arange(
+                    column_stop - column_start, dtype=mx.int32
+                )
+                trivial = (
+                    mx.abs(
+                        row_indices[:, None]
+                        - column_indices[None, :]
+                        + int(base_delta)
+                    )
+                    < exclusion_zone
+                )
+                block = mx.where(
+                    trivial,
+                    mx.full(block.shape, SENTINEL, dtype=mx.float32),
+                    block,
+                )
 
         if compute_columns:
             column_values_mx = mx.max(block, axis=0)
-            column_indices_mx = mx.argmax(block, axis=0).astype(mx.int64) + row_start
-            column_indices_mx = mx.where(column_values_mx < -1.0, -1, column_indices_mx)
+            column_indices_mx = mx.argmax(block, axis=0).astype(mx.int32)
         else:
             column_values_mx = mx.array([], dtype=mx.float32)
             column_indices_mx = mx.array([], dtype=mx.int64)
 
         if compute_rows:
             row_values_mx = mx.max(block, axis=1)
-            row_indices_mx = mx.argmax(block, axis=1).astype(mx.int64) + column_start
-            row_indices_mx = mx.where(row_values_mx < -1.0, -1, row_indices_mx)
+            row_indices_mx = mx.argmax(block, axis=1).astype(mx.int32)
         else:
             row_values_mx = mx.array([], dtype=mx.float32)
             row_indices_mx = mx.array([], dtype=mx.int64)
 
         mx.eval(column_values_mx, column_indices_mx, row_values_mx, row_indices_mx)
 
-    return TileExecution(
-        column_values=np.asarray(column_values_mx, dtype=np.float32),
-        column_indices=np.asarray(column_indices_mx, dtype=np.int64),
-        row_values=np.asarray(row_values_mx, dtype=np.float32),
-        row_indices=np.asarray(row_indices_mx, dtype=np.int64),
-    )
+    column_values = np.asarray(column_values_mx, dtype=np.float32)
+    column_indices = np.asarray(column_indices_mx, dtype=np.int64)
+    column_indices += row_start
+    column_indices[column_values < -1.0] = -1
+    row_values = np.asarray(row_values_mx, dtype=np.float32)
+    row_indices = np.asarray(row_indices_mx, dtype=np.int64)
+    row_indices += column_start
+    row_indices[row_values < -1.0] = -1
+    return TileExecution(column_values, column_indices, row_values, row_indices)

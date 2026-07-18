@@ -45,6 +45,14 @@ def merge_1nn_slices(
             )
         if values.size != indices.size:
             raise ValueError("profile value and index slices have different lengths")
+        valid_correlations = np.isfinite(values) & (values >= -1.0) & (values <= 1.0)
+        sentinels = values == -2.0
+        if not np.all(valid_correlations | sentinels):
+            raise ValueError("1NN profile values must be finite correlations or -2")
+        if np.any(sentinels & (indices != -1)) or np.any(
+            valid_correlations & (indices < 0)
+        ):
+            raise ValueError("1NN profile values and indices are inconsistent")
         start = int(profile.offset)
         stop = start + values.size
         if start < 0 or stop > profile_length:

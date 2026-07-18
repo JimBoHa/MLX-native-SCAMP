@@ -16,7 +16,8 @@ Kubernetes-oriented job server from local Mac deployments.
   incompatible peers fail with `FAILED_PRECONDITION`.
 - Apple Silicon and MLX capability discovery, including Metal/CPU backend,
   MLX version, unified memory, recommended working set, and supported profile
-  and precision modes.
+  and precision modes. Workers also advertise and enforce a conservative
+  per-tile working-set limit before constructing a dense similarity matrix.
 - Worker health and execution counters.
 - A real rectangular 1NN-index tile operation. A is the column dimension and B
   is the row dimension, matching upstream SCAMP's distributed tile convention.
@@ -54,7 +55,15 @@ python -m mlx_native_scamp.distributed --host 127.0.0.1 --port 30078
 `--backend cpu` explicitly selects the MLX CPU device. `--backend metal`
 requires Metal instead of falling back. The default loopback bind is deliberate:
 version 1 uses the same insecure gRPC transport as upstream SCAMP. Do not expose
-it to an untrusted network. TLS and authentication remain future work.
+it to an untrusted network. A non-loopback bind is rejected unless
+`--allow-insecure-remote` is supplied explicitly. TLS and authentication remain
+future work.
+
+The worker derives its default tile limit from one quarter of Apple's reported
+recommended working set (bounded between 64 MiB and 4 GiB), or uses a 1 GiB
+fallback when MLX cannot report memory. Override it with
+`--max-tile-working-set-bytes`; requests over the limit fail with
+`RESOURCE_EXHAUSTED` before MLX allocation.
 
 ## Discover and execute
 
@@ -115,6 +124,12 @@ The following upstream distributed behavior is not claimed yet:
 - streaming or content-addressed input distribution to avoid resending samples
   shared by adjacent tiles;
 - TLS/authentication and deployment tooling for remote Mac fleets.
+
+Version 1's single-precision request builder converts raw samples to float32.
+This matches its advertised compute mode but can erase small variations riding
+on very large offsets before normalization. Integrating the safe double-input
+preprocessing used by the local high-offset path remains required before this
+transport can claim that edge-case parity with upstream SCAMP.
 
 The versioned tile messages and global result offsets are intended to support
 those additions without breaking this worker API.

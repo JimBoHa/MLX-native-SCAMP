@@ -12,6 +12,7 @@ from importlib import import_module
 _RUNTIME_EXPORTS = {
     "API_VERSION",
     "DEFAULT_MAX_MESSAGE_BYTES",
+    "DEFAULT_MAX_TILE_WORKING_SET_BYTES",
     "WorkerClient",
     "WorkerPool",
     "WorkerServer",

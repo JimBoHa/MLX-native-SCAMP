@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import platform
 import socket
 import threading
@@ -26,12 +27,19 @@ import numpy as np
 
 from ._version import API_VERSION
 from .codec import decode_array, encode_array, is_empty_payload
-from .execution import execute_1nn_tile
+from .execution import estimate_1nn_tile_working_set_bytes, execute_1nn_tile
 from .proto import scamp_worker_v1_pb2 as messages
 from .proto import scamp_worker_v1_pb2_grpc as services
 
 
 DEFAULT_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_TILE_WORKING_SET_BYTES = 1024 * 1024 * 1024
+_TRANSIENT_RPC_CODES = {
+    grpc.StatusCode.ABORTED,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+    grpc.StatusCode.RESOURCE_EXHAUSTED,
+    grpc.StatusCode.UNAVAILABLE,
+}
 
 
 def _is_apple_silicon() -> bool:
@@ -53,6 +61,28 @@ def _physical_memory_bytes() -> int:
         return int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
     except (AttributeError, OSError, TypeError, ValueError):  # pragma: no cover
         return 0
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _default_tile_working_set_bytes() -> int:
+    try:
+        device_info = mx.device_info()
+    except Exception:  # pragma: no cover - old MLX fallback
+        device_info = {}
+    available = int(device_info.get("max_recommended_working_set_size", 0))
+    if not available:
+        available = int(device_info.get("memory_size", 0)) or _physical_memory_bytes()
+    if not available:
+        return DEFAULT_MAX_TILE_WORKING_SET_BYTES
+    return max(64 * 1024 * 1024, min(available // 4, 4 * 1024 * 1024 * 1024))
 
 
 def _select_device(backend: str):
@@ -94,10 +124,16 @@ class _WorkerService(services.ScampWorkerServicer):
         backend: str,
         max_message_bytes: int,
         max_concurrent_tiles: int,
+        max_tile_working_set_bytes: int | None,
     ) -> None:
         self.worker_id = worker_id
         self.device, self.backend = _select_device(backend)
         self.max_message_bytes = max_message_bytes
+        self.max_tile_working_set_bytes = (
+            _default_tile_working_set_bytes()
+            if max_tile_working_set_bytes is None
+            else max_tile_working_set_bytes
+        )
         self._started_ns = time.monotonic_ns()
         self._state = messages.WORKER_STATE_NOT_SERVING
         self._active = 0
@@ -152,6 +188,7 @@ class _WorkerService(services.ScampWorkerServicer):
             profile_kinds=[messages.PROFILE_KIND_1NN_INDEX],
             precisions=[messages.PRECISION_SINGLE],
             max_message_bytes=self.max_message_bytes,
+            max_tile_working_set_bytes=self.max_tile_working_set_bytes,
         )
 
     def _health(self) -> messages.WorkerHealth:
@@ -191,6 +228,20 @@ class _WorkerService(services.ScampWorkerServicer):
         if request.precision != messages.PRECISION_SINGLE:
             context.abort(
                 grpc.StatusCode.UNIMPLEMENTED, "worker only supports single precision"
+            )
+        rows = int(request.row_stop) - int(request.row_start)
+        columns = int(request.column_stop) - int(request.column_start)
+        try:
+            estimated_bytes = estimate_1nn_tile_working_set_bytes(
+                rows, columns, int(request.window)
+            )
+        except ValueError as error:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        if estimated_bytes > self.max_tile_working_set_bytes:
+            context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                f"estimated tile working set {estimated_bytes} bytes exceeds "
+                f"worker limit {self.max_tile_working_set_bytes} bytes",
             )
         if not self._tile_slots.acquire(blocking=False):
             context.abort(
@@ -295,11 +346,20 @@ class WorkerServer:
         rpc_threads: int = 4,
         max_concurrent_tiles: int = 1,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        max_tile_working_set_bytes: int | None = None,
+        allow_insecure_remote: bool = False,
     ) -> None:
         if rpc_threads <= 0 or max_concurrent_tiles <= 0:
             raise ValueError("worker thread and concurrency counts must be positive")
         if max_message_bytes <= 0:
             raise ValueError("max_message_bytes must be positive")
+        if max_tile_working_set_bytes is not None and max_tile_working_set_bytes <= 0:
+            raise ValueError("max_tile_working_set_bytes must be positive")
+        if not _is_loopback_host(host) and not allow_insecure_remote:
+            raise ValueError(
+                "non-loopback workers require allow_insecure_remote=True until "
+                "TLS/authentication support is configured"
+            )
         self.host = host
         self.requested_port = port
         self.max_message_bytes = max_message_bytes
@@ -311,6 +371,7 @@ class WorkerServer:
             backend=backend,
             max_message_bytes=max_message_bytes,
             max_concurrent_tiles=max_concurrent_tiles,
+            max_tile_working_set_bytes=max_tile_working_set_bytes,
         )
         options = (
             ("grpc.max_receive_message_length", max_message_bytes),
@@ -392,11 +453,19 @@ class WorkerClient:
     def execute_tile(
         self, request: messages.ProfileTileRequest
     ) -> messages.ProfileTileResult:
-        return self.stub.ExecuteProfileTile(
+        result = self.stub.ExecuteProfileTile(
             request,
             timeout=self.timeout,
             wait_for_ready=True,
         )
+        if result.api_version != API_VERSION:
+            raise ValueError(
+                f"worker returned distributed API version {result.api_version}; "
+                f"expected {API_VERSION}"
+            )
+        if result.request_id != request.request_id:
+            raise ValueError("worker response request_id does not match the request")
+        return result
 
     def close(self) -> None:
         self.channel.close()
@@ -442,6 +511,8 @@ class WorkerPool:
                 if health.state == messages.WORKER_STATE_SERVING:
                     return client.execute_tile(request)
             except grpc.RpcError as error:
+                if error.code() not in _TRANSIENT_RPC_CODES:
+                    raise
                 last_error = error
         if last_error is not None:
             raise last_error
