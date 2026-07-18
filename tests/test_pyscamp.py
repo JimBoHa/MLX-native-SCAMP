@@ -56,6 +56,14 @@ class PyScampCompatTests(unittest.TestCase):
         np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
         np.testing.assert_array_equal(valid_idx, out_idx)
 
+    def test_selfjoin_uses_ceil_exclusion_zone(self):
+        arr = np.array([0, 1, 3, 2, 5, 4], dtype=np.float32)
+        for m in (3, 5):
+            valid_dist, valid_idx = reduce_1nn_index(distance_matrix(arr, None, m))
+            out_dist, out_idx = mp.selfjoin(arr, m, pearson=True)
+            np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
+            np.testing.assert_array_equal(valid_idx, out_idx)
+
     def test_abjoin_matches_reference(self):
         valid_dist, valid_idx = reduce_1nn_index(self.dm_ab)
         out_dist, out_idx = mp.abjoin(self.a, self.b, self.m, pearson=True)

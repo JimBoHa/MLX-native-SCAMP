@@ -133,7 +133,9 @@ def _convert_match_value(corr: float, m: int, pearson: bool) -> float:
 
 def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, self_join: bool, block_rows: int):
     n_cols = prepared_a.subsequences
-    exclusion = m // 4
+    # SCAMP excludes lags strictly smaller than ceil(m / 4).  Using floor
+    # admits trivial near-diagonal matches whenever m is not divisible by 4.
+    exclusion = (m + 3) // 4
     col_indices = mx.arange(n_cols, dtype=mx.int32)
     for row_start in range(0, prepared_b.subsequences, block_rows):
         row_end = min(prepared_b.subsequences, row_start + block_rows)
