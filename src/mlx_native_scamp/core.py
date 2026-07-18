@@ -28,17 +28,21 @@ def gpu_supported() -> bool:
 
 def _ensure_1d_array(values: Any, name: str) -> Any:
     if isinstance(values, mx.array):
-        array = values
-        if array.dtype != mx.float32:
-            array = array.astype(mx.float32)
+        if values.ndim != 1:
+            raise ValueError(f"{name} must be a 1D array")
+        if values.dtype == mx.float32:
+            return values
+        numpy_array = np.asarray(values)
     else:
         numpy_array = np.asarray(values)
-        if numpy_array.ndim != 1:
-            raise ValueError(f"{name} must be a 1D array")
-        array = mx.array(np.ascontiguousarray(numpy_array, dtype=np.float32))
-    if array.ndim != 1:
+    if numpy_array.ndim != 1:
         raise ValueError(f"{name} must be a 1D array")
-    return array
+    if numpy_array.dtype == np.float32:
+        return mx.array(np.ascontiguousarray(numpy_array))
+    # Preserve upstream's force-cast-to-double input semantics until each
+    # window has been normalized. Casting an uncentered series to float32 can
+    # erase small variations around a large offset before Metal sees them.
+    return np.array(numpy_array, dtype=np.float64, order="C", copy=True)
 
 
 def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, allow_threshold: bool = False) -> dict[str, Any]:
@@ -95,6 +99,50 @@ def _sliding_valid_mask(finite_mask: Any, m: int) -> Any:
 
 
 def _prepare_series(values: Any, m: int) -> PreparedSeries:
+    if isinstance(values, np.ndarray):
+        finite = np.isfinite(values)
+        clean = np.where(finite, values, 0.0)
+        windows = np.lib.stride_tricks.sliding_window_view(clean, m)
+        finite_windows = np.lib.stride_tricks.sliding_window_view(finite, m)
+
+        # Center each window around its own baseline before converting its
+        # normalized representation to float32. The secondary range scale
+        # keeps the norm calculation bounded without sacrificing variations
+        # riding on a large offset.
+        with np.errstate(over="ignore", invalid="ignore"):
+            shifted = windows - windows[:, :1]
+        overflowed = ~np.all(np.isfinite(shifted), axis=1)
+        scales = np.max(np.abs(shifted), axis=1, keepdims=True)
+        safe_scales = np.where(scales > 0.0, scales, 1.0)
+        with np.errstate(invalid="ignore"):
+            scaled = shifted / safe_scales
+
+        # Subtracting opposite finite float64 extremes can overflow. Those
+        # rare windows use an equivalent scale-first affine transform.
+        if np.any(overflowed):
+            source = windows[overflowed]
+            source_scales = np.max(np.abs(source), axis=1, keepdims=True)
+            safe_source_scales = np.where(source_scales > 0.0, source_scales, 1.0)
+            scaled_source = source / safe_source_scales
+            scaled[overflowed] = scaled_source - scaled_source[:, :1]
+            safe_scales[overflowed] = safe_source_scales
+
+        centered = scaled - np.mean(scaled, axis=1, keepdims=True)
+        norms = np.sqrt(np.sum(centered * centered, axis=1, dtype=np.float64))
+        flatness_limit = np.sqrt(FLATNESS_EPSILON) / safe_scales[:, 0]
+        valid_np = np.all(finite_windows, axis=1) & (norms > flatness_limit)
+        safe_norms = np.where(valid_np, norms, 1.0)
+        normalized_np = centered / safe_norms[:, None]
+        normalized_np[~valid_np] = 0.0
+
+        normalized = mx.array(np.ascontiguousarray(normalized_np, dtype=np.float32))
+        valid = mx.array(np.ascontiguousarray(valid_np))
+        return PreparedSeries(
+            windows=normalized,
+            valid=valid,
+            subsequences=int(normalized.shape[0]),
+        )
+
     x = values
     finite = mx.isfinite(x)
     clean = mx.where(finite, x, mx.zeros_like(x))

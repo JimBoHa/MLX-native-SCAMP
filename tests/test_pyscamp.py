@@ -130,6 +130,37 @@ class PyScampCompatTests(unittest.TestCase):
                 np.testing.assert_allclose(expected_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
                 np.testing.assert_array_equal(expected_idx, out_idx)
 
+    def test_large_offsets_do_not_destroy_numpy_variation(self):
+        values = np.array([0, 1, 2, 4], dtype=np.float64)
+        inputs = (
+            values + 1e8,
+            np.array([2**30, 2**30 + 1, 2**30 + 2, 2**30 + 4], dtype=np.int64),
+        )
+        for series in inputs:
+            with self.subTest(dtype=series.dtype):
+                out_corr, out_idx = mp.abjoin(series, series, 4, pearson=True)
+                np.testing.assert_allclose(out_corr, np.array([1.0], dtype=np.float32), atol=1e-6)
+                np.testing.assert_array_equal(out_idx, np.array([0], dtype=np.int32))
+
+    def test_large_offsets_do_not_destroy_mlx_float64_variation(self):
+        with mx.stream(mx.cpu):
+            series = mx.array([1e8, 1e8 + 1, 1e8 + 2, 1e8 + 4], dtype=mx.float64)
+
+        out_corr, out_idx = mp.abjoin(series, series, 4, pearson=True)
+
+        np.testing.assert_allclose(out_corr, np.array([1.0], dtype=np.float32), atol=1e-6)
+        np.testing.assert_array_equal(out_idx, np.array([0], dtype=np.int32))
+
+    def test_centering_is_independent_for_each_high_offset_window(self):
+        # Upstream SCAMP returns two finite self-correlations and indices
+        # [0, 1]. A single global baseline still quantizes the second window.
+        series = np.array([1e8, 2e8, 2e8 + 1, 2e8 + 2], dtype=np.float64)
+
+        out_corr, out_idx = mp.abjoin(series, series, 3, pearson=True)
+
+        np.testing.assert_allclose(out_corr, np.ones(2, dtype=np.float32), atol=1e-6)
+        np.testing.assert_array_equal(out_idx, np.array([0, 1], dtype=np.int32))
+
     def test_compatibility_kwargs_are_accepted(self):
         out_dist, out_idx = mp.selfjoin(
             self.a,
