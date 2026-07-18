@@ -1,3 +1,6 @@
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _distribution_version
+
 from .core import (
     abjoin,
     abjoin_knn,
@@ -10,7 +13,10 @@ from .core import (
     selfjoin_sum,
 )
 
-__version__ = "dev"
+try:
+    __version__ = _distribution_version("mlx-native-scamp")
+except _PackageNotFoundError:
+    __version__ = "dev"
 
 __all__ = [
     "__version__",

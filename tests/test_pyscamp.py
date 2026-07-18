@@ -1,6 +1,8 @@
 import unittest
+from importlib.metadata import version as distribution_version
 
 import mlx.core as mx
+import mlx_native_scamp
 import numpy as np
 
 import pyscamp as mp
@@ -44,8 +46,10 @@ class PyScampCompatTests(unittest.TestCase):
 
     def test_public_surface_matches_upstream_bindings(self):
         exported = {name for name in EXPECTED_PUBLIC_CALLABLES if hasattr(mp, name)}
+        installed_version = distribution_version("mlx-native-scamp")
         self.assertEqual(EXPECTED_PUBLIC_CALLABLES, exported)
-        self.assertEqual("dev", mp.__version__)
+        self.assertEqual(installed_version, mlx_native_scamp.__version__)
+        self.assertEqual(mlx_native_scamp.__version__, mp.__version__)
 
     def test_gpu_supported(self):
         self.assertTrue(mp.gpu_supported())
