@@ -79,6 +79,29 @@ class PyScampCompatTests(unittest.TestCase):
         out = mp.abjoin_sum(self.a, self.b, self.m, threshold=0.5, pearson=True)
         np.testing.assert_allclose(valid, out, rtol=1e-4, atol=1e-4)
 
+    def test_abjoin_sum_accumulates_reduced_blocks_in_float64(self):
+        rng = np.random.default_rng(123)
+        m = 8
+        a = rng.normal(size=m).astype(np.float32)
+        b = rng.normal(size=50_000 + m - 1).astype(np.float32)
+
+        normalized_a = a.astype(np.float64)
+        normalized_a -= normalized_a.mean()
+        normalized_a /= np.linalg.norm(normalized_a)
+        windows_b = np.array(
+            np.lib.stride_tricks.sliding_window_view(b.astype(np.float64), m),
+            copy=True,
+        )
+        windows_b -= windows_b.mean(axis=1, keepdims=True)
+        windows_b /= np.linalg.norm(windows_b, axis=1)[:, None]
+        correlations = windows_b @ normalized_a
+        expected = np.sum(correlations[correlations > 0.0], dtype=np.float64)
+
+        out = mp.abjoin_sum(a, b, m, threshold=0.0, pearson=True)
+
+        self.assertEqual(np.dtype(np.float64), out.dtype)
+        np.testing.assert_allclose(out[0], expected, rtol=0.0, atol=2e-4)
+
     def test_selfjoin_matrix_matches_reference(self):
         valid = reduce_matrix(self.dm_self, 4, 5, True)
         out = mp.selfjoin_matrix(self.a, self.m, threshold=0.0, mheight=4, mwidth=5, pearson=True)

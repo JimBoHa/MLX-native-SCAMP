@@ -166,10 +166,16 @@ def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, 
 
 
 def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, threshold: float, self_join: bool) -> np.ndarray:
-    accum = mx.zeros((prepared_a.subsequences,), dtype=mx.float32)
+    with mx.stream(mx.cpu):
+        accum = mx.zeros((prepared_a.subsequences,), dtype=mx.float64)
     for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         filtered = mx.where(block > threshold, block, mx.zeros_like(block))
-        accum = accum + mx.sum(filtered, axis=0)
+        block_sum = mx.sum(filtered, axis=0)
+        with mx.stream(mx.cpu):
+            accum = accum + block_sum.astype(mx.float64)
+        # Schedule each reduced vector and its CPU accumulation so the lazy
+        # graph does not retain full correlation blocks until final output.
+        mx.async_eval(accum)
     return np.asarray(accum, dtype=np.float64)
 
 
