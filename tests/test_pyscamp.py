@@ -102,6 +102,14 @@ class PyScampCompatTests(unittest.TestCase):
         matches = mp.abjoin_knn(self.a, self.b, self.m, 3, threshold=0.2, pearson=True)
         self._assert_knn_matches_reference(matches, self.dm_ab, 0.2)
 
+    def test_abjoin_knn_excludes_matches_equal_to_threshold(self):
+        a = np.array([1, 0, -1, 0], dtype=np.float32)
+        b = np.array([0, 1, 0, -1], dtype=np.float32)
+
+        matches = mp.abjoin_knn(a, b, 4, 1, threshold=0.0, pearson=True)
+
+        self.assertEqual([], matches)
+
     def test_nan_windows_are_excluded(self):
         arr = self.a.copy()
         arr[10] = np.nan
