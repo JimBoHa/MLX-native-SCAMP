@@ -275,6 +275,31 @@ def _best_match_profile(
     return _convert_profile_output(corr_np, m, pearson), idx_np
 
 
+def _best_match_values(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    pearson: bool,
+    self_join: bool,
+    use_metal_kernel: bool,
+) -> np.ndarray:
+    if use_metal_kernel:
+        from ._metal_1nn import best_profile
+
+        corr_np = best_profile(prepared_a, prepared_b, m, self_join)
+        return _convert_profile_output(corr_np, m, pearson)
+
+    profile, _ = _best_match_profile(
+        prepared_a,
+        prepared_b,
+        m,
+        pearson,
+        self_join,
+        use_metal_kernel=False,
+    )
+    return profile
+
+
 def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, threshold: float, self_join: bool) -> np.ndarray:
     accum = mx.zeros((prepared_a.subsequences,), dtype=prepared_a.windows.dtype)
     for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
@@ -390,12 +415,21 @@ def _run_profile(
     prepared_b = _prepare_series(series_b, m)
     self_join = not has_b
 
-    if profile == "1nn":
+    if profile in {"1nn", "1nn_value"}:
         use_metal_1nn = (
             use_metal_1nn
             and float32_sources
             and _metal_recurrence_is_safe(prepared_a, prepared_b, m)
         )
+        if profile == "1nn_value":
+            return _best_match_values(
+                prepared_a,
+                prepared_b,
+                m,
+                pearson,
+                self_join,
+                use_metal_1nn,
+            )
         return _best_match_profile(
             prepared_a,
             prepared_b,
@@ -486,6 +520,34 @@ def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarra
         m,
         pearson=params["pearson"],
         profile="1nn",
+    )
+
+
+def selfjoin_1nn(a: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Compute SCAMP's index-free 1NN profile for a self-join."""
+
+    params = _parse_common_kwargs(kwargs)
+    return _run_profile_with_resources(
+        params,
+        a,
+        None,
+        m,
+        pearson=params["pearson"],
+        profile="1nn_value",
+    )
+
+
+def abjoin_1nn(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Compute SCAMP's index-free 1NN profile for an AB-join."""
+
+    params = _parse_common_kwargs(kwargs)
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        profile="1nn_value",
     )
 
 

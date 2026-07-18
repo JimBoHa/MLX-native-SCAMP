@@ -42,6 +42,10 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 - Single-precision `selfjoin` and `abjoin` use a custom Metal kernel that
   follows SCAMP's rolling-covariance diagonal algorithm. Other profiles and
   execution modes use the portable MLX implementation.
+- `mlx_native_scamp.selfjoin_1nn` and `abjoin_1nn` expose SCAMP's index-free
+  `1NN` profile for CLI and library adapters. On Metal they omit the indexed
+  profile's second kernel pass; the strict `pyscamp` compatibility namespace
+  remains limited to upstream's Python exports.
 - The diagonal kernel is selected only for native float32 inputs whose raw
   rolling covariance is safe in float32. Non-float32 and extreme-magnitude
   inputs retain the normalized-window path so precision and overflow fixes can
