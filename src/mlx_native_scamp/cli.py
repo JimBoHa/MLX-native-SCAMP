@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import sys
+import tempfile
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
@@ -184,7 +186,12 @@ def _validate_job(args: argparse.Namespace, devices: list[int] | None) -> None:
             raise CLIError("max tile size must be at least twice the window size")
 
 
-def _read_series(name: str, stdin: TextIO) -> np.ndarray:
+def _read_series(
+    name: str,
+    stdin: TextIO,
+    *,
+    dtype: type[np.float32] | type[np.float64] = np.float64,
+) -> np.ndarray:
     if name == "-":
         stream = stdin
         label = "stdin"
@@ -209,7 +216,7 @@ def _read_series(name: str, stdin: TextIO) -> np.ndarray:
 
     try:
         # fromiter avoids a second, Python-object copy of large input series.
-        return np.fromiter(values(), dtype=np.float64)
+        return np.fromiter(values(), dtype=dtype)
     finally:
         if close:
             stream.close()
@@ -324,19 +331,62 @@ def _validate_outputs(args: argparse.Namespace) -> None:
     if outputs.count("-") > 1:
         raise CLIError("at most one active output can be written to stdout")
     file_outputs = [output for output in outputs if output != "-"]
-    if len(file_outputs) != len(set(file_outputs)):
+    try:
+        resolved_outputs = [Path(output).resolve(strict=False) for output in file_outputs]
+        resolved_inputs = {
+            Path(input_name).resolve(strict=False)
+            for input_name in (args.input_a_file_name, args.input_b_file_name)
+            if input_name and input_name != "-"
+        }
+    except OSError as exc:
+        raise CLIError(f"unable to resolve input/output paths: {exc}") from exc
+    if len(resolved_outputs) != len(set(resolved_outputs)):
         raise CLIError("active output filenames must be distinct")
+    for position, output in enumerate(resolved_outputs):
+        for other in resolved_outputs[position + 1 :]:
+            try:
+                if output.exists() and other.exists() and output.samefile(other):
+                    raise CLIError("active output filenames must be distinct")
+            except OSError as exc:
+                raise CLIError(f"unable to compare output paths: {exc}") from exc
+    collisions = resolved_inputs.intersection(resolved_outputs)
+    if collisions:
+        raise CLIError(
+            f"an output filename aliases an input file: {next(iter(collisions))}"
+        )
+    for output in resolved_outputs:
+        for input_path in resolved_inputs:
+            try:
+                if output.exists() and input_path.exists() and output.samefile(input_path):
+                    raise CLIError(
+                        f"an output filename aliases an input file: {input_path}"
+                    )
+            except OSError as exc:
+                raise CLIError(f"unable to compare input/output paths: {exc}") from exc
 
 
 def _write_lines(name: str, lines: Iterable[str], stdout: TextIO) -> None:
     if name == "-":
         stream = stdout
         close = False
+        temporary_path = None
+        target_path = None
     else:
+        target_path = Path(name)
         try:
-            stream = Path(name).open("w", encoding="utf-8", newline="\n")
+            temporary = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                dir=target_path.parent,
+                prefix=f".{target_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            )
         except OSError as exc:
             raise CLIError(f"unable to open {name!r} for writing: {exc.strerror or exc}") from exc
+        stream = temporary
+        temporary_path = Path(temporary.name)
         close = True
     try:
         batch: list[str] = []
@@ -348,11 +398,30 @@ def _write_lines(name: str, lines: Iterable[str], stdout: TextIO) -> None:
         if batch:
             stream.write("\n".join(batch) + "\n")
         stream.flush()
-    except OSError as exc:
-        raise CLIError(f"unable to write {name!r}: {exc.strerror or exc}") from exc
-    finally:
+        if close:
+            os.fsync(stream.fileno())
+    except BaseException as exc:
         if close:
             stream.close()
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        if isinstance(exc, OSError):
+            raise CLIError(
+                f"unable to write {name!r}: {exc.strerror or exc}"
+            ) from exc
+        raise
+    finally:
+        if close and not stream.closed:
+            stream.close()
+    if temporary_path is not None and target_path is not None:
+        try:
+            os.replace(temporary_path, target_path)
+        except OSError as exc:
+            temporary_path.unlink(missing_ok=True)
+            raise CLIError(
+                f"unable to replace {name!r} with completed output: "
+                f"{exc.strerror or exc}"
+            ) from exc
 
 
 def _write_result(
@@ -437,8 +506,13 @@ def run(
     if args.print_debug_info:
         stderr.write("Starting SCAMP\n")
 
-    series_a = _read_series(args.input_a_file_name, stdin)
-    series_b = _read_series(args.input_b_file_name, stdin) if args.input_b_file_name else None
+    input_dtype = np.float32 if _precision(args) == "single" else np.float64
+    series_a = _read_series(args.input_a_file_name, stdin, dtype=input_dtype)
+    series_b = (
+        _read_series(args.input_b_file_name, stdin, dtype=input_dtype)
+        if args.input_b_file_name
+        else None
+    )
     if len(series_a) < args.window or (series_b is not None and len(series_b) < args.window):
         raise CLIError("window size must be smaller than or equal to the time-series length")
     if args.profile_type == "MATRIX_SUMMARY":

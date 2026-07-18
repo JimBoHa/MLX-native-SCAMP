@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -127,6 +128,74 @@ class CLIParityTests(unittest.TestCase):
         stdout = io.StringIO()
         cli._write_lines("-", cli._matrix_lines(np.array([[0.1, 0.2], [0.3, np.nan]])), stdout)
         self.assertEqual("0.1 0.2\n0.3 nan\n", stdout.getvalue())
+
+    def test_aliasing_outputs_and_input_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory, "input.txt")
+            input_path.write_text("0\n1\n2\n3\n", encoding="utf-8")
+            alias = f"{directory}/./profile.txt"
+            cases = (
+                self.parse(
+                    "--window=3",
+                    f"--input_a_file_name={input_path}",
+                    f"--output_a_file_name={Path(directory, 'profile.txt')}",
+                    f"--output_a_index_file_name={alias}",
+                ),
+                self.parse(
+                    "--window=3",
+                    f"--input_a_file_name={input_path}",
+                    f"--output_a_file_name={input_path}",
+                    f"--output_a_index_file_name={Path(directory, 'index.txt')}",
+                ),
+            )
+            for args in cases:
+                with self.subTest(args=args), self.assertRaises(cli.CLIError):
+                    cli.run(args)
+            self.assertEqual("0\n1\n2\n3\n", input_path.read_text(encoding="utf-8"))
+
+    def test_existing_hardlink_aliases_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory, "input.txt")
+            input_path.write_text("0\n1\n2\n3\n", encoding="utf-8")
+            profile_path = Path(directory, "profile.txt")
+            profile_path.write_text("existing\n", encoding="utf-8")
+            index_alias = Path(directory, "index-hardlink.txt")
+            os.link(profile_path, index_alias)
+            args = self.parse(
+                "--window=3",
+                f"--input_a_file_name={input_path}",
+                f"--output_a_file_name={profile_path}",
+                f"--output_a_index_file_name={index_alias}",
+            )
+            with self.assertRaisesRegex(cli.CLIError, "distinct"):
+                cli.run(args)
+
+    def test_file_output_replaces_target_only_after_all_lines_succeed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "profile.txt")
+            target.write_text("previous\n", encoding="utf-8")
+
+            def broken_lines():
+                yield "first"
+                raise OSError("simulated output failure")
+
+            with self.assertRaisesRegex(cli.CLIError, "simulated output failure"):
+                cli._write_lines(str(target), broken_lines(), io.StringIO())
+            self.assertEqual("previous\n", target.read_text(encoding="utf-8"))
+            self.assertEqual([], list(Path(directory).glob(".*.tmp")))
+
+    def test_single_precision_inputs_are_parsed_for_the_metal_recurrence(self):
+        args = self.parse(
+            "--window=3",
+            "--input_a_file_name=-",
+            "--single_precision",
+        )
+        with (
+            mock.patch.object(cli, "_compute_one", return_value=([], [])) as compute,
+            mock.patch.object(cli, "_write_result"),
+        ):
+            cli.run(args, stdin=io.StringIO("0\n1\n2\n3\n"))
+        self.assertEqual(np.dtype(np.float32), compute.call_args.args[1].dtype)
 
     def test_gflags_style_boolean_values_are_accepted(self):
         args = self.parse("--output_pearson=false", "--single_precision=true")
