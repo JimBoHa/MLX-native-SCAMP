@@ -13,7 +13,7 @@ authors = [
   { name = "JimBoHa" }
 ]
 dependencies = [
-  "mlx>=0.15.0",
+  "mlx>=0.17.3",
   "numpy>=1.26.0",
 ]
 
