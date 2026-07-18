@@ -46,6 +46,9 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
 - MLX manages its own CPU scheduler, so `threads` selects CPU execution but cannot
   enforce an exact worker count.
 - Multi-GPU requests and GPU IDs other than `0` are unsupported and rejected.
+- Concurrent CPU+GPU workers are not exposed by MLX; when both selectors are
+  supplied, this port deliberately uses Metal rather than claiming SCAMP's
+  heterogeneous-worker behavior.
 - Other compatibility kwargs such as `precision` are accepted, but CUDA-specific
   behavior is not reproduced.
 - The implementation currently targets dense 1D numeric arrays.
