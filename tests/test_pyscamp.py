@@ -1,3 +1,4 @@
+import inspect
 import unittest
 
 import mlx.core as mx
@@ -43,9 +44,45 @@ class PyScampCompatTests(unittest.TestCase):
             self.assertEqual(group[0][0], best_row)
 
     def test_public_surface_matches_upstream_bindings(self):
-        exported = {name for name in EXPECTED_PUBLIC_CALLABLES if hasattr(mp, name)}
+        exported = {name for name in mp.__all__ if callable(getattr(mp, name, None))}
         self.assertEqual(EXPECTED_PUBLIC_CALLABLES, exported)
         self.assertEqual("dev", mp.__version__)
+
+    def test_public_callables_have_substantive_api_docs(self):
+        common_join_terms = (
+            "a:",
+            "m:",
+            "pearson",
+            "precision",
+            "single",
+            "mixed",
+            "double",
+            "ultra",
+            "verbose",
+            "gpus",
+            "threads",
+            "defaults to",
+        )
+        required_terms = {
+            "gpu_supported": ("MLX", "GPU", "bool", "CUDA"),
+            "selfjoin": common_join_terms + ("float32", "int32"),
+            "abjoin": common_join_terms + ("b:", "float32", "int32"),
+            "selfjoin_sum": common_join_terms + ("threshold", "float64"),
+            "abjoin_sum": common_join_terms + ("b:", "threshold", "float64"),
+            "selfjoin_matrix": common_join_terms + ("threshold", "mheight", "mwidth", "float32"),
+            "abjoin_matrix": common_join_terms + ("b:", "threshold", "mheight", "mwidth", "float32"),
+            "selfjoin_knn": common_join_terms + ("k:", "threshold", "list", "float"),
+            "abjoin_knn": common_join_terms + ("b:", "k:", "threshold", "list", "float"),
+        }
+        self.assertEqual(EXPECTED_PUBLIC_CALLABLES, set(required_terms))
+
+        for name, terms in required_terms.items():
+            with self.subTest(callable=name):
+                doc = inspect.getdoc(getattr(mp, name))
+                self.assertIsNotNone(doc)
+                self.assertGreaterEqual(len(doc), 150)
+                for term in terms:
+                    self.assertIn(term.casefold(), doc.casefold())
 
     def test_gpu_supported(self):
         self.assertTrue(mp.gpu_supported())

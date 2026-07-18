@@ -20,6 +20,17 @@ class PreparedSeries:
 
 
 def gpu_supported() -> bool:
+    """Report whether MLX is currently using its Apple GPU backend.
+
+    Returns:
+        bool: ``True`` when MLX identifies the GPU as its default execution
+        device, otherwise ``False``. Runtime lookup failures also return
+        ``False``.
+
+    Notes:
+        This is an MLX capability check. It does not probe for, or make any
+        claim about, CUDA-compatible GPUs.
+    """
     try:
         return mx.default_device() == mx.gpu
     except Exception:
@@ -273,26 +284,194 @@ def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: flo
 
 
 def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the one-nearest-neighbor matrix profile of one series.
+
+    Args:
+        a: Dense one-dimensional numeric input. Python sequences, NumPy
+            arrays, and MLX arrays are accepted.
+        m: Positive subsequence length that fits within ``a``.
+
+    Keyword Args:
+        pearson (bool): Return Pearson correlations when ``True``; return
+            z-normalized Euclidean distances when ``False``. Defaults to
+            ``False``.
+        precision (str): One of ``"single"``, ``"mixed"``, ``"double"``, or
+            ``"ultra"``. Defaults to ``"double"``. The option is validated for
+            pyscamp compatibility, while this MLX implementation currently
+            converts inputs and performs its profile kernels in ``float32``.
+        verbose (bool): Compatibility verbosity flag. Defaults to ``False``;
+            the current MLX kernel does not emit progress output.
+        gpus: Compatibility device selector. Defaults to ``None``. MLX, rather
+            than CUDA device numbering, controls execution placement.
+        threads (int): Compatibility CPU worker limit. Defaults to ``0``;
+            MLX schedules kernel work independently.
+
+    Returns:
+        tuple[numpy.ndarray, numpy.ndarray]: A ``float32`` profile and an
+        ``int32`` match-index array, each with shape ``(len(a) - m + 1,)``.
+        Indices refer to subsequences in ``a``. Invalid or unmatched windows
+        are represented by ``NaN`` and ``-1`` respectively.
+
+    Notes:
+        Matches inside the self-join exclusion zone are omitted. Non-finite
+        and constant subsequences are not eligible matches.
+    """
     params = _parse_common_kwargs(kwargs)
     return _run_profile(a, None, m, pearson=params["pearson"], profile="1nn")
 
 
 def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the one-nearest-neighbor profile from ``a`` into ``b``.
+
+    Args:
+        a: Dense one-dimensional query series supplied as a Python sequence,
+            NumPy array, or MLX array.
+        b: Dense one-dimensional reference series in the same accepted forms
+            as ``a``.
+        m: Positive subsequence length that fits within both inputs.
+
+    Keyword Args:
+        pearson (bool): Return Pearson correlations when ``True``; return
+            z-normalized Euclidean distances when ``False``. Defaults to
+            ``False``.
+        precision (str): One of ``"single"``, ``"mixed"``, ``"double"``, or
+            ``"ultra"``. Defaults to ``"double"``. The option is validated for
+            pyscamp compatibility, while this MLX implementation currently
+            converts inputs and performs its profile kernels in ``float32``.
+        verbose (bool): Compatibility verbosity flag. Defaults to ``False``;
+            the current MLX kernel does not emit progress output.
+        gpus: Compatibility device selector. Defaults to ``None``. MLX, rather
+            than CUDA device numbering, controls execution placement.
+        threads (int): Compatibility CPU worker limit. Defaults to ``0``;
+            MLX schedules kernel work independently.
+
+    Returns:
+        tuple[numpy.ndarray, numpy.ndarray]: A ``float32`` profile and an
+        ``int32`` match-index array, each with shape ``(len(a) - m + 1,)``.
+        Every index identifies the matching subsequence in ``b``. Invalid or
+        unmatched windows are represented by ``NaN`` and ``-1`` respectively.
+
+    Notes:
+        Non-finite and constant subsequences in either input are not eligible
+        matches.
+    """
     params = _parse_common_kwargs(kwargs)
     return _run_profile(a, b, m, pearson=params["pearson"], profile="1nn")
 
 
 def selfjoin_sum(a: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Sum qualifying self-join correlations for every subsequence in ``a``.
+
+    Args:
+        a: Dense one-dimensional numeric input. Python sequences, NumPy
+            arrays, and MLX arrays are accepted.
+        m: Positive subsequence length that fits within ``a``.
+
+    Keyword Args:
+        threshold (float): Pearson-correlation cutoff in ``[-1, 1]``. Only
+            matches strictly greater than the cutoff contribute. Defaults to
+            ``0.0``.
+        pearson (bool): Accepted for pyscamp compatibility and defaults to
+            ``False``. SUM profiles always contain sums of Pearson
+            correlations, regardless of this flag.
+        precision (str): One of ``"single"``, ``"mixed"``, ``"double"``, or
+            ``"ultra"``. Defaults to ``"double"``. The option is validated for
+            compatibility; current MLX profile kernels compute in ``float32``.
+        verbose (bool): Compatibility verbosity flag. Defaults to ``False``;
+            the current MLX kernel does not emit progress output.
+        gpus: Compatibility device selector. Defaults to ``None``. MLX, rather
+            than CUDA device numbering, controls execution placement.
+        threads (int): Compatibility CPU worker limit. Defaults to ``0``;
+            MLX schedules kernel work independently.
+
+    Returns:
+        numpy.ndarray: A ``float64`` array with shape
+        ``(len(a) - m + 1,)`` containing correlation sums.
+
+    Notes:
+        Matches inside the self-join exclusion zone are omitted. Non-finite
+        and constant subsequences do not contribute to a sum.
+    """
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile(a, None, m, pearson=True, threshold=params["threshold"], profile="sum")
 
 
 def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Sum qualifying correlations from each subsequence in ``a`` to ``b``.
+
+    Args:
+        a: Dense one-dimensional query series supplied as a Python sequence,
+            NumPy array, or MLX array.
+        b: Dense one-dimensional reference series in the same accepted forms
+            as ``a``.
+        m: Positive subsequence length that fits within both inputs.
+
+    Keyword Args:
+        threshold (float): Pearson-correlation cutoff in ``[-1, 1]``. Only
+            matches strictly greater than the cutoff contribute. Defaults to
+            ``0.0``.
+        pearson (bool): Accepted for pyscamp compatibility and defaults to
+            ``False``. SUM profiles always contain sums of Pearson
+            correlations, regardless of this flag.
+        precision (str): One of ``"single"``, ``"mixed"``, ``"double"``, or
+            ``"ultra"``. Defaults to ``"double"``. The option is validated for
+            compatibility; current MLX profile kernels compute in ``float32``.
+        verbose (bool): Compatibility verbosity flag. Defaults to ``False``;
+            the current MLX kernel does not emit progress output.
+        gpus: Compatibility device selector. Defaults to ``None``. MLX, rather
+            than CUDA device numbering, controls execution placement.
+        threads (int): Compatibility CPU worker limit. Defaults to ``0``;
+            MLX schedules kernel work independently.
+
+    Returns:
+        numpy.ndarray: A ``float64`` array with shape
+        ``(len(a) - m + 1,)`` containing correlation sums over subsequences in
+        ``b``.
+
+    Notes:
+        Non-finite and constant subsequences in either input do not contribute
+        to a sum.
+    """
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile(a, b, m, pearson=True, threshold=params["threshold"], profile="sum")
 
 
 def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Reduce a self-join distance matrix to a fixed-size summary grid.
+
+    Args:
+        a: Dense one-dimensional numeric input. Python sequences, NumPy
+            arrays, and MLX arrays are accepted.
+        m: Positive subsequence length that fits within ``a``.
+
+    Keyword Args:
+        threshold (float): Pearson-correlation cutoff in ``[-1, 1]``. Cells
+            retain matches at or above this cutoff. Defaults to ``0.0``.
+        mheight (int): Positive number of summary rows. Defaults to ``50``.
+        mwidth (int): Positive number of summary columns. Defaults to ``50``.
+        pearson (bool): Return maximum Pearson correlations when ``True``;
+            return their z-normalized Euclidean distances when ``False``.
+            Defaults to ``False``. ``threshold`` is always interpreted as a
+            correlation, including in distance mode.
+        precision (str): One of ``"single"``, ``"mixed"``, ``"double"``, or
+            ``"ultra"``. Defaults to ``"double"``. The option is validated for
+            compatibility; current MLX profile kernels compute in ``float32``.
+        verbose (bool): Compatibility verbosity flag. Defaults to ``False``;
+            the current MLX kernel does not emit progress output.
+        gpus: Compatibility device selector. Defaults to ``None``. MLX, rather
+            than CUDA device numbering, controls execution placement.
+        threads (int): Compatibility CPU worker limit. Defaults to ``0``;
+            MLX schedules kernel work independently.
+
+    Returns:
+        numpy.ndarray: A ``float32`` array with shape
+        ``(mheight, mwidth)``. A cell is ``NaN`` when it contains no valid
+        match meeting ``threshold``.
+
+    Notes:
+        The grid summarizes the upper half of the self-join matrix after the
+        exclusion zone is applied. Non-finite and constant windows are omitted.
+    """
     params = _parse_common_kwargs(kwargs, allow_threshold=True, allow_matrix=True)
     return _run_profile(
         a,
@@ -307,6 +486,43 @@ def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Reduce the distance matrix between ``a`` and ``b`` to a summary grid.
+
+    Args:
+        a: Dense one-dimensional query series supplied as a Python sequence,
+            NumPy array, or MLX array. Its subsequences form summary columns.
+        b: Dense one-dimensional reference series in the same accepted forms
+            as ``a``. Its subsequences form summary rows.
+        m: Positive subsequence length that fits within both inputs.
+
+    Keyword Args:
+        threshold (float): Pearson-correlation cutoff in ``[-1, 1]``. Cells
+            retain matches at or above this cutoff. Defaults to ``0.0``.
+        mheight (int): Positive number of summary rows. Defaults to ``50``.
+        mwidth (int): Positive number of summary columns. Defaults to ``50``.
+        pearson (bool): Return maximum Pearson correlations when ``True``;
+            return their z-normalized Euclidean distances when ``False``.
+            Defaults to ``False``. ``threshold`` is always interpreted as a
+            correlation, including in distance mode.
+        precision (str): One of ``"single"``, ``"mixed"``, ``"double"``, or
+            ``"ultra"``. Defaults to ``"double"``. The option is validated for
+            compatibility; current MLX profile kernels compute in ``float32``.
+        verbose (bool): Compatibility verbosity flag. Defaults to ``False``;
+            the current MLX kernel does not emit progress output.
+        gpus: Compatibility device selector. Defaults to ``None``. MLX, rather
+            than CUDA device numbering, controls execution placement.
+        threads (int): Compatibility CPU worker limit. Defaults to ``0``;
+            MLX schedules kernel work independently.
+
+    Returns:
+        numpy.ndarray: A ``float32`` array with shape
+        ``(mheight, mwidth)``. A cell is ``NaN`` when it contains no valid
+        match meeting ``threshold``.
+
+    Notes:
+        Non-finite and constant subsequences in either input are omitted from
+        the grid.
+    """
     params = _parse_common_kwargs(kwargs, allow_threshold=True, allow_matrix=True)
     return _run_profile(
         a,
@@ -321,10 +537,83 @@ def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
+    """Return up to ``k`` nearest self-join matches for each subsequence.
+
+    Args:
+        a: Dense one-dimensional numeric input. Python sequences, NumPy
+            arrays, and MLX arrays are accepted.
+        m: Positive subsequence length that fits within ``a``.
+        k: Positive maximum number of matches retained per subsequence.
+
+    Keyword Args:
+        threshold (float): Pearson-correlation cutoff in ``[-1, 1]``. Matches
+            at or above the cutoff are retained. Defaults to ``0.0``.
+        pearson (bool): Store Pearson correlations when ``True``; store
+            z-normalized Euclidean distances when ``False``. Defaults to
+            ``False``. ``threshold`` is always interpreted as a correlation.
+        precision (str): One of ``"single"``, ``"mixed"``, ``"double"``, or
+            ``"ultra"``. Defaults to ``"double"``. The option is validated for
+            compatibility; current MLX profile kernels compute in ``float32``.
+        verbose (bool): Compatibility verbosity flag. Defaults to ``False``;
+            the current MLX kernel does not emit progress output.
+        gpus: Compatibility device selector. Defaults to ``None``. MLX, rather
+            than CUDA device numbering, controls execution placement.
+        threads (int): Compatibility CPU worker limit. Defaults to ``0``;
+            MLX schedules kernel work independently.
+
+    Returns:
+        list[tuple[int, int, float]]: Tuples of ``(a_index, match_index,
+        value)`` using Python ``int``, ``int``, and ``float`` values. Results
+        are grouped by ``a_index`` and ordered nearest first within each group.
+        A group may contain fewer than ``k`` entries when matches are invalid
+        or fall below ``threshold``.
+
+    Notes:
+        Matches inside the self-join exclusion zone are omitted. Non-finite
+        and constant subsequences are not eligible matches.
+    """
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile(a, None, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
 
 
 def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
+    """Return up to ``k`` nearest matches in ``b`` for each subsequence in ``a``.
+
+    Args:
+        a: Dense one-dimensional query series supplied as a Python sequence,
+            NumPy array, or MLX array.
+        b: Dense one-dimensional reference series in the same accepted forms
+            as ``a``.
+        m: Positive subsequence length that fits within both inputs.
+        k: Positive maximum number of matches retained per subsequence in
+            ``a``.
+
+    Keyword Args:
+        threshold (float): Pearson-correlation cutoff in ``[-1, 1]``. Matches
+            at or above the cutoff are retained. Defaults to ``0.0``.
+        pearson (bool): Store Pearson correlations when ``True``; store
+            z-normalized Euclidean distances when ``False``. Defaults to
+            ``False``. ``threshold`` is always interpreted as a correlation.
+        precision (str): One of ``"single"``, ``"mixed"``, ``"double"``, or
+            ``"ultra"``. Defaults to ``"double"``. The option is validated for
+            compatibility; current MLX profile kernels compute in ``float32``.
+        verbose (bool): Compatibility verbosity flag. Defaults to ``False``;
+            the current MLX kernel does not emit progress output.
+        gpus: Compatibility device selector. Defaults to ``None``. MLX, rather
+            than CUDA device numbering, controls execution placement.
+        threads (int): Compatibility CPU worker limit. Defaults to ``0``;
+            MLX schedules kernel work independently.
+
+    Returns:
+        list[tuple[int, int, float]]: Tuples of ``(a_index, b_index, value)``
+        using Python ``int``, ``int``, and ``float`` values. Results are grouped
+        by ``a_index`` and ordered nearest first within each group. A group may
+        contain fewer than ``k`` entries when matches are invalid or fall below
+        ``threshold``.
+
+    Notes:
+        Non-finite and constant subsequences in either input are not eligible
+        matches.
+    """
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile(a, b, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
