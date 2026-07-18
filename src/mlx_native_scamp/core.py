@@ -32,7 +32,10 @@ def _ensure_1d_array(values: Any, name: str) -> Any:
         if array.dtype != mx.float32:
             array = array.astype(mx.float32)
     else:
-        array = mx.array(values, dtype=mx.float32)
+        numpy_array = np.asarray(values)
+        if numpy_array.ndim != 1:
+            raise ValueError(f"{name} must be a 1D array")
+        array = mx.array(np.ascontiguousarray(numpy_array, dtype=np.float32))
     if array.ndim != 1:
         raise ValueError(f"{name} must be a 1D array")
     return array

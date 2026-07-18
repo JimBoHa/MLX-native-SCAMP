@@ -115,6 +115,21 @@ class PyScampCompatTests(unittest.TestCase):
         np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
         np.testing.assert_array_equal(valid_idx, out_idx)
 
+    def test_numpy_compatible_inputs_are_forcecast_and_contiguous(self):
+        expected_dist, expected_idx = mp.selfjoin(np.arange(16, dtype=np.float32), 4, pearson=True)
+        inputs = (
+            range(16),
+            np.arange(16, dtype=np.float64),
+            np.ascontiguousarray(np.arange(16, dtype=np.float64)[::-1])[::-1],
+            np.array([str(value) for value in range(16)]),
+            np.array(range(16), dtype=object),
+        )
+        for values in inputs:
+            with self.subTest(input_type=type(values), dtype=getattr(values, "dtype", None)):
+                out_dist, out_idx = mp.selfjoin(values, 4, pearson=True)
+                np.testing.assert_allclose(expected_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
+                np.testing.assert_array_equal(expected_idx, out_idx)
+
     def test_compatibility_kwargs_are_accepted(self):
         out_dist, out_idx = mp.selfjoin(
             self.a,
