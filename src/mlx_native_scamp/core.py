@@ -40,6 +40,11 @@ def _select_execution_stream(gpus: Any, threads: int) -> Any | None:
 
     if not gpu_ids:
         return mx.default_stream(mx.cpu)
+    if threads > 0:
+        raise ValueError(
+            "Concurrent CPU and Metal execution is not supported; "
+            "specify either gpus=[0] or a positive threads value"
+        )
     if len(gpu_ids) > 1:
         raise ValueError(
             "MLX/Metal supports only one GPU; multi-GPU requests are not supported"

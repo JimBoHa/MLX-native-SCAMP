@@ -135,7 +135,6 @@ class PyScampCompatTests(unittest.TestCase):
             ([], 0, mx.cpu),
             (None, 2, mx.cpu),
             ([0], 0, mx.gpu),
-            ([0], 2, mx.gpu),
         ]
 
         for gpus, threads, expected_device in cases:
@@ -156,6 +155,9 @@ class PyScampCompatTests(unittest.TestCase):
             with self.subTest(gpus=gpus):
                 with self.assertRaisesRegex(ValueError, "multi-GPU"):
                     mp.selfjoin(self.a, self.m, gpus=gpus)
+
+        with self.assertRaisesRegex(ValueError, "Concurrent CPU and Metal"):
+            mp.selfjoin(self.a, self.m, gpus=[0], threads=2)
 
     def test_selected_stream_wraps_graph_construction_and_evaluation(self):
         original_device = mx.default_device()
@@ -236,7 +238,6 @@ class PyScampCompatTests(unittest.TestCase):
                 self.m,
                 pearson=True,
                 gpus=[0],
-                threads=2,
             )
             self.assertEqual(mx.cpu, mx.default_device())
             np.testing.assert_allclose(
