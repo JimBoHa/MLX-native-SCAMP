@@ -283,7 +283,46 @@ def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSerie
     return np.asarray(accum, dtype=np.float64)
 
 
-def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, threshold: float, rows: int, cols: int, self_join: bool) -> np.ndarray:
+def _convert_matrix_summary(
+    summary: np.ndarray,
+    m: int,
+    pearson: bool,
+    threshold: float,
+) -> np.ndarray:
+    summary = np.asarray(summary, dtype=np.float32)
+    summary[summary < -1.0] = np.nan
+    summary[summary < threshold] = np.nan
+    if pearson:
+        return summary
+    out = np.sqrt(np.maximum(2.0 * m * (1.0 - summary), 0.0)).astype(np.float32)
+    out[np.isnan(summary)] = np.nan
+    return out
+
+
+def _matrix_summary(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    pearson: bool,
+    threshold: float,
+    rows: int,
+    cols: int,
+    self_join: bool,
+    use_metal_kernel: bool,
+) -> np.ndarray:
+    if use_metal_kernel:
+        from ._metal_matrix import matrix_summary
+
+        summary = matrix_summary(
+            prepared_a,
+            prepared_b,
+            m,
+            rows,
+            cols,
+            self_join,
+        )
+        return _convert_matrix_summary(summary, m, pearson, threshold)
+
     row_edges = np.ceil(np.arange(rows + 1) * prepared_b.subsequences / rows).astype(int)
     col_edges = np.ceil(np.arange(cols + 1) * prepared_a.subsequences / cols).astype(int)
     col_ranges = [(int(col_edges[c]), int(col_edges[c + 1])) for c in range(cols)]
@@ -312,15 +351,12 @@ def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
             block_rows_summary.append(mx.stack(block_cols_summary, axis=0))
         summary = mx.maximum(summary, mx.stack(block_rows_summary, axis=0))
 
-    summary = np.asarray(summary, dtype=np.float32)
-    summary[summary < -1.0] = np.nan
-    if threshold is not None:
-        summary[summary < threshold] = np.nan
-    if pearson:
-        return summary.astype(np.float32)
-    out = np.sqrt(np.maximum(2.0 * m * (1.0 - summary), 0.0)).astype(np.float32)
-    out[np.isnan(summary)] = np.nan
-    return out
+    return _convert_matrix_summary(
+        np.asarray(summary, dtype=np.float32),
+        m,
+        pearson,
+        threshold,
+    )
 
 
 def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, k: int, threshold: float, pearson: bool, self_join: bool) -> list[tuple[int, int, float]]:
@@ -366,6 +402,7 @@ def _run_profile(
     profile: str,
     k: int | None = None,
     use_metal_1nn: bool = False,
+    use_metal_matrix: bool = False,
 ):
     has_b = b is not None
     float32_sources = _is_float32_input(a) and (
@@ -407,6 +444,11 @@ def _run_profile(
     if profile == "sum":
         return _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
     if profile == "matrix":
+        use_metal_matrix = (
+            use_metal_matrix
+            and float32_sources
+            and _metal_recurrence_is_safe(prepared_a, prepared_b, m)
+        )
         return _matrix_summary(
             prepared_a,
             prepared_b,
@@ -416,6 +458,7 @@ def _run_profile(
             mheight,
             mwidth,
             self_join,
+            use_metal_matrix,
         )
     if profile == "knn":
         if k is None or k <= 0:
@@ -461,6 +504,7 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
             *args,
             precision=params["precision"],
             use_metal_1nn=use_metal_1nn,
+            use_metal_matrix=use_metal_1nn,
             **kwargs,
         )
 
