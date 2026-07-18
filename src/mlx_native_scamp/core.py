@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import mlx.core as mx
@@ -17,6 +18,18 @@ class PreparedSeries:
     windows: Any
     valid: Any
     subsequences: int
+
+
+def _default_device_name() -> str:
+    try:
+        device = mx.default_device()
+    except Exception:
+        return "unknown"
+    if device == mx.gpu:
+        return "gpu"
+    if device == mx.cpu:
+        return "cpu"
+    return "unknown"
 
 
 def gpu_supported() -> bool:
@@ -243,7 +256,19 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
     return results
 
 
-def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: float = 0.0, mheight: int = 50, mwidth: int = 50, profile: str, k: int | None = None):
+def _run_profile(
+    a: Any,
+    b: Any | None,
+    m: int,
+    *,
+    pearson: bool,
+    threshold: float = 0.0,
+    mheight: int = 50,
+    mwidth: int = 50,
+    profile: str,
+    k: int | None = None,
+    verbose: bool = False,
+):
     series_a = _ensure_1d_array(a, "a")
     if m <= 0:
         raise ValueError("m must be greater than 0")
@@ -254,42 +279,73 @@ def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: flo
     series_b = _ensure_1d_array(b, "b") if has_b else series_a
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
+    if profile not in {"1nn", "sum", "matrix", "knn"}:
+        raise ValueError(f"Unknown profile type: {profile}")
+    if profile == "knn" and (k is None or k <= 0):
+        raise ValueError("k must be greater than 0")
+
+    join = "abjoin" if has_b else "selfjoin"
+    if verbose:
+        started = perf_counter()
+        print(
+            f"pyscamp {join}/{profile} start: "
+            f"a_subsequences={int(series_a.shape[0]) - m + 1} "
+            f"b_subsequences={int(series_b.shape[0]) - m + 1} "
+            f"window={m} device={_default_device_name()}"
+        )
 
     prepared_a = _prepare_series(series_a, m)
     prepared_b = _prepare_series(series_b, m)
     self_join = not has_b
 
     if profile == "1nn":
-        return _best_match_profile(prepared_a, prepared_b, m, pearson, self_join)
-    if profile == "sum":
-        return _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
-    if profile == "matrix":
-        return _matrix_summary(prepared_a, prepared_b, m, pearson, threshold, mheight, mwidth, self_join)
-    if profile == "knn":
-        if k is None or k <= 0:
-            raise ValueError("k must be greater than 0")
-        return _knn_profile(prepared_a, prepared_b, m, k, threshold, pearson, self_join)
-    raise ValueError(f"Unknown profile type: {profile}")
+        result = _best_match_profile(prepared_a, prepared_b, m, pearson, self_join)
+    elif profile == "sum":
+        result = _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
+    elif profile == "matrix":
+        result = _matrix_summary(prepared_a, prepared_b, m, pearson, threshold, mheight, mwidth, self_join)
+    else:
+        result = _knn_profile(prepared_a, prepared_b, m, k, threshold, pearson, self_join)
+
+    if verbose:
+        print(f"pyscamp {join}/{profile} complete: elapsed={perf_counter() - started:.6f}s")
+    return result
 
 
 def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
     params = _parse_common_kwargs(kwargs)
-    return _run_profile(a, None, m, pearson=params["pearson"], profile="1nn")
+    return _run_profile(a, None, m, pearson=params["pearson"], profile="1nn", verbose=params["verbose"])
 
 
 def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
     params = _parse_common_kwargs(kwargs)
-    return _run_profile(a, b, m, pearson=params["pearson"], profile="1nn")
+    return _run_profile(a, b, m, pearson=params["pearson"], profile="1nn", verbose=params["verbose"])
 
 
 def selfjoin_sum(a: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, None, m, pearson=True, threshold=params["threshold"], profile="sum")
+    return _run_profile(
+        a,
+        None,
+        m,
+        pearson=True,
+        threshold=params["threshold"],
+        profile="sum",
+        verbose=params["verbose"],
+    )
 
 
 def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, b, m, pearson=True, threshold=params["threshold"], profile="sum")
+    return _run_profile(
+        a,
+        b,
+        m,
+        pearson=True,
+        threshold=params["threshold"],
+        profile="sum",
+        verbose=params["verbose"],
+    )
 
 
 def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
@@ -303,6 +359,7 @@ def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
         mheight=params["mheight"],
         mwidth=params["mwidth"],
         profile="matrix",
+        verbose=params["verbose"],
     )
 
 
@@ -317,14 +374,33 @@ def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
         mheight=params["mheight"],
         mwidth=params["mwidth"],
         profile="matrix",
+        verbose=params["verbose"],
     )
 
 
 def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, None, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
+    return _run_profile(
+        a,
+        None,
+        m,
+        pearson=params["pearson"],
+        threshold=params["threshold"],
+        profile="knn",
+        k=k,
+        verbose=params["verbose"],
+    )
 
 
 def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, b, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
+    return _run_profile(
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        threshold=params["threshold"],
+        profile="knn",
+        k=k,
+        verbose=params["verbose"],
+    )

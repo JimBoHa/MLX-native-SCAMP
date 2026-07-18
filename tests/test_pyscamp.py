@@ -1,4 +1,7 @@
+import io
+import re
 import unittest
+from contextlib import redirect_stdout
 
 import mlx.core as mx
 import numpy as np
@@ -116,16 +119,80 @@ class PyScampCompatTests(unittest.TestCase):
         np.testing.assert_array_equal(valid_idx, out_idx)
 
     def test_compatibility_kwargs_are_accepted(self):
-        out_dist, out_idx = mp.selfjoin(
-            self.a,
-            self.m,
-            pearson=True,
-            gpus=[],
-            threads=2,
-            precision="double",
-            verbose=True,
-        )
+        with redirect_stdout(io.StringIO()):
+            out_dist, out_idx = mp.selfjoin(
+                self.a,
+                self.m,
+                pearson=True,
+                gpus=[],
+                threads=2,
+                precision="double",
+                verbose=True,
+            )
         self.assertEqual(out_dist.shape, out_idx.shape)
+
+    def test_verbose_reports_each_join_and_profile(self):
+        rng = np.random.default_rng(7)
+        a = rng.normal(size=10).astype(np.float32)
+        b = rng.normal(size=12).astype(np.float32)
+        m = 4
+        a_subsequences = len(a) - m + 1
+        b_subsequences = len(b) - m + 1
+        cases = [
+            ("selfjoin/1nn", a_subsequences, lambda: mp.selfjoin(a, m, verbose=True)),
+            ("abjoin/1nn", b_subsequences, lambda: mp.abjoin(a, b, m, verbose=True)),
+            ("selfjoin/sum", a_subsequences, lambda: mp.selfjoin_sum(a, m, verbose=True)),
+            ("abjoin/sum", b_subsequences, lambda: mp.abjoin_sum(a, b, m, verbose=True)),
+            (
+                "selfjoin/matrix",
+                a_subsequences,
+                lambda: mp.selfjoin_matrix(a, m, mheight=2, mwidth=3, verbose=True),
+            ),
+            (
+                "abjoin/matrix",
+                b_subsequences,
+                lambda: mp.abjoin_matrix(a, b, m, mheight=2, mwidth=3, verbose=True),
+            ),
+            ("selfjoin/knn", a_subsequences, lambda: mp.selfjoin_knn(a, m, 2, verbose=True)),
+            ("abjoin/knn", b_subsequences, lambda: mp.abjoin_knn(a, b, m, 2, verbose=True)),
+        ]
+
+        for label, expected_b_subsequences, run_profile in cases:
+            with self.subTest(profile=label):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    run_profile()
+                lines = stdout.getvalue().splitlines()
+
+                self.assertEqual(2, len(lines))
+                start = (
+                    f"pyscamp {label} start: "
+                    f"a_subsequences={a_subsequences} "
+                    f"b_subsequences={expected_b_subsequences} "
+                    f"window={m} device="
+                )
+                self.assertRegex(lines[0], rf"^{re.escape(start)}(?:cpu|gpu|unknown)$")
+                self.assertRegex(
+                    lines[1],
+                    rf"^pyscamp {re.escape(label)} complete: elapsed=\d+\.\d{{6}}s$",
+                )
+
+    def test_profiles_are_silent_by_default(self):
+        rng = np.random.default_rng(8)
+        a = rng.normal(size=10).astype(np.float32)
+        m = 4
+        profiles = [
+            lambda: mp.selfjoin(a, m),
+            lambda: mp.selfjoin_sum(a, m),
+            lambda: mp.selfjoin_matrix(a, m, mheight=2, mwidth=3),
+            lambda: mp.selfjoin_knn(a, m, 2),
+        ]
+
+        for run_profile in profiles:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                run_profile()
+            self.assertEqual("", stdout.getvalue())
 
     def test_invalid_kwargs_raise(self):
         with self.assertRaises(ValueError):

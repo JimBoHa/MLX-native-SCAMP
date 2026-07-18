@@ -41,4 +41,5 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
 - The compute-heavy matrix profile kernels are MLX-native on Apple Silicon.
 - Inputs can be NumPy arrays, Python sequences, or MLX arrays.
 - Compatibility kwargs like `gpus`, `threads`, and `precision` are accepted for API compatibility, but CUDA-specific behavior is not reproduced.
+- Pass `verbose=True` to any join to print one start line and one completion line; joins are silent by default.
 - The implementation currently targets dense 1D numeric arrays.
