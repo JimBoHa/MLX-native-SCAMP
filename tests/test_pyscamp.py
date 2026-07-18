@@ -6,6 +6,7 @@ import numpy as np
 
 import mlx_native_scamp.core as scamp_core
 import pyscamp as mp
+from mlx_native_scamp import core
 
 from reference import corr_to_euclidean, distance_matrix, reduce_1nn_index, reduce_matrix, reduce_sum_thresh
 
@@ -43,6 +44,21 @@ class PyScampCompatTests(unittest.TestCase):
             self.assertLessEqual(len(group), 3)
             best_row = int(np.nanargmax(dm[:, col]))
             self.assertEqual(group[0][0], best_row)
+
+    def _assert_join_results_equal(self, expected, actual):
+        if isinstance(expected, tuple):
+            np.testing.assert_allclose(
+                expected[0], actual[0], equal_nan=True, rtol=1e-5, atol=1e-5
+            )
+            np.testing.assert_array_equal(expected[1], actual[1])
+        else:
+            np.testing.assert_allclose(
+                np.asarray(expected),
+                np.asarray(actual),
+                equal_nan=True,
+                rtol=1e-5,
+                atol=1e-5,
+            )
 
     def test_public_surface_matches_upstream_bindings(self):
         exported = {name for name in EXPECTED_PUBLIC_CALLABLES if hasattr(mp, name)}
@@ -169,6 +185,149 @@ class PyScampCompatTests(unittest.TestCase):
             verbose=True,
         )
         self.assertEqual(out_dist.shape, out_idx.shape)
+
+    def test_max_tile_size_preserves_all_join_outputs(self):
+        rng = np.random.default_rng(7)
+        a = rng.random(1200, dtype=np.float32)
+        b = rng.random(1175, dtype=np.float32)
+        m = 32
+        tiled = {"max_tile_size": np.int64(1024)}
+        calls = {
+            "selfjoin": lambda options: mp.selfjoin(a, m, pearson=True, **options),
+            "abjoin": lambda options: mp.abjoin(a, b, m, pearson=True, **options),
+            "selfjoin_sum": lambda options: mp.selfjoin_sum(a, m, threshold=0.2, **options),
+            "abjoin_sum": lambda options: mp.abjoin_sum(a, b, m, threshold=0.2, **options),
+            "selfjoin_matrix": lambda options: mp.selfjoin_matrix(
+                a, m, threshold=0.1, mheight=5, mwidth=6, pearson=True, **options
+            ),
+            "abjoin_matrix": lambda options: mp.abjoin_matrix(
+                a, b, m, threshold=0.1, mheight=5, mwidth=6, pearson=True, **options
+            ),
+            "selfjoin_knn": lambda options: mp.selfjoin_knn(
+                a, m, 3, threshold=0.2, pearson=True, **options
+            ),
+            "abjoin_knn": lambda options: mp.abjoin_knn(
+                a, b, m, 3, threshold=0.2, pearson=True, **options
+            ),
+        }
+
+        for name, call in calls.items():
+            with self.subTest(name=name):
+                self._assert_join_results_equal(call({}), call(tiled))
+
+    def test_max_tile_size_bounds_both_similarity_dimensions(self):
+        rng = np.random.default_rng(8)
+        m = 32
+        max_tile_size = 1024
+        tile_subsequences = max_tile_size - m + 1
+        prepared_a = core._prepare_series(
+            core._ensure_1d_array(rng.random(1400, dtype=np.float32), "a"), m
+        )
+        prepared_b = core._prepare_series(
+            core._ensure_1d_array(rng.random(1300, dtype=np.float32), "b"), m
+        )
+
+        tiles = list(
+            core._iterate_blocks(
+                prepared_a,
+                prepared_b,
+                m,
+                False,
+                block_rows=2048,
+                tile_subsequences=tile_subsequences,
+            )
+        )
+
+        self.assertGreater(len(tiles), 1)
+        self.assertEqual(993, tile_subsequences)
+        self.assertTrue(
+            all(tile.values.shape[0] <= tile_subsequences for tile in tiles)
+        )
+        self.assertTrue(
+            all(tile.values.shape[1] <= tile_subsequences for tile in tiles)
+        )
+
+    def test_automatic_tile_size_uses_unified_memory_and_remains_bounded(self):
+        rng = np.random.default_rng(9)
+        m = 32
+        prepared_a = core._prepare_series(
+            core._ensure_1d_array(rng.random(2600, dtype=np.float32), "a"), m
+        )
+        prepared_b = core._prepare_series(
+            core._ensure_1d_array(rng.random(2500, dtype=np.float32), "b"), m
+        )
+
+        with patch.object(core, "_device_working_set_bytes", return_value=64 * core.MIB):
+            low_memory_tile = core._automatic_max_tile_size(
+                prepared_a, prepared_b, m
+            )
+        with patch.object(
+            core, "_device_working_set_bytes", return_value=8 * 1024 * core.MIB
+        ):
+            high_memory_tile = core._automatic_max_tile_size(
+                prepared_a, prepared_b, m
+            )
+
+        tile_subsequences = core._tile_subsequence_count(low_memory_tile, m)
+        self.assertGreater(high_memory_tile, low_memory_tile)
+        self.assertGreaterEqual(low_memory_tile, max(1024, 2 * m))
+        self.assertLess(tile_subsequences, prepared_a.subsequences)
+
+        tiles = list(
+            core._iterate_blocks(
+                prepared_a,
+                prepared_b,
+                m,
+                False,
+                block_rows=2048,
+                tile_subsequences=tile_subsequences,
+            )
+        )
+        self.assertGreater(len(tiles), 1)
+        self.assertTrue(
+            all(max(tile.values.shape) <= tile_subsequences for tile in tiles)
+        )
+
+    def test_omitted_max_tile_size_uses_automatic_policy(self):
+        with patch.object(
+            core,
+            "_automatic_max_tile_size",
+            wraps=core._automatic_max_tile_size,
+        ) as automatic:
+            mp.abjoin(self.a, self.b, self.m, pearson=True)
+
+        automatic.assert_called_once()
+
+    def test_reducer_scheduler_bounds_in_flight_tiles(self):
+        with (
+            patch.object(core, "_schedule_reducer_state") as schedule,
+            patch.object(core.mx, "synchronize") as synchronize,
+        ):
+            scheduler = core.ReducerScheduler()
+            scheduler.schedule("first")
+            synchronize.assert_not_called()
+            scheduler.schedule("second")
+            synchronize.assert_called_once_with()
+            scheduler.schedule("third")
+            scheduler.finish()
+
+        self.assertEqual(3, schedule.call_count)
+        self.assertEqual(2, synchronize.call_count)
+
+    def test_max_tile_size_validation(self):
+        with self.assertRaisesRegex(ValueError, "integer"):
+            mp.selfjoin(self.a, self.m, max_tile_size=1024.0)
+        with self.assertRaisesRegex(ValueError, "integer"):
+            mp.selfjoin(self.a, self.m, max_tile_size=None)
+        with self.assertRaisesRegex(ValueError, "at least 1024"):
+            mp.selfjoin(self.a, self.m, max_tile_size=1023)
+
+        series = np.arange(1200, dtype=np.float32)
+        with self.assertRaisesRegex(ValueError, "at least twice m"):
+            mp.selfjoin(series, 513, max_tile_size=1024)
+
+        boundary_profile, _ = mp.selfjoin(series[:512], 512, max_tile_size=1024)
+        self.assertEqual((1,), boundary_profile.shape)
 
     def test_invalid_kwargs_raise(self):
         with self.assertRaises(ValueError):

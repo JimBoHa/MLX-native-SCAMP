@@ -40,5 +40,11 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
 
 - The compute-heavy matrix profile kernels are MLX-native on Apple Silicon.
 - Inputs can be NumPy arrays, Python sequences, or MLX arrays.
+- Like SCAMP, `max_tile_size` is a time-series tile length. Its effective
+  correlation dimension is `max_tile_size - m + 1`, and it must be an integer
+  of at least 1024 and at least twice the window size.
+- When `max_tile_size` is omitted, MLX chooses a bounded tile from the Apple
+  device's recommended unified-memory working set. Normalized windows remain
+  densely stored.
 - Compatibility kwargs like `gpus`, `threads`, and `precision` are accepted for API compatibility, but CUDA-specific behavior is not reproduced.
 - The implementation currently targets dense 1D numeric arrays.
