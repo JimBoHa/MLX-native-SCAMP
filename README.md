@@ -33,7 +33,7 @@ import numpy as np
 import pyscamp as mp
 
 series = np.random.random(4096).astype(np.float32)
-profile, index = mp.selfjoin(series, 128, pearson=True)
+profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 ```
 
 ## Notes
