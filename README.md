@@ -1,6 +1,12 @@
 # MLX-native-SCAMP
 
-`MLX-native-SCAMP` is an Apple Silicon port of SCAMP's Python-facing API built on top of Apple MLX.
+`MLX-native-SCAMP` is an Apple Silicon port of the Python-facing API from
+[zpzim/SCAMP](https://github.com/zpzim/SCAMP), built on Apple MLX.
+
+The project targets the `pyscamp` Python surface. It does not currently port
+SCAMP's C++ CLI, distributed client/server runtime, or CUDA kernel-management
+tools. Computation that maps to Apple hardware is implemented with MLX and
+Metal semantics instead of emulating NVIDIA devices.
 
 The package provides an MLX-native `pyscamp`-compatible import surface for the
 full SCAMP 4.0.3 Python API:
@@ -15,7 +21,8 @@ full SCAMP 4.0.3 Python API:
 - `selfjoin_knn`
 - `abjoin_knn`
 
-The implementation is pure Python plus MLX and is meant to be called by other apps without requiring CUDA.
+The implementation uses Python and NumPy-compatible I/O around an MLX compute
+engine and is meant to be called by other apps without requiring CUDA.
 All nine SCAMP 4.0.3 `pyscamp` callables are implemented in the local MLX
 engine rather than delegated back to CUDA SCAMP.
 
@@ -23,9 +30,8 @@ engine rather than delegated back to CUDA SCAMP.
 
 The compatibility baseline is the nine-callable Python API in the official
 [SCAMP 4.0.3 release](https://github.com/zpzim/SCAMP/releases/tag/v4.0.3).
-Additions found only on the current upstream `master` branch are tracked as
-separate compatibility work and are not part of this baseline unless explicitly
-documented here.
+Compatible additions from current upstream SCAMP are tracked as separate work
+until they are merged and documented here.
 
 ## Install
 
@@ -52,3 +58,14 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
 - Inputs can be NumPy arrays, Python sequences, or MLX arrays.
 - Compatibility kwargs like `gpus`, `threads`, and `precision` are accepted for API compatibility, but CUDA-specific behavior is not reproduced.
 - The implementation currently targets dense 1D numeric arrays.
+
+## Upstream and citation
+
+This port builds on the SCAMP algorithm and public interface maintained by
+[Zachary Zimmerman and the SCAMP contributors](https://github.com/zpzim/SCAMP).
+Users should retain the upstream attribution and cite the SCAMP work when
+appropriate:
+
+Zimmerman, Zachary, et al. “Matrix Profile XIV: Scaling Time Series Motif
+Discovery with GPUs to Break a Quintillion Pairwise Comparisons a Day and
+Beyond.” *Proceedings of the ACM Symposium on Cloud Computing*, 2019.
