@@ -49,6 +49,8 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
 - Concurrent CPU+GPU workers are not exposed by MLX, so supplying both selectors
   is rejected rather than silently ignoring one or claiming SCAMP's
   heterogeneous-worker behavior.
-- Other compatibility kwargs such as `precision` are accepted, but CUDA-specific
-  behavior is not reproduced.
+- `precision="single"` computes in float32 on the selected MLX device (normally Metal).
+- The default `precision="double"` and `precision="ultra"` compute in float64 on the MLX CPU backend because Metal does not support float64.
+- Explicit `gpus=[0]` requests with `double` or `ultra` are rejected instead of
+  silently moving float64 work to CPU.
 - The implementation currently targets dense 1D numeric arrays.

@@ -9,7 +9,7 @@ import numpy as np
 
 SENTINEL = -2.0
 FLATNESS_EPSILON = 1e-13
-VALID_PRECISIONS = {"single", "mixed", "double", "ultra"}
+VALID_PRECISIONS = {"single", "double", "ultra"}
 BLOCK_ROWS = 256
 
 
@@ -57,13 +57,13 @@ def _select_execution_stream(gpus: Any, threads: int) -> Any | None:
     return mx.default_stream(mx.gpu)
 
 
-def _ensure_1d_array(values: Any, name: str) -> Any:
+def _ensure_1d_array(values: Any, name: str, dtype: Any) -> Any:
     if isinstance(values, mx.array):
         array = values
-        if array.dtype != mx.float32:
-            array = array.astype(mx.float32)
+        if array.dtype != dtype:
+            array = array.astype(dtype)
     else:
-        array = mx.array(values, dtype=mx.float32)
+        array = mx.array(values, dtype=dtype)
     if array.ndim != 1:
         raise ValueError(f"{name} must be a 1D array")
     return array
@@ -82,7 +82,7 @@ def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, all
 
     precision = kwargs.get("precision", "double")
     if precision not in VALID_PRECISIONS:
-        raise ValueError("Invalid precision type specified: valid options are single, mixed, double, ultra")
+        raise ValueError("Invalid precision type specified: valid options are single, double, ultra")
 
     threshold = float(kwargs.get("threshold", 0.0))
     if allow_threshold and (threshold < -1.0 or threshold > 1.0):
@@ -173,7 +173,7 @@ def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
         row_valid = mx.take(prepared_b.valid, row_indices, axis=0)
         block = block_b @ prepared_a.windows.T
         valid_mask = row_valid[:, None] & prepared_a.valid[None, :]
-        sentinel_block = mx.full(block.shape, SENTINEL, dtype=mx.float32)
+        sentinel_block = mx.full(block.shape, SENTINEL, dtype=block.dtype)
         block = mx.where(valid_mask, block, sentinel_block)
         if self_join and exclusion > 0:
             diag_mask = mx.abs(row_indices[:, None] - col_indices[None, :]) < exclusion
@@ -182,7 +182,7 @@ def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
 
 
 def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, self_join: bool) -> tuple[np.ndarray, np.ndarray]:
-    best_corr = mx.full((prepared_a.subsequences,), SENTINEL, dtype=mx.float32)
+    best_corr = mx.full((prepared_a.subsequences,), SENTINEL, dtype=prepared_a.windows.dtype)
     best_idx = mx.full((prepared_a.subsequences,), -1, dtype=mx.int32)
     for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         block_best_corr = mx.max(block, axis=0)
@@ -197,7 +197,7 @@ def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, 
 
 
 def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, threshold: float, self_join: bool) -> np.ndarray:
-    accum = mx.zeros((prepared_a.subsequences,), dtype=mx.float32)
+    accum = mx.zeros((prepared_a.subsequences,), dtype=prepared_a.windows.dtype)
     for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         filtered = mx.where(block > threshold, block, mx.zeros_like(block))
         accum = accum + mx.sum(filtered, axis=0)
@@ -209,25 +209,25 @@ def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
     col_edges = np.ceil(np.arange(cols + 1) * prepared_a.subsequences / cols).astype(int)
     col_ranges = [(int(col_edges[c]), int(col_edges[c + 1])) for c in range(cols)]
     col_indices = mx.arange(prepared_a.subsequences, dtype=mx.int32)
-    summary = mx.full((rows, cols), SENTINEL, dtype=mx.float32)
+    summary = mx.full((rows, cols), SENTINEL, dtype=prepared_a.windows.dtype)
 
     for row_start, row_end, row_indices, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         if self_join:
             upper_mask = row_indices[:, None] <= col_indices[None, :]
-            block = mx.where(upper_mask, block, mx.full(block.shape, SENTINEL, dtype=mx.float32))
+            block = mx.where(upper_mask, block, mx.full(block.shape, SENTINEL, dtype=block.dtype))
         block_rows_summary: list[Any] = []
         for r in range(rows):
             rs = int(max(row_start, row_edges[r]))
             re = int(min(row_end, row_edges[r + 1]))
             if rs >= re:
-                block_rows_summary.append(mx.full((cols,), SENTINEL, dtype=mx.float32))
+                block_rows_summary.append(mx.full((cols,), SENTINEL, dtype=summary.dtype))
                 continue
             row_slice = block[rs - row_start : re - row_start]
             block_cols_summary: list[Any] = []
             for c in range(cols):
                 cs, ce = col_ranges[c]
                 if cs >= ce:
-                    block_cols_summary.append(mx.array(SENTINEL, dtype=mx.float32))
+                    block_cols_summary.append(mx.array(SENTINEL, dtype=summary.dtype))
                     continue
                 block_cols_summary.append(mx.max(row_slice[:, cs:ce]))
             block_rows_summary.append(mx.stack(block_cols_summary, axis=0))
@@ -246,7 +246,7 @@ def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
 
 def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, k: int, threshold: float, pearson: bool, self_join: bool) -> list[tuple[int, int, float]]:
     n_cols = prepared_a.subsequences
-    best_corr = mx.full((k, n_cols), SENTINEL, dtype=mx.float32)
+    best_corr = mx.full((k, n_cols), SENTINEL, dtype=prepared_a.windows.dtype)
     best_idx = mx.full((k, n_cols), -1, dtype=mx.int32)
 
     for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
@@ -274,15 +274,28 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
     return results
 
 
-def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: float = 0.0, mheight: int = 50, mwidth: int = 50, profile: str, k: int | None = None):
-    series_a = _ensure_1d_array(a, "a")
+def _run_profile(
+    a: Any,
+    b: Any | None,
+    m: int,
+    *,
+    pearson: bool,
+    precision: str,
+    threshold: float = 0.0,
+    mheight: int = 50,
+    mwidth: int = 50,
+    profile: str,
+    k: int | None = None,
+):
+    compute_dtype = mx.float32 if precision == "single" else mx.float64
+    series_a = _ensure_1d_array(a, "a", compute_dtype)
     if m <= 0:
         raise ValueError("m must be greater than 0")
     if int(series_a.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(a)")
 
     has_b = b is not None
-    series_b = _ensure_1d_array(b, "b") if has_b else series_a
+    series_b = _ensure_1d_array(b, "b", compute_dtype) if has_b else series_a
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
 
@@ -295,43 +308,97 @@ def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: flo
     if profile == "sum":
         return _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
     if profile == "matrix":
-        return _matrix_summary(prepared_a, prepared_b, m, pearson, threshold, mheight, mwidth, self_join)
+        return _matrix_summary(
+            prepared_a,
+            prepared_b,
+            m,
+            pearson,
+            threshold,
+            mheight,
+            mwidth,
+            self_join,
+        )
     if profile == "knn":
         if k is None or k <= 0:
             raise ValueError("k must be greater than 0")
-        return _knn_profile(prepared_a, prepared_b, m, k, threshold, pearson, self_join)
+        return _knn_profile(
+            prepared_a, prepared_b, m, k, threshold, pearson, self_join
+        )
     raise ValueError(f"Unknown profile type: {profile}")
 
 
-def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
+def _resolve_execution_stream(params: dict[str, Any]) -> Any | None:
     execution_stream = _select_execution_stream(params["gpus"], params["threads"])
+    if params["precision"] == "single":
+        return execution_stream
+
+    if execution_stream is not None and execution_stream.device == mx.gpu:
+        raise ValueError(
+            "Metal does not support float64; use precision='single' with "
+            "gpus=[0], or select CPU execution for double/ultra precision"
+        )
+    return mx.default_stream(mx.cpu)
+
+
+def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
+    execution_stream = _resolve_execution_stream(params)
     stream_context = (
         nullcontext()
         if execution_stream is None
         else mx.stream(execution_stream)
     )
     with stream_context:
-        return _run_profile(*args, **kwargs)
+        return _run_profile(*args, precision=params["precision"], **kwargs)
 
 
 def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
     params = _parse_common_kwargs(kwargs)
-    return _run_profile_with_resources(params, a, None, m, pearson=params["pearson"], profile="1nn")
+    return _run_profile_with_resources(
+        params,
+        a,
+        None,
+        m,
+        pearson=params["pearson"],
+        profile="1nn",
+    )
 
 
 def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
     params = _parse_common_kwargs(kwargs)
-    return _run_profile_with_resources(params, a, b, m, pearson=params["pearson"], profile="1nn")
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        profile="1nn",
+    )
 
 
 def selfjoin_sum(a: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile_with_resources(params, a, None, m, pearson=True, threshold=params["threshold"], profile="sum")
+    return _run_profile_with_resources(
+        params,
+        a,
+        None,
+        m,
+        pearson=True,
+        threshold=params["threshold"],
+        profile="sum",
+    )
 
 
 def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile_with_resources(params, a, b, m, pearson=True, threshold=params["threshold"], profile="sum")
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=True,
+        threshold=params["threshold"],
+        profile="sum",
+    )
 
 
 def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
@@ -366,9 +433,27 @@ def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile_with_resources(params, a, None, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
+    return _run_profile_with_resources(
+        params,
+        a,
+        None,
+        m,
+        pearson=params["pearson"],
+        threshold=params["threshold"],
+        profile="knn",
+        k=k,
+    )
 
 
 def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile_with_resources(params, a, b, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        threshold=params["threshold"],
+        profile="knn",
+        k=k,
+    )
