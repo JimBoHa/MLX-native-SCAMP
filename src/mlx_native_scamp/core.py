@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +37,16 @@ def _ensure_1d_array(values: Any, name: str) -> Any:
     if array.ndim != 1:
         raise ValueError(f"{name} must be a 1D array")
     return array
+
+
+def _normalize_window_size(m: Any) -> int:
+    try:
+        normalized = operator.index(m)
+    except TypeError:
+        raise TypeError("m must be an integer") from None
+    if normalized < 3:
+        raise ValueError("m must be at least 3")
+    return normalized
 
 
 def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, allow_threshold: bool = False) -> dict[str, Any]:
@@ -244,9 +255,8 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
 
 
 def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: float = 0.0, mheight: int = 50, mwidth: int = 50, profile: str, k: int | None = None):
+    m = _normalize_window_size(m)
     series_a = _ensure_1d_array(a, "a")
-    if m <= 0:
-        raise ValueError("m must be greater than 0")
     if int(series_a.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(a)")
 
@@ -254,6 +264,19 @@ def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: flo
     series_b = _ensure_1d_array(b, "b") if has_b else series_a
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
+
+    subsequences_a = int(series_a.shape[0]) - m + 1
+    subsequences_b = int(series_b.shape[0]) - m + 1
+    if profile == "matrix":
+        if mwidth > subsequences_a:
+            raise ValueError(
+                "mwidth must be less than or equal to the number of subsequences in a"
+            )
+        if mheight > subsequences_b:
+            height_series = "b" if has_b else "a"
+            raise ValueError(
+                f"mheight must be less than or equal to the number of subsequences in {height_series}"
+            )
 
     prepared_a = _prepare_series(series_a, m)
     prepared_b = _prepare_series(series_b, m)
