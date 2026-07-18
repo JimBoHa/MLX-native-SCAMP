@@ -131,6 +131,16 @@ class PyScampCompatTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mp.selfjoin(self.a, self.m, nope=True)
 
+    def test_nan_threshold_is_rejected(self):
+        calls = (
+            lambda: mp.selfjoin_sum(self.a, self.m, threshold=np.nan),
+            lambda: mp.selfjoin_matrix(self.a, self.m, threshold=np.nan),
+            lambda: mp.selfjoin_knn(self.a, self.m, 3, threshold=np.nan),
+        )
+        for call in calls:
+            with self.subTest(call=call), self.assertRaisesRegex(ValueError, "finite"):
+                call()
+
 
 if __name__ == "__main__":
     unittest.main()

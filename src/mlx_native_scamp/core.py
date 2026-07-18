@@ -54,8 +54,8 @@ def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, all
         raise ValueError("Invalid precision type specified: valid options are single, mixed, double, ultra")
 
     threshold = float(kwargs.get("threshold", 0.0))
-    if allow_threshold and (threshold < -1.0 or threshold > 1.0):
-        raise ValueError("Invalid threshold specified: value must be between -1 and 1")
+    if allow_threshold and (not np.isfinite(threshold) or threshold < -1.0 or threshold > 1.0):
+        raise ValueError("Invalid threshold specified: value must be finite and between -1 and 1")
 
     threads = int(kwargs.get("threads", 0))
     if threads < 0:
