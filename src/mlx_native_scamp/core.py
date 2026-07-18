@@ -19,6 +19,11 @@ class PreparedSeries:
     subsequences: int
 
 
+def _schedule_reducer_state(*state: Any) -> None:
+    """Schedule compact state so MLX can release its similarity block."""
+    mx.async_eval(*state)
+
+
 def gpu_supported() -> bool:
     try:
         return mx.default_device() == mx.gpu
@@ -159,6 +164,7 @@ def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, 
         update = block_best_corr > best_corr
         best_corr = mx.where(update, block_best_corr, best_corr)
         best_idx = mx.where(update, block_best_idx, best_idx)
+        _schedule_reducer_state(best_corr, best_idx)
     corr_np = np.asarray(best_corr).astype(np.float32)
     idx_np = np.asarray(best_idx).astype(np.int32)
     idx_np[corr_np < -1.0] = -1
@@ -170,6 +176,7 @@ def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSerie
     for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         filtered = mx.where(block > threshold, block, mx.zeros_like(block))
         accum = accum + mx.sum(filtered, axis=0)
+        _schedule_reducer_state(accum)
     return np.asarray(accum, dtype=np.float64)
 
 
@@ -201,6 +208,7 @@ def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
                 block_cols_summary.append(mx.max(row_slice[:, cs:ce]))
             block_rows_summary.append(mx.stack(block_cols_summary, axis=0))
         summary = mx.maximum(summary, mx.stack(block_rows_summary, axis=0))
+        _schedule_reducer_state(summary)
 
     summary = np.asarray(summary, dtype=np.float32)
     summary[summary < -1.0] = np.nan
@@ -227,6 +235,7 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
         merged_order = _topk_desc_axis0(merged_corr, k)
         best_corr = mx.take_along_axis(merged_corr, merged_order, axis=0)
         best_idx = mx.take_along_axis(merged_idx, merged_order, axis=0)
+        _schedule_reducer_state(best_corr, best_idx)
 
     corr_np = np.asarray(best_corr).astype(np.float32)
     idx_np = np.asarray(best_idx).astype(np.int32)
