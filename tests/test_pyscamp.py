@@ -62,6 +62,43 @@ class PyScampCompatTests(unittest.TestCase):
         np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
         np.testing.assert_array_equal(valid_idx, out_idx)
 
+    def test_abjoin_clamps_positive_correlation_roundoff(self):
+        series = np.arange(8, dtype=np.float32)
+
+        out_corr, out_idx = mp.abjoin(series, series, len(series), pearson=True)
+
+        np.testing.assert_array_equal(out_corr, np.array([1.0], dtype=np.float32))
+        np.testing.assert_array_equal(out_idx, np.array([0], dtype=np.int32))
+
+    def test_abjoin_preserves_perfect_anticorrelation(self):
+        series = np.arange(8, dtype=np.float32)
+        expected_distance = np.array([2.0 * np.sqrt(len(series))], dtype=np.float32)
+
+        out_corr, out_idx = mp.abjoin(series, -series, len(series), pearson=True)
+        out_dist, dist_idx = mp.abjoin(series, -series, len(series), pearson=False)
+
+        np.testing.assert_array_equal(out_corr, np.array([-1.0], dtype=np.float32))
+        np.testing.assert_array_equal(out_idx, np.array([0], dtype=np.int32))
+        np.testing.assert_allclose(out_dist, expected_distance, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(dist_idx, np.array([0], dtype=np.int32))
+
+    def test_matrix_and_knn_preserve_correlation_boundary(self):
+        series = np.arange(8, dtype=np.float32)
+
+        matrix = mp.abjoin_matrix(
+            series,
+            -series,
+            len(series),
+            threshold=-1.0,
+            mheight=1,
+            mwidth=1,
+            pearson=True,
+        )
+        matches = mp.abjoin_knn(series, series, len(series), 1, threshold=0.0, pearson=True)
+
+        np.testing.assert_array_equal(matrix, np.array([[-1.0]], dtype=np.float32))
+        self.assertEqual([(0, 0, 1.0)], matches)
+
     def test_selfjoin_euclidean_matches_reference_conversion(self):
         valid_corr, valid_idx = reduce_1nn_index(self.dm_self)
         valid_dist = corr_to_euclidean(valid_corr, self.m)
