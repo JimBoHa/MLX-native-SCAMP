@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
+from numbers import Real
 from typing import Any
 
 import mlx.core as mx
@@ -8,7 +10,7 @@ import numpy as np
 
 SENTINEL = -2.0
 FLATNESS_EPSILON = 1e-13
-VALID_PRECISIONS = {"single", "mixed", "double", "ultra"}
+VALID_PRECISIONS = {"single", "double", "ultra"}
 BLOCK_ROWS = 256
 
 
@@ -38,6 +40,32 @@ def _ensure_1d_array(values: Any, name: str) -> Any:
     return array
 
 
+def _index_kwarg(value: Any, name: str) -> int:
+    try:
+        return operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an integer") from None
+
+
+def _bool_kwarg(value: Any, name: str) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, (Real, np.bool_)):
+        raise TypeError(f"{name} must be a boolean-compatible number or None")
+    return bool(value)
+
+
+def _gpu_kwarg(value: Any) -> list[int]:
+    if value is None:
+        raise TypeError("gpus must be a sequence of integer device IDs")
+    try:
+        return [_index_kwarg(device, "GPU device ID") for device in value]
+    except TypeError as error:
+        if str(error) == "GPU device ID must be an integer":
+            raise
+        raise TypeError("gpus must be a sequence of integer device IDs") from None
+
+
 def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, allow_threshold: bool = False) -> dict[str, Any]:
     valid_keys = {"verbose", "precision", "pearson", "gpus", "threads"}
     if allow_threshold:
@@ -50,28 +78,33 @@ def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, all
         raise ValueError(f"Invalid keyword argument specified unknown argument: {sorted(unknown)[0]}")
 
     precision = kwargs.get("precision", "double")
+    if not isinstance(precision, str):
+        raise TypeError("precision must be a string")
     if precision not in VALID_PRECISIONS:
-        raise ValueError("Invalid precision type specified: valid options are single, mixed, double, ultra")
+        raise ValueError("Invalid precision type specified: valid options are single, double, ultra")
 
-    threshold = float(kwargs.get("threshold", 0.0))
+    threshold_value = kwargs.get("threshold", 0.0)
+    if not isinstance(threshold_value, Real):
+        raise TypeError("threshold must be a real number")
+    threshold = float(threshold_value)
     if allow_threshold and (threshold < -1.0 or threshold > 1.0):
         raise ValueError("Invalid threshold specified: value must be between -1 and 1")
 
-    threads = int(kwargs.get("threads", 0))
+    threads = _index_kwarg(kwargs.get("threads", 0), "threads")
     if threads < 0:
         raise ValueError("Invalid number of cpu worker threads specified, must be greater than or equal to 0.")
 
     params = {
-        "pearson": bool(kwargs.get("pearson", False)),
+        "pearson": _bool_kwarg(kwargs.get("pearson", False), "pearson"),
         "precision": precision,
         "threshold": threshold,
-        "verbose": bool(kwargs.get("verbose", False)),
+        "verbose": _bool_kwarg(kwargs.get("verbose", False), "verbose"),
         "threads": threads,
-        "gpus": kwargs.get("gpus", None),
+        "gpus": _gpu_kwarg(kwargs["gpus"]) if "gpus" in kwargs else None,
     }
     if allow_matrix:
-        params["mheight"] = int(kwargs.get("mheight", 50))
-        params["mwidth"] = int(kwargs.get("mwidth", 50))
+        params["mheight"] = _index_kwarg(kwargs.get("mheight", 50), "mheight")
+        params["mwidth"] = _index_kwarg(kwargs.get("mwidth", 50), "mwidth")
         if params["mheight"] <= 0:
             raise ValueError("Invalid matrix height specified: value must be greater than 0")
         if params["mwidth"] <= 0:

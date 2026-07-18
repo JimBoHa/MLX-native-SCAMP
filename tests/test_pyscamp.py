@@ -131,6 +131,34 @@ class PyScampCompatTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mp.selfjoin(self.a, self.m, nope=True)
 
+    def test_compatibility_kwarg_types_match_upstream(self):
+        invalid_calls = (
+            lambda: mp.selfjoin(self.a, self.m, threads=1.5),
+            lambda: mp.selfjoin(self.a, self.m, pearson="false"),
+            lambda: mp.selfjoin(self.a, self.m, verbose=[]),
+            lambda: mp.selfjoin(self.a, self.m, gpus=None),
+            lambda: mp.selfjoin(self.a, self.m, gpus=[0.0]),
+            lambda: mp.selfjoin_sum(self.a, self.m, threshold="0.2"),
+            lambda: mp.selfjoin_matrix(self.a, self.m, mheight=2.5),
+        )
+        for call in invalid_calls:
+            with self.subTest(call=call), self.assertRaises(TypeError):
+                call()
+
+        out_dist, out_idx = mp.selfjoin(
+            self.a,
+            self.m,
+            pearson=np.bool_(True),
+            verbose=0,
+            threads=np.int64(1),
+            gpus=(),
+        )
+        self.assertEqual(out_dist.shape, out_idx.shape)
+
+    def test_removed_mixed_precision_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "single, double, ultra"):
+            mp.selfjoin(self.a, self.m, precision="mixed")
+
 
 if __name__ == "__main__":
     unittest.main()
