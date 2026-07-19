@@ -13,10 +13,15 @@ from .core import (
     selfjoin_sum,
 )
 
-try:
-    __version__ = _distribution_version("mlx-native-scamp")
-except _PackageNotFoundError:
-    __version__ = "dev"
+
+def _resolve_version() -> str:
+    try:
+        return _distribution_version("mlx-native-scamp")
+    except _PackageNotFoundError:
+        return "dev"
+
+
+__version__ = _resolve_version()
 
 __all__ = [
     "__version__",
