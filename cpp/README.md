@@ -72,8 +72,14 @@ add_subdirectory(path/to/MLX-native-SCAMP)
 target_link_libraries(my_app PRIVATE MLXNativeSCAMP::scamp)
 ```
 
+Examples and tests default off when the project is included through
+`add_subdirectory`, so it adds only the requested library to a parent build.
+
 or install the exported `MLXNativeSCAMPConfig.cmake` package with
-`cmake --install`.
+`cmake --install`. The installed library does not embed the build virtual
+environment in its runtime search path; consumers select their MLX package
+through `MLX_DIR`/`CMAKE_PREFIX_PATH`, and the exported target links it
+transitively.
 
 ## Explicit expansion gaps
 

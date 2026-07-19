@@ -209,9 +209,24 @@ PreparedSeries PrepareSeries(const std::vector<double> &input,
                              std::size_t window) {
   std::vector<double> clean_double(input.size(), 0.0);
   std::vector<int> invalid_prefix(input.size() + 1, 0);
+  double origin = 0.0;
+  const auto first_finite =
+      std::find_if(input.begin(), input.end(), [](double value) {
+        return std::isfinite(value);
+      });
+  if (first_finite != input.end()) {
+    origin = *first_finite;
+  }
   for (std::size_t i = 0; i < input.size(); ++i) {
     if (std::isfinite(input[i])) {
-      clean_double[i] = input[i];
+      // Pearson correlation is independently translation-invariant for each
+      // series.  Removing a stable origin before the rolling statistics keeps
+      // nearby variation representable when the raw baseline is very large.
+      clean_double[i] = input[i] - origin;
+      if (!std::isfinite(clean_double[i])) {
+        throw SCAMPException(
+            "Error: input range overflows stable centering precomputation");
+      }
     }
     invalid_prefix[i + 1] =
         invalid_prefix[i] + (std::isfinite(input[i]) ? 0 : 1);
@@ -389,39 +404,41 @@ void ValidateResources(const std::vector<int> &devices, int num_threads) {
 std::string GetPrecisionTypeString(SCAMPPrecisionType type) {
   switch (type) {
   case PRECISION_SINGLE:
-    return "single";
+    return "PRECISION_SINGLE";
   case PRECISION_MIXED:
-    return "mixed";
+    return "PRECISION_MIXED";
   case PRECISION_DOUBLE:
-    return "double";
+    return "PRECISION_DOUBLE";
   case PRECISION_ULTRA:
-    return "ultra";
-  default:
-    return "invalid";
+    return "PRECISION_ULTRA";
+  case PRECISION_INVALID:
+    return "PRECISION_INVALID";
   }
+  return "PRECISION_UNKNOWN";
 }
 
 std::string GetProfileTypeString(SCAMPProfileType type) {
   switch (type) {
   case PROFILE_TYPE_1NN_INDEX:
-    return "1NN_INDEX";
+    return "PROFILE_TYPE_1NN_INDEX";
   case PROFILE_TYPE_SUM_THRESH:
-    return "SUM_THRESH";
+    return "PROFILE_TYPE_SUM_THRESH";
   case PROFILE_TYPE_FREQUENCY_THRESH:
-    return "FREQUENCY_THRESH";
+    return "PROFILE_TYPE_FREQUENCY_THRESH";
   case PROFILE_TYPE_KNN:
-    return "KNN";
+    return "PROFILE_TYPE_KNN";
   case PROFILE_TYPE_1NN_MULTIDIM:
-    return "1NN_MULTIDIM";
+    return "PROFILE_TYPE_1NN_MULTIDIM";
   case PROFILE_TYPE_1NN:
-    return "1NN";
+    return "PROFILE_TYPE_1NN";
   case PROFILE_TYPE_APPROX_ALL_NEIGHBORS:
-    return "APPROX_ALL_NEIGHBORS";
+    return "PROFILE_TYPE_APPROX_ALL_NEIGHBORS";
   case PROFILE_TYPE_MATRIX_SUMMARY:
-    return "MATRIX_SUMMARY";
-  default:
-    return "INVALID";
+    return "PROFILE_TYPE_MATRIX_SUMMARY";
+  case PROFILE_TYPE_INVALID:
+    return "PROFILE_TYPE_INVALID";
   }
+  return "PROFILE_TYPE_UNKNOWN";
 }
 
 float GetProfileCorrelation(std::uint64_t packed_profile) {
@@ -480,7 +497,7 @@ void Profile::Alloc(std::size_t size, std::int64_t matrix_height,
   }
 }
 
-void SCAMPArgs::validate() const {
+void SCAMPArgs::validate() {
   if (profile_type != PROFILE_TYPE_1NN_INDEX) {
     throw SCAMPException(
         "Error: native C++ support currently covers PROFILE_TYPE_1NN_INDEX "
@@ -520,8 +537,12 @@ void SCAMPArgs::validate() const {
         "Error: AB row profiles require computing_rows=true and "
         "keep_rows_separate=true together");
   }
-  const bool row_offset_set = distributed_start_row >= 0;
-  const bool col_offset_set = distributed_start_col >= 0;
+  if (distributed_start_row < -1 || distributed_start_col < -1) {
+    throw SCAMPException(
+        "Error: distributed offsets must be -1 (unset) or nonnegative");
+  }
+  const bool row_offset_set = distributed_start_row != -1;
+  const bool col_offset_set = distributed_start_col != -1;
   if (row_offset_set != col_offset_set) {
     throw SCAMPException(
         "Error: distributed row and column offsets must be set together");
@@ -541,6 +562,19 @@ void SCAMPArgs::validate() const {
     throw SCAMPException(
         "Error: 1NN distributed offsets require is_aligned=true");
   }
+  if (row_offset_set) {
+    const auto max_metal_index =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max());
+    const auto columns = timeseries_a.size() - window + 1;
+    const auto rows = timeseries_b.size() - window + 1;
+    if (static_cast<std::uint64_t>(distributed_start_col) + columns - 1 >
+            max_metal_index ||
+        static_cast<std::uint64_t>(distributed_start_row) + rows - 1 >
+            max_metal_index) {
+      throw SCAMPException(
+          "Error: distributed tile bounds exceed the Metal int32 index range");
+    }
+  }
   const auto max_shape =
       static_cast<std::size_t>(std::numeric_limits<mx::ShapeElem>::max());
   if (timeseries_a.size() > max_shape ||
@@ -549,7 +583,7 @@ void SCAMPArgs::validate() const {
   }
 }
 
-void SCAMPArgs::print() const {
+void SCAMPArgs::print() {
   std::cout << "window: " << window << '\n'
             << "max_tile_size: " << max_tile_size << '\n'
             << "has_b: " << has_b << '\n'
@@ -564,6 +598,7 @@ void SCAMPArgs::print() const {
             << '\n'
             << "distance_threshold: " << distance_threshold << '\n'
             << "silent_mode: " << silent_mode << '\n'
+            << "max_matches_per_column: " << max_matches_per_column << '\n'
             << "timeseries_a size: " << timeseries_a.size() << '\n'
             << "timeseries_b size: " << timeseries_b.size() << std::endl;
 }

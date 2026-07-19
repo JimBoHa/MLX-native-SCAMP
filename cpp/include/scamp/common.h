@@ -7,7 +7,16 @@
 #include <string>
 #include <vector>
 
+class SCAMPException : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 namespace SCAMP {
+
+// Preserve callers written against earlier versions of this port while the
+// global declaration matches upstream common/scamp_exception.h exactly.
+using ::SCAMPException;
 
 enum SCAMPProfileType {
   PROFILE_TYPE_INVALID = 0,
@@ -55,11 +64,6 @@ public:
   bool operator()(const SCAMPmatch &lhs, const SCAMPmatch &rhs) const {
     return lhs.corr > rhs.corr;
   }
-};
-
-class SCAMPException : public std::runtime_error {
-public:
-  using std::runtime_error::runtime_error;
 };
 
 std::string GetPrecisionTypeString(SCAMPPrecisionType type);

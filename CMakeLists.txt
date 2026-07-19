@@ -10,12 +10,14 @@ endif()
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
-option(MLX_SCAMP_BUILD_EXAMPLES "Build native C++ examples" ON)
-option(MLX_SCAMP_BUILD_TESTS "Build native C++ tests" ON)
+set(MLX_SCAMP_DEVELOPER_TARGETS_DEFAULT ON)
+if(NOT PROJECT_IS_TOP_LEVEL)
+  set(MLX_SCAMP_DEVELOPER_TARGETS_DEFAULT OFF)
+endif()
+option(MLX_SCAMP_BUILD_EXAMPLES "Build native C++ examples"
+       ${MLX_SCAMP_DEVELOPER_TARGETS_DEFAULT})
+option(MLX_SCAMP_BUILD_TESTS "Build native C++ tests"
+       ${MLX_SCAMP_DEVELOPER_TARGETS_DEFAULT})
 set(MLX_SCAMP_PYTHON_EXECUTABLE "" CACHE FILEPATH
     "Python interpreter used only to locate an installed MLX wheel")
 
@@ -58,8 +60,8 @@ set_target_properties(mlx_native_scamp_cpp PROPERTIES
   OUTPUT_NAME mlx_scamp
   VERSION "${PROJECT_VERSION}"
   SOVERSION "${PROJECT_VERSION_MAJOR}"
-  BUILD_RPATH "${MLX_LIBRARY_DIRS}"
-  INSTALL_RPATH "${MLX_LIBRARY_DIRS}")
+  CXX_EXTENSIONS OFF
+  BUILD_RPATH "${MLX_LIBRARY_DIRS}")
 target_compile_features(mlx_native_scamp_cpp PUBLIC cxx_std_17)
 target_compile_options(mlx_native_scamp_cpp PRIVATE
   $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall;-Wextra;-Wpedantic>)
@@ -79,6 +81,10 @@ if(MLX_SCAMP_BUILD_TESTS)
   add_executable(mlx_scamp_cpp_test cpp/tests/test_indexed_1nn.cpp)
   target_link_libraries(mlx_scamp_cpp_test PRIVATE MLXNativeSCAMP::scamp)
   add_test(NAME mlx_scamp_cpp_indexed_1nn COMMAND mlx_scamp_cpp_test)
+
+  add_executable(mlx_scamp_cpp_api_test cpp/tests/test_upstream_api.cpp)
+  target_link_libraries(mlx_scamp_cpp_api_test PRIVATE MLXNativeSCAMP::scamp)
+  add_test(NAME mlx_scamp_cpp_upstream_api COMMAND mlx_scamp_cpp_api_test)
 endif()
 
 install(TARGETS mlx_native_scamp_cpp

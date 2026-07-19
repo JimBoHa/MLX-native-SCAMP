@@ -11,8 +11,8 @@ namespace SCAMP {
 // Apple-native counterpart of upstream SCAMPArgs. Defaults select the Metal
 // path that this initial native library slice implements.
 struct SCAMPArgs {
-  void validate() const;
-  void print() const;
+  void validate();
+  void print();
   bool InitProfileMemory();
 
   std::vector<double> timeseries_a;

@@ -183,25 +183,40 @@ void TestABRowOnly() {
 }
 
 void TestHighOffsetInputPreservesVariation() {
-  const double baseline = 1.0e12;
-  const std::vector<double> a = {
-      baseline + 0.0, baseline + 1.0, baseline + 4.0,  baseline + 2.0,
-      baseline + 8.0, baseline + 3.0, baseline + 7.0,  baseline + 5.0,
-      baseline + 9.0, baseline + 6.0, baseline + 11.0, baseline + 10.0};
-  const std::vector<double> b = {
-      baseline + 6.0, baseline + 2.0, baseline + 9.0,  baseline + 1.0,
-      baseline + 7.0, baseline + 4.0, baseline + 10.0, baseline + 3.0,
-      baseline + 8.0, baseline + 0.0, baseline + 11.0, baseline + 5.0,
-      baseline + 12.0};
+  const double baseline = 1.0e16;
+  std::uint32_t state = 0x6d2b79f5U;
+  auto high_offset_sample = [&state, baseline]() {
+    state = state * 1664525U + 1013904223U;
+    const auto delta = static_cast<int>((state >> 16U) % 65U) - 32;
+    return baseline + static_cast<double>(delta);
+  };
+  std::vector<double> a(700);
+  std::vector<double> b(717);
+  std::generate(a.begin(), a.end(), high_offset_sample);
+  std::generate(b.begin(), b.end(), high_offset_sample);
+
+  // The raw-baseline double mean is itself numerically unstable at 1e16.
+  // Translation is Pearson-invariant, so use centered values as the oracle.
+  std::vector<double> centered_a = a;
+  std::vector<double> centered_b = b;
+  const double origin_a = centered_a.front();
+  const double origin_b = centered_b.front();
+  for (double &value : centered_a) {
+    value -= origin_a;
+  }
+  for (double &value : centered_b) {
+    value -= origin_b;
+  }
   SCAMP::SCAMPArgs args;
   args.timeseries_a = a;
   args.timeseries_b = b;
   args.has_b = true;
-  args.window = 4;
+  args.window = 8;
   args.computing_rows = false;
   SCAMP::do_SCAMP(&args);
   CheckProfile(args.profile_a.data.at(0).uint64_value,
-               BruteForce(a, b, args.window, false, true), 5e-5F);
+               BruteForce(centered_a, centered_b, args.window, false, true),
+               2e-4F);
 }
 
 void TestRandomizedJoins() {
@@ -257,6 +272,48 @@ void TestUnsupportedModeIsExplicit() {
   throw std::runtime_error("unsupported precision did not throw");
 }
 
+void TestDistributedBoundsCannotOverflowMetalIndices() {
+  SCAMP::SCAMPArgs args;
+  args.timeseries_a = {0.0, 1.0, -1.0, 0.5, 1.5, -0.5};
+  args.timeseries_b = {1.0, -0.5, 0.25, 1.25, -1.0, 0.75};
+  args.has_b = true;
+  args.window = 3;
+  args.computing_rows = false;
+  args.is_aligned = true;
+  args.distributed_start_col = std::numeric_limits<std::int32_t>::max() - 1;
+  args.distributed_start_row = 0;
+  try {
+    SCAMP::do_SCAMP(&args);
+  } catch (const SCAMP::SCAMPException &error) {
+    if (std::string(error.what()).find("tile bounds") != std::string::npos) {
+      return;
+    }
+    throw;
+  }
+  throw std::runtime_error("overflowing distributed bounds did not throw");
+}
+
+void TestNegativeDistributedOffsetsAreRejected() {
+  SCAMP::SCAMPArgs args;
+  args.timeseries_a = {0.0, 1.0, -1.0, 0.5, 1.5, -0.5};
+  args.timeseries_b = {1.0, -0.5, 0.25, 1.25, -1.0, 0.75};
+  args.has_b = true;
+  args.window = 3;
+  args.computing_rows = false;
+  args.is_aligned = true;
+  args.distributed_start_col = -2;
+  args.distributed_start_row = -3;
+  try {
+    SCAMP::do_SCAMP(&args);
+  } catch (const SCAMP::SCAMPException &error) {
+    if (std::string(error.what()).find("-1 (unset)") != std::string::npos) {
+      return;
+    }
+    throw;
+  }
+  throw std::runtime_error("invalid negative distributed offsets did not throw");
+}
+
 void TestShortSelfJoinHasNoNontrivialMatch() {
   SCAMP::SCAMPArgs args;
   args.timeseries_a = {0.0, 1.0, -1.0};
@@ -281,6 +338,8 @@ int main() {
     TestHighOffsetInputPreservesVariation();
     TestRandomizedJoins();
     TestUnsupportedModeIsExplicit();
+    TestDistributedBoundsCannotOverflowMetalIndices();
+    TestNegativeDistributedOffsetsAreRejected();
     TestShortSelfJoinHasNoNontrivialMatch();
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
