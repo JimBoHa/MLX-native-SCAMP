@@ -18,24 +18,25 @@ Both the new `<scamp/...>` include layout and upstream-compatible
 `<common/scamp_args.h>`, `<common/profile.h>`, and
 `<common/scamp_interface.h>` forwarding headers are installed.
 
-The implemented operation is `PROFILE_TYPE_1NN_INDEX` with
-`PRECISION_SINGLE` on Metal device 0. It covers:
+The implemented operations are `PROFILE_TYPE_1NN_INDEX` and
+`PROFILE_TYPE_1NN` with `PRECISION_SINGLE` on Metal device 0. They cover:
 
 - self joins with SCAMP's `ceil(window / 4)` exclusion zone;
 - one-sided AB joins producing `profile_a`;
 - two-sided AB joins using `computing_rows` and `keep_rows_separate` to also
   produce `profile_b`;
 - aligned AB exclusion, including distributed row/column offsets; and
-- non-finite and flat subsequences, which produce correlation `-2` and index
-  `-1` when no valid match exists.
+- non-finite and flat subsequences, which produce correlation `-2` (and index
+  `-1` for `1NN_INDEX`) when no valid match exists.
 
-The compute path uses SCAMP's diagonal rolling-covariance recurrence in two
-custom Metal passes. The first atomically reduces correlations, and the second
-selects the smallest exact index for ties. Compensated CPU statistics and each
-diagonal's initial covariance are computed in double precision before the
-single-precision Metal recurrence, preserving variation in high-offset input.
-Device/output storage is linear in the input lengths; no dense distance matrix
-or normalized window matrix is materialized.
+The compute path uses SCAMP's diagonal rolling-covariance recurrence. Its first
+custom Metal pass atomically reduces correlations. `1NN_INDEX` follows with a
+second pass that selects the smallest exact index for ties; `1NN` materializes
+the correlation keys immediately and skips that entire pass. Compensated CPU
+statistics and each diagonal's initial covariance are computed in double
+precision before the single-precision Metal recurrence, preserving variation
+in high-offset input. Device/output storage is linear in the input lengths; no
+dense distance matrix or normalized window matrix is materialized.
 
 ## Build and test
 
@@ -72,8 +73,8 @@ Top-level builds enable `MLX_SCAMP_BUILD_CLI` and produce
 with `add_subdirectory`. The executable links `MLXNativeSCAMP::scamp`
 directly—there is no embedded interpreter or Python subprocess.
 
-Its first capability slice mirrors the useful upstream gflags spellings for
-indexed 1NN:
+Its first capability slices mirror the useful upstream gflags spellings for
+indexed and index-free 1NN:
 
 ```bash
 ./build/cpp/mlx-scamp-native \
@@ -100,6 +101,11 @@ Input files contain whitespace-delimited doubles, including `nan`/`inf` as
 invalid samples. Correlation outputs use `nan` and index outputs use `-1` when
 no match exists. Euclidean distance is the default; add `--output_pearson` for
 correlation.
+
+Set `--profile_type=1NN` to request the index-free upstream profile. Only
+`--output_a_file_name` and, with `--keep_rows`, `--output_b_file_name` are
+active in that mode. The two index-output flags are deliberately ignored: they
+may be empty or alias an input because no index file is inspected or written.
 
 The CLI rejects unsupported profiles, non-single precision, CPU-only work,
 autotuning, and explicit tiling before opening input or creating output. It
@@ -136,8 +142,7 @@ transitively.
 Unsupported requests throw `SCAMPException`; they are not routed through a
 slower implementation or silently ignored. The remaining C++ API work is:
 
-- `PROFILE_TYPE_1NN`, `SUM_THRESH`, `APPROX_ALL_NEIGHBORS`, and
-  `MATRIX_SUMMARY` reducers;
+- `SUM_THRESH`, `APPROX_ALL_NEIGHBORS`, and `MATRIX_SUMMARY` reducers;
 - `PRECISION_DOUBLE` and `PRECISION_ULTRA` CPU paths (Metal has no float64);
 - native CPU workers and heterogeneous CPU/Metal scheduling;
 - bounded multi-dispatch tiling for very long joins (`max_tile_size` is

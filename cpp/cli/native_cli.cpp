@@ -98,8 +98,12 @@ struct Options {
 };
 
 constexpr std::string_view kVariant =
-    "v0 backend=mlx-metal strategy=two-pass-diagonal-recurrence "
-    "profile=1NN_INDEX precision=single device=0";
+    "v0 backend=mlx-metal strategy=diagonal-recurrence "
+    "profile=1NN_INDEX,1NN precision=single device=0";
+
+bool IsIndexedProfile(const Options &options) {
+  return options.profile_type == "1NN_INDEX";
+}
 
 const std::unordered_set<std::string> &BoolFlags() {
   static const std::unordered_set<std::string> flags = {"single_precision",
@@ -328,7 +332,7 @@ Options ParseOptions(int argc, char **argv) {
 
 void PrintHelp() {
   std::cout
-      << "mlx-scamp-native: native Apple Silicon indexed-1NN SCAMP CLI\n\n"
+      << "mlx-scamp-native: native Apple Silicon 1NN SCAMP CLI\n\n"
       << "Required job flags:\n"
       << "  --window=N\n"
       << "  --input_a_file_name=PATH\n"
@@ -345,8 +349,9 @@ void PrintHelp() {
       << "  --aligned --global_row=N --global_col=N\n"
       << "  --gpus=0                       MLX exposes Metal device 0\n"
       << "  --print_debug_info\n\n"
-      << "Only --profile_type=1NN_INDEX and single precision are currently "
-         "implemented.\n"
+      << "--profile_type=1NN_INDEX writes value and index files; "
+         "--profile_type=1NN writes only value files. Single precision is "
+         "currently required.\n"
       << "Flags accept --name=value or --name value. Boolean flags also "
          "accept\n"
       << "--flag=true|false and --noflag. Use --list_variants for the fixed "
@@ -354,14 +359,14 @@ void PrintHelp() {
 }
 
 void ValidateCapabilities(const Options &options) {
-  if (options.profile_type != "1NN_INDEX") {
+  if (options.profile_type != "1NN_INDEX" && options.profile_type != "1NN") {
     throw CliError("--profile_type=" + options.profile_type +
                    " is unsupported; this native CLI currently implements "
-                   "1NN_INDEX only");
+                   "1NN_INDEX and 1NN only");
   }
   if (!options.single_precision) {
     throw CliError("--single_precision is required by the native Metal "
-                   "indexed-1NN kernel");
+                   "1NN kernels");
   }
   if (options.double_precision || options.ultra_precision) {
     throw CliError("double and ultra precision are not implemented by this "
@@ -388,7 +393,7 @@ void ValidateCapabilities(const Options &options) {
     if (options.explicitly_set.count(name) != 0) {
       throw CliError("--" + name +
                      " applies to a reducer not implemented by this "
-                     "indexed-1NN CLI");
+                     "1NN CLI");
     }
   }
   if (!options.gpus.empty() && options.gpus != "0") {
@@ -406,9 +411,11 @@ void ValidateCapabilities(const Options &options) {
                    "--input_a_file_name");
   }
   const bool has_b = !options.input_b.empty();
-  if (options.output_a.empty() || options.output_a_index.empty() ||
+  if (options.output_a.empty() ||
+      (IsIndexedProfile(options) && options.output_a_index.empty()) ||
       (options.keep_rows &&
-       (options.output_b.empty() || options.output_b_index.empty()))) {
+       (options.output_b.empty() ||
+        (IsIndexedProfile(options) && options.output_b_index.empty())))) {
     throw CliError("active output file names must not be empty");
   }
   if (options.keep_rows && !has_b) {
@@ -553,10 +560,15 @@ void ValidateOutput(const fs::path &path) {
 }
 
 std::vector<fs::path> ActiveOutputs(const Options &options) {
-  std::vector<fs::path> outputs = {options.output_a, options.output_a_index};
+  std::vector<fs::path> outputs = {options.output_a};
+  if (IsIndexedProfile(options)) {
+    outputs.emplace_back(options.output_a_index);
+  }
   if (options.keep_rows) {
     outputs.emplace_back(options.output_b);
-    outputs.emplace_back(options.output_b_index);
+    if (IsIndexedProfile(options)) {
+      outputs.emplace_back(options.output_b_index);
+    }
   }
   return outputs;
 }
@@ -907,6 +919,16 @@ void StageProfile(const fs::path &value_path, const fs::path &index_path,
   }));
 }
 
+void StageProfile(const fs::path &value_path,
+                  const std::vector<float> &profile, bool pearson,
+                  std::uint64_t window, std::vector<StagedOutput> *staged) {
+  staged->push_back(StageOutput(value_path, [&](std::ostream &output) {
+    for (float correlation : profile) {
+      output << OutputValue(correlation, pearson, window) << '\n';
+    }
+  }));
+}
+
 void CleanStaged(std::vector<StagedOutput> *staged) noexcept {
   for (StagedOutput &output : *staged) {
     if (output.temporary_exists) {
@@ -971,9 +993,12 @@ int Run(int argc, char **argv) {
   arguments.distributed_start_row = options.global_row;
   arguments.distributed_start_col = options.global_col;
   arguments.precision_type = SCAMP::PRECISION_SINGLE;
-  arguments.profile_type = SCAMP::PROFILE_TYPE_1NN_INDEX;
-  arguments.profile_a.type = SCAMP::PROFILE_TYPE_1NN_INDEX;
-  arguments.profile_b.type = SCAMP::PROFILE_TYPE_1NN_INDEX;
+  const SCAMP::SCAMPProfileType profile_type =
+      IsIndexedProfile(options) ? SCAMP::PROFILE_TYPE_1NN_INDEX
+                                : SCAMP::PROFILE_TYPE_1NN;
+  arguments.profile_type = profile_type;
+  arguments.profile_a.type = profile_type;
+  arguments.profile_b.type = profile_type;
   arguments.computing_columns = true;
   arguments.computing_rows = !arguments.has_b || options.keep_rows;
   arguments.keep_rows_separate = options.keep_rows;
@@ -988,7 +1013,7 @@ int Run(int argc, char **argv) {
     if (arguments.has_b) {
       std::cerr << ", samples_b=" << arguments.timeseries_b.size();
     }
-    std::cerr << ", output="
+    std::cerr << ", profile=" << options.profile_type << ", output="
               << (options.output_pearson ? "pearson" : "euclidean") << '\n';
   }
   std::cerr << "mlx-scamp-native: computing on MLX Metal device 0\n";
@@ -999,15 +1024,26 @@ int Run(int argc, char **argv) {
 
   std::cerr << "mlx-scamp-native: staging outputs\n";
   std::vector<StagedOutput> staged;
-  staged.reserve(options.keep_rows ? 4 : 2);
+  staged.reserve(ActiveOutputs(options).size());
   try {
-    StageProfile(options.output_a, options.output_a_index,
-                 arguments.profile_a.data.at(0).uint64_value,
-                 options.output_pearson, arguments.window, &staged);
-    if (options.keep_rows) {
-      StageProfile(options.output_b, options.output_b_index,
-                   arguments.profile_b.data.at(0).uint64_value,
+    if (IsIndexedProfile(options)) {
+      StageProfile(options.output_a, options.output_a_index,
+                   arguments.profile_a.data.at(0).uint64_value,
                    options.output_pearson, arguments.window, &staged);
+      if (options.keep_rows) {
+        StageProfile(options.output_b, options.output_b_index,
+                     arguments.profile_b.data.at(0).uint64_value,
+                     options.output_pearson, arguments.window, &staged);
+      }
+    } else {
+      StageProfile(options.output_a,
+                   arguments.profile_a.data.at(0).float_value,
+                   options.output_pearson, arguments.window, &staged);
+      if (options.keep_rows) {
+        StageProfile(options.output_b,
+                     arguments.profile_b.data.at(0).float_value,
+                     options.output_pearson, arguments.window, &staged);
+      }
     }
     // Computation and output staging can be long. Recheck identities before
     // the first destination rename so a path swapped to an input in that
