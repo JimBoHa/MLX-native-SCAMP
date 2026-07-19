@@ -72,18 +72,21 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 
 ## Distributed MLX worker (experimental)
 
-The first macOS-native distributed slice provides a versioned gRPC worker,
-capability and health discovery, and remote execution of rectangular 1NN
-profile tiles. Install the optional transport dependencies and start a
-loopback worker with:
+The macOS-native distributed runtime provides versioned gRPC workers,
+capability and health discovery, and complete coordinator-side 1NN-index
+self-joins and AB-joins. Install the optional transport dependencies and start
+a loopback worker with:
 
 ```bash
 python -m pip install '.[distributed]'
 python -m mlx_native_scamp.distributed --backend auto
 ```
 
-The protocol uses compact float32 byte buffers for the single-precision MLX
-path instead of upstream's repeated-double payloads. See
+The coordinator automatically decomposes a join into memory-bounded tiles,
+uses upper-triangle symmetry for self-joins, retries transient failures, and
+assembles deterministic global profiles. The protocol uses compact float32
+byte buffers for the single-precision MLX path instead of upstream's
+repeated-double payloads. See
 [Distributed MLX runtime](docs/distributed.md) for coordinator usage, protocol
 details, and the remaining upstream distributed features. Non-loopback binds
 require the explicit `--allow-insecure-remote` opt-in while TLS/authentication

@@ -1,13 +1,14 @@
 # Distributed MLX runtime
 
-This experimental runtime is the first independently usable part of SCAMP's
-distributed client/server architecture ported to macOS and MLX. It is not yet
-a replacement for upstream's complete job server.
+This experimental runtime is an independently usable part of SCAMP's
+distributed client/server architecture ported to macOS and MLX. It runs
+complete 1NN-index self-joins and AB-joins across a pool of Macs. It is not yet
+a replacement for upstream's persistent, multi-profile job server.
 
 Upstream uses a central gRPC job server and workers that repeatedly pull tiles.
-Version 1 deliberately exposes each MLX worker as a gRPC service and lets the
+Version 1 exposes each MLX worker as a gRPC service and lets an in-process
 coordinator push bounded tiles. This makes worker health and Apple hardware
-capabilities discoverable before scheduling and removes the always-running
+capabilities discoverable before scheduling and removes the always-running,
 Kubernetes-oriented job server from local Mac deployments.
 
 ## What is implemented
@@ -20,14 +21,27 @@ Kubernetes-oriented job server from local Mac deployments.
   per-tile working-set limit before constructing a dense similarity matrix.
 - Worker health and execution counters.
 - A real rectangular 1NN-index tile operation. A is the column dimension and B
-  is the row dimension, matching upstream SCAMP's distributed tile convention.
+  is the row dimension, matching upstream SCAMP's distributed convention.
   Results contain global indices and both row and column partial profiles, so
   they can be merged without rewriting tile-local indices.
-- A coordinator-side `WorkerPool` that discovers workers, checks health, and
-  dispatches individual tiles round-robin with failover to another serving
-  worker.
-- A deterministic 1NN slice reducer that combines tiles by global offset and
-  produces the same result regardless of worker completion order.
+- A `WorkerPool` that tolerates unreachable peers, checks health, and
+  dispatches tiles round-robin with failover to another serving worker.
+- A `DistributedCoordinator` that decomposes complete self-joins and AB-joins,
+  keeps only a bounded number of requests in flight, merges results as they
+  arrive, and returns global profiles in the same Euclidean or Pearson
+  representation as upstream SCAMP.
+- Upper-triangle self-join scheduling. Off-diagonal tiles compute both profile
+  directions and represent their transposes, while diagonal blocks are
+  computed once. A `g` by `g` grid therefore needs `g * (g + 1) / 2` tiles
+  instead of `g * g`.
+- Optional AB row profiles corresponding to upstream's `keep_rows` behavior.
+- Per-tile retry with bounded exponential backoff after all live workers fail,
+  plus monotonic progress snapshots containing completed tiles, retry count,
+  elapsed time, and ETA.
+- Deterministic merging. Equal correlations select the lower non-negative
+  global index regardless of worker completion order. Correlations are clamped
+  to Pearson's valid range before argmax to stabilize perfect short-window
+  matches across tile shapes.
 - Compact little-endian float32 payloads for the current single-precision path.
   These halve input bandwidth relative to upstream's repeated `double` series
   fields, include only the samples needed by each tile, and decode directly
@@ -36,7 +50,14 @@ Kubernetes-oriented job server from local Mac deployments.
 The worker defaults to one concurrent tile. This avoids multiple large Metal
 allocations competing for the same unified-memory working set. gRPC handling
 still uses multiple threads, so health and discovery remain responsive during
-compute.
+compute. The coordinator defaults to one in-flight tile per serving worker.
+
+Automatic planning uses the smallest message and working-set limits advertised
+by the serving workers, capped by a conservative 256 MiB coordinator budget.
+The estimate includes the dense correlation matrix, masks, and
+normalized-window intermediates. Set
+`max_tile_bytes` on `DistributedCoordinator` to lower that limit, or pass an
+explicit `tile_size`; unsafe explicit sizes fail before work is dispatched.
 
 ## Run a worker
 
@@ -65,16 +86,82 @@ fallback when MLX cannot report memory. Override it with
 `--max-tile-working-set-bytes`; requests over the limit fail with
 `RESOURCE_EXHAUSTED` before MLX allocation.
 
-## Discover and execute
+Workers on other Macs must bind a reachable interface with explicit opt-in,
+for example `--host 0.0.0.0 --allow-insecure-remote`. Use that only on a
+trusted, firewalled private network until TLS and authentication are
+implemented.
+
+## Run a complete join
+
+Start one or more workers, then give their targets to a pool:
 
 ```python
 import numpy as np
 
-from mlx_native_scamp.distributed import (
-    WorkerPool,
-    make_tile_request,
-    merge_1nn_slices,
-)
+from mlx_native_scamp.distributed import DistributedCoordinator, WorkerPool
+
+rng = np.random.default_rng(7)
+a = rng.random(100_000, dtype=np.float32)
+b = rng.random(80_000, dtype=np.float32)
+
+events = []
+with WorkerPool(["mac-studio.local:30078", "macbook.local:30078"]) as workers:
+    coordinator = DistributedCoordinator(workers)
+    self_result = coordinator.selfjoin(
+        a,
+        128,
+        pearson=True,
+        progress=events.append,
+    )
+    ab_result = coordinator.abjoin(
+        a,
+        b,
+        128,
+        keep_rows=True,
+    )
+
+self_correlations = self_result.column_values
+self_global_indices = self_result.column_indices
+ab_distances = ab_result.column_values
+b_distances = ab_result.row_values
+print(events[-1].fraction, events[-1].eta_seconds)
+```
+
+`WorkerPool(max_message_bytes=...)` can lower the client channels' send and
+receive cap when required by the network or process budget. Automatic tile
+planning uses the smallest of that cap and every serving worker's advertised
+limit, so it never schedules a request or expected response the client cannot
+accept.
+
+Like `pyscamp`, output values are Euclidean distances by default; pass
+`pearson=True` for correlations. Global indices remain signed 64-bit values so
+large distributed jobs are not limited to 32-bit offsets. Invalid or flat
+windows produce `NaN` and index `-1`.
+
+For a normal AB-join, only the A/column profile is computed. `keep_rows=True`
+also computes the B/row profile in the same tile traversal. A regular AB-join
+has no exclusion zone; self-joins use SCAMP's `ceil(window / 4)` zone. Advanced
+AB workloads whose subsequence coordinates share the same origin may pass a
+nonzero `exclusion_zone` explicitly.
+
+Transient RPC failures are first failed over within `WorkerPool`, then retried
+up to three times by the coordinator. Protocol, authentication, permission,
+and invalid-request errors fail immediately. A retry reuses the request ID, so
+workers and logs can associate attempts with the same tile.
+
+Each job pins scheduling to the serving workers whose protocol, profile,
+precision, message, and working-set capabilities were validated when its plan
+was created. Those workers may recover during a retry; a newly appearing Mac
+joins the next job instead of bypassing the current plan's resource bounds.
+
+## Execute one tile directly
+
+The versioned tile API remains available for custom schedulers:
+
+```python
+import numpy as np
+
+from mlx_native_scamp.distributed import WorkerPool, make_tile_request
 from mlx_native_scamp.distributed.codec import decode_array
 
 a = np.random.default_rng(7).random(4096, dtype=np.float32)
@@ -97,33 +184,30 @@ column_correlations = decode_array(result.column_profile.values)
 column_indices = decode_array(result.column_profile.indices)
 ```
 
-When a column range is split across multiple row tiles, merge the returned
-partial profiles with `merge_1nn_slices(results, profile_length)`. The reducer
-uses each result's global offset and deterministically resolves equal values by
-the lower global match index.
-
-For self-joins, `make_tile_request` supplies SCAMP's `ceil(window / 4)`
-exclusion zone by default. Passing a B series creates an AB-join and defaults
-the exclusion zone to zero. Bounds are subsequence bounds, not raw time-series
-sample bounds.
+When managing tiles manually, combine partial profiles with
+`merge_1nn_slices(results, profile_length)`. The reducer uses each result's
+global offset and resolves exactly equal values by the lower global match
+index. Bounds are subsequence bounds, not raw time-series sample bounds.
 
 ## Upstream relationship and remaining work
 
-This slice covers the useful core of upstream workers' `ExecuteWork`: receive a
-tile, execute it on the available accelerator, and return mergeable partial
-profiles. Capability discovery and health are additions needed for heterogeneous
-Mac workers; upstream workers advertise only an estimated throughput number.
+This runtime covers the useful core of upstream workers' `ExecuteWork` and the
+complete in-process lifecycle for 1NN-index jobs: plan tiles, execute on the
+available accelerators, retry and fail over, combine global profiles, and
+report progress. Capability discovery and health are additions needed for
+heterogeneous Mac workers; upstream workers advertise only an estimated
+throughput number.
 
 The following upstream distributed behavior is not claimed yet:
 
-- job submission, status polling, and final-result retrieval;
-- automatic decomposition of complete joins into tiles;
-- global profile combining, retry queues, failure requeue, progress, and ETA;
-- SUM, matrix-summary, KNN, multidimensional, and double-precision tile reducers;
+- persistent job submission, status polling, cancellation, and later result
+  retrieval independent of the coordinating process;
+- SUM, matrix-summary, KNN, multidimensional, and double-precision tile
+  reducers;
 - scheduling weighted by measured worker throughput;
 - streaming or content-addressed input distribution to avoid resending samples
   shared by adjacent tiles;
-- TLS/authentication and deployment tooling for remote Mac fleets.
+- TLS, authentication, and deployment tooling for remote Mac fleets.
 
 Version 1's single-precision request builder converts raw samples to float32.
 This matches its advertised compute mode but can erase small variations riding
@@ -131,5 +215,5 @@ on very large offsets before normalization. Integrating the safe double-input
 preprocessing used by the local high-offset path remains required before this
 transport can claim that edge-case parity with upstream SCAMP.
 
-The versioned tile messages and global result offsets are intended to support
-those additions without breaking this worker API.
+The versioned tile messages and global result offsets support those additions
+without breaking this worker API.

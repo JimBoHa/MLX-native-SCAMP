@@ -27,7 +27,11 @@ import numpy as np
 
 from ._version import API_VERSION
 from .codec import decode_array, encode_array, is_empty_payload
-from .execution import estimate_1nn_tile_working_set_bytes, execute_1nn_tile
+from .execution import (
+    _MLX_STREAM_LOCK,
+    estimate_1nn_tile_working_set_bytes,
+    execute_1nn_tile,
+)
 from .proto import scamp_worker_v1_pb2 as messages
 from .proto import scamp_worker_v1_pb2_grpc as services
 
@@ -92,9 +96,10 @@ def _select_device(backend: str):
     use_metal = requested == "metal" or (requested == "auto" and _is_apple_silicon())
     device = mx.Device(mx.gpu if use_metal else mx.cpu, 0)
     try:
-        with mx.stream(device):
-            probe = mx.array([1.0], dtype=mx.float32) + 1.0
-            mx.eval(probe)
+        with _MLX_STREAM_LOCK:
+            with mx.stream(device):
+                probe = mx.array([1.0], dtype=mx.float32) + 1.0
+                mx.eval(probe)
     except Exception as error:
         if requested == "auto" and use_metal:
             device = mx.Device(mx.cpu, 0)
@@ -424,11 +429,14 @@ class WorkerClient:
         timeout: float = 10.0,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     ) -> None:
+        if max_message_bytes <= 0:
+            raise ValueError("max_message_bytes must be positive")
         self.target = target
         self.timeout = timeout
+        self.max_message_bytes = int(max_message_bytes)
         options = (
-            ("grpc.max_receive_message_length", max_message_bytes),
-            ("grpc.max_send_message_length", max_message_bytes),
+            ("grpc.max_receive_message_length", self.max_message_bytes),
+            ("grpc.max_send_message_length", self.max_message_bytes),
         )
         self.channel = grpc.insecure_channel(target, options=options)
         self.stub = services.ScampWorkerStub(self.channel)
@@ -480,14 +488,29 @@ class WorkerClient:
 class WorkerPool:
     """Small coordinator that discovers workers and schedules single tiles."""
 
-    def __init__(self, targets: Iterable[str], *, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        targets: Iterable[str],
+        *,
+        timeout: float = 10.0,
+        max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+    ) -> None:
+        if max_message_bytes <= 0:
+            raise ValueError("max_message_bytes must be positive")
+        self._max_message_bytes = int(max_message_bytes)
         self._clients = tuple(
-            WorkerClient(target, timeout=timeout) for target in targets
+            WorkerClient(
+                target,
+                timeout=timeout,
+                max_message_bytes=self._max_message_bytes,
+            )
+            for target in targets
         )
         if not self._clients:
             raise ValueError("at least one worker target is required")
         self._next_worker = 0
         self._lock = threading.Lock()
+        self._preferred_targets: frozenset[str] | None = None
 
     def discover(self) -> tuple[WorkerSnapshot, ...]:
         def inspect(client: WorkerClient) -> WorkerSnapshot:
@@ -496,20 +519,73 @@ class WorkerPool:
         with ThreadPoolExecutor(max_workers=len(self._clients)) as executor:
             return tuple(executor.map(inspect, self._clients))
 
+    def discover_serving(self) -> tuple[WorkerSnapshot, ...]:
+        """Return healthy serving workers while tolerating unreachable peers.
+
+        A complete job can continue when one configured Mac is offline. If no
+        worker can be inspected, the last gRPC error is preserved so callers
+        retain its status and diagnostic details.
+        """
+
+        def inspect(client: WorkerClient):
+            try:
+                snapshot = WorkerSnapshot(
+                    client.target, client.capabilities(), client.health()
+                )
+                return snapshot, None
+            except grpc.RpcError as error:
+                return None, error
+
+        with ThreadPoolExecutor(max_workers=len(self._clients)) as executor:
+            inspected = tuple(executor.map(inspect, self._clients))
+        serving = tuple(
+            snapshot
+            for snapshot, _ in inspected
+            if snapshot is not None
+            and snapshot.health.state == messages.WORKER_STATE_SERVING
+        )
+        if serving:
+            with self._lock:
+                self._preferred_targets = frozenset(
+                    snapshot.target for snapshot in serving
+                )
+            return serving
+        errors = tuple(error for _, error in inspected if error is not None)
+        if errors:
+            raise errors[-1]
+        raise RuntimeError("no serving distributed workers are available")
+
     def execute_tile(
-        self, request: messages.ProfileTileRequest
+        self,
+        request: messages.ProfileTileRequest,
+        *,
+        eligible_targets: frozenset[str] | None = None,
     ) -> messages.ProfileTileResult:
         with self._lock:
-            candidates = (
-                self._clients[self._next_worker :] + self._clients[: self._next_worker]
+            allowed = tuple(
+                client
+                for client in self._clients
+                if eligible_targets is None or client.target in eligible_targets
             )
-            self._next_worker = (self._next_worker + 1) % len(self._clients)
+            if not allowed:
+                raise RuntimeError("no eligible distributed workers are configured")
+            eligible = tuple(
+                client
+                for client in allowed
+                if self._preferred_targets is None
+                or client.target in self._preferred_targets
+            )
+            if not eligible:
+                # Health is a snapshot. Retrying the job-approved workers lets
+                # one recover without admitting an unvalidated endpoint.
+                eligible = allowed
+            start = self._next_worker % len(eligible)
+            candidates = eligible[start:] + eligible[:start]
+            self._next_worker = (start + 1) % len(eligible)
         last_error: grpc.RpcError | None = None
         for client in candidates:
             try:
-                health = client.health()
-                if health.state == messages.WORKER_STATE_SERVING:
-                    return client.execute_tile(request)
+                return client.execute_tile(request)
             except grpc.RpcError as error:
                 if error.code() not in _TRANSIENT_RPC_CODES:
                     raise
@@ -521,6 +597,18 @@ class WorkerPool:
     def close(self) -> None:
         for client in self._clients:
             client.close()
+
+    @property
+    def worker_count(self) -> int:
+        """Number of configured worker endpoints."""
+
+        return len(self._clients)
+
+    @property
+    def max_message_bytes(self) -> int:
+        """Maximum request or response accepted by every client channel."""
+
+        return self._max_message_bytes
 
     def __enter__(self) -> "WorkerPool":
         return self
@@ -549,8 +637,8 @@ def make_tile_request(
     b = None if series_b is None else np.asarray(series_b, dtype=np.float32)
     if a.ndim != 1 or (b is not None and b.ndim != 1):
         raise ValueError("distributed input series must be one-dimensional")
-    if window <= 0 or a.size < window or (b is not None and b.size < window):
-        raise ValueError("window must be positive and fit both input series")
+    if window < 3 or a.size < window or (b is not None and b.size < window):
+        raise ValueError("window must be at least 3 and fit both input series")
     column_count = a.size - window + 1
     row_count = (a if b is None else b).size - window + 1
     resolved_row_stop = row_count if row_stop is None else row_stop
