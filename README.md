@@ -16,6 +16,9 @@ The package provides an MLX-native `pyscamp`-compatible import surface for the f
 
 The implementation is pure Python plus MLX and is meant to be called by other apps without requiring CUDA.
 All nine upstream `pyscamp` callables are implemented in the local MLX engine rather than delegated back to CUDA SCAMP.
+The native `mlx_native_scamp` namespace additionally exposes
+`abjoin_bidirectional`, which computes both AB-join axes in one traversal for
+SCAMP `keep_rows` consumers without changing the strict `pyscamp` surface.
 
 ## Native C++ library and CLI
 
