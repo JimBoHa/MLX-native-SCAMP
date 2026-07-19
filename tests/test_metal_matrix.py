@@ -314,6 +314,78 @@ class MetalMatrixSummaryTests(unittest.TestCase):
 
         kernel.assert_not_called()
 
+    def test_explicit_tile_ceiling_keeps_oversized_abjoin_portable(self):
+        rng = np.random.default_rng(281)
+        a = rng.normal(size=1000).astype(np.float32)
+        b = rng.normal(size=1025).astype(np.float32)
+
+        with (
+            mock.patch.object(
+                _metal_matrix,
+                "matrix_summary",
+                side_effect=AssertionError(
+                    "join-wide Metal bypassed the explicit ceiling"
+                ),
+            ) as kernel,
+            mock.patch.object(
+                core,
+                "_prepare_series_tile",
+                wraps=core._prepare_series_tile,
+            ) as tiled_preparation,
+        ):
+            summary = mp.abjoin_matrix(
+                a,
+                b,
+                8,
+                mheight=5,
+                mwidth=7,
+                pearson=True,
+                precision="single",
+                gpus=[0],
+                max_tile_size=1024,
+            )
+
+        kernel.assert_not_called()
+        self.assertGreater(tiled_preparation.call_count, 0)
+        self.assertEqual((5, 7), summary.shape)
+
+    def test_default_tile_ceiling_keeps_oversized_selfjoin_portable(self):
+        series = np.random.default_rng(282).normal(size=1025).astype(np.float32)
+
+        with (
+            mock.patch.object(
+                core,
+                "_default_max_tile_size",
+                return_value=1024,
+            ) as default_ceiling,
+            mock.patch.object(
+                _metal_matrix,
+                "matrix_summary",
+                side_effect=AssertionError(
+                    "join-wide Metal bypassed the default ceiling"
+                ),
+            ) as kernel,
+            mock.patch.object(
+                core,
+                "_prepare_series_tile",
+                wraps=core._prepare_series_tile,
+            ) as tiled_preparation,
+        ):
+            summary = mp.selfjoin_matrix(
+                series,
+                8,
+                mheight=5,
+                mwidth=7,
+                pearson=True,
+                precision="single",
+                gpus=[0],
+            )
+
+        default_ceiling.assert_called_once_with()
+        kernel.assert_not_called()
+        self.assertGreater(tiled_preparation.call_count, 0)
+        self.assertEqual((5, 7), summary.shape)
+
     def test_high_offset_non_float32_input_keeps_portable_path(self):
         offsets = np.array(
             [0, 16, 32, 64, 128, 80, 48, 144, 96, 176, 112, 208],
