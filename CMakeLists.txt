@@ -18,6 +18,8 @@ option(MLX_SCAMP_BUILD_EXAMPLES "Build native C++ examples"
        ${MLX_SCAMP_DEVELOPER_TARGETS_DEFAULT})
 option(MLX_SCAMP_BUILD_TESTS "Build native C++ tests"
        ${MLX_SCAMP_DEVELOPER_TARGETS_DEFAULT})
+option(MLX_SCAMP_BUILD_CLI "Build the native Apple Silicon command-line tool"
+       ${MLX_SCAMP_DEVELOPER_TARGETS_DEFAULT})
 set(MLX_SCAMP_PYTHON_EXECUTABLE "" CACHE FILEPATH
     "Python interpreter used only to locate an installed MLX wheel")
 
@@ -71,6 +73,23 @@ target_include_directories(mlx_native_scamp_cpp
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(mlx_native_scamp_cpp PUBLIC mlx)
 
+if(MLX_SCAMP_BUILD_CLI)
+  find_library(MLX_SCAMP_COREFOUNDATION CoreFoundation REQUIRED)
+  add_executable(mlx_scamp_native
+    cpp/cli/main.cpp
+    cpp/cli/native_cli.cpp)
+  set_target_properties(mlx_scamp_native PROPERTIES
+    OUTPUT_NAME mlx-scamp-native
+    INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}"
+    CXX_EXTENSIONS OFF)
+  target_compile_features(mlx_scamp_native PRIVATE cxx_std_17)
+  target_compile_options(mlx_scamp_native PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall;-Wextra;-Wpedantic>)
+  target_link_libraries(mlx_scamp_native PRIVATE
+    MLXNativeSCAMP::scamp
+    "${MLX_SCAMP_COREFOUNDATION}")
+endif()
+
 if(MLX_SCAMP_BUILD_EXAMPLES)
   add_executable(mlx_scamp_cpp_example cpp/examples/indexed_1nn.cpp)
   target_link_libraries(mlx_scamp_cpp_example PRIVATE MLXNativeSCAMP::scamp)
@@ -85,6 +104,20 @@ if(MLX_SCAMP_BUILD_TESTS)
   add_executable(mlx_scamp_cpp_api_test cpp/tests/test_upstream_api.cpp)
   target_link_libraries(mlx_scamp_cpp_api_test PRIVATE MLXNativeSCAMP::scamp)
   add_test(NAME mlx_scamp_cpp_upstream_api COMMAND mlx_scamp_cpp_api_test)
+
+  if(MLX_SCAMP_BUILD_CLI)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+      NAME mlx_scamp_native_cli
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/test_native_cli.py"
+              "$<TARGET_FILE:mlx_scamp_native>")
+    add_test(
+      NAME mlx_scamp_native_cli_no_python_linkage
+      COMMAND "${CMAKE_COMMAND}"
+              "-DCLI=$<TARGET_FILE:mlx_scamp_native>"
+              -P "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/check_no_python.cmake")
+  endif()
 endif()
 
 install(TARGETS mlx_native_scamp_cpp
@@ -93,6 +126,10 @@ install(TARGETS mlx_native_scamp_cpp
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
   INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+if(MLX_SCAMP_BUILD_CLI)
+  install(TARGETS mlx_scamp_native
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
 install(DIRECTORY cpp/include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 install(EXPORT MLXNativeSCAMPTargets
   FILE MLXNativeSCAMPTargets.cmake

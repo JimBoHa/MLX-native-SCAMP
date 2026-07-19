@@ -1,4 +1,4 @@
-# Native C++ API
+# Native C++ API and CLI
 
 This directory is the first native C++ parity slice for SCAMP on Apple
 Silicon. The `MLXNativeSCAMP::scamp` CMake target links directly to the C++
@@ -65,6 +65,56 @@ MLX development package. Runtime execution remains entirely native C++/MLX.
 Set `MLX_SCAMP_PYTHON_EXECUTABLE` if the desired interpreter is not the active
 virtual environment or the first `python3` on `PATH`.
 
+## Native command line
+
+Top-level builds enable `MLX_SCAMP_BUILD_CLI` and produce
+`mlx-scamp-native`. The option defaults off when this repository is included
+with `add_subdirectory`. The executable links `MLXNativeSCAMP::scamp`
+directly—there is no embedded interpreter or Python subprocess.
+
+Its first capability slice mirrors the useful upstream gflags spellings for
+indexed 1NN:
+
+```bash
+./build/cpp/mlx-scamp-native \
+  --window 128 \
+  --input_a_file_name series-a.txt \
+  --input_b_file_name series-b.txt \
+  --single_precision \
+  --keep_rows \
+  --output_pearson \
+  --output_a_file_name columns.txt \
+  --output_a_index_file_name columns-index.txt \
+  --output_b_file_name rows.txt \
+  --output_b_index_file_name rows-index.txt
+```
+
+Flags accept both `--name=value` and `--name value`; booleans additionally
+accept `--flag=true|false` and `--noflag`. `--gpus` may be empty or `0`.
+`--aligned` accepts paired `--global_row`/`--global_col` offsets. Use
+`--list_variants` without job arguments to print the single fixed MLX Metal
+strategy. As in an upstream tile request, global offsets position the aligned
+exclusion zone; reported match indexes remain local to the supplied files.
+
+Input files contain whitespace-delimited doubles, including `nan`/`inf` as
+invalid samples. Correlation outputs use `nan` and index outputs use `-1` when
+no match exists. Euclidean distance is the default; add `--output_pearson` for
+correlation.
+
+The CLI rejects unsupported profiles, non-single precision, CPU-only work,
+autotuning, and explicit tiling before opening input or creating output. It
+also rejects canonical, hardlink, case-folded, and Unicode-normalized
+input/output aliases. Output symlinks are rejected outright so replacement
+semantics cannot accidentally diverge from their target. Every active output
+is written and fsynced to a same-directory temporary file before any
+destination is replaced; existing destinations are backed up so a multi-file
+commit can roll back after a rename failure.
+
+`cmake --install` places the executable in `${CMAKE_INSTALL_BINDIR}` with a
+relocatable `@loader_path/../${CMAKE_INSTALL_LIBDIR}` run path. A package
+manager should co-locate the MLX runtime in that library directory (or make it
+available to dyld in the normal way).
+
 Consumers can use the build-tree target directly:
 
 ```cmake
@@ -93,6 +143,7 @@ slower implementation or silently ignored. The remaining C++ API work is:
 - bounded multi-dispatch tiling for very long joins (`max_tile_size` is
   currently validated for argument compatibility, while this kernel retains
   linear storage and executes one join-wide dispatch);
-- integration with the macOS CLI and distributed worker runtime; and
+- integration of the remaining reducers with the native CLI and the
+  distributed worker runtime; and
 - multiple accelerators or CUDA device management, which do not map to current
   Apple Silicon hardware.
