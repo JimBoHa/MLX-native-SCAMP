@@ -427,12 +427,174 @@ def _best_match_profile(
     return _convert_profile_output(corr_np, m, pearson), idx_np
 
 
-def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, threshold: float, self_join: bool) -> np.ndarray:
+def _sum_threshold_profile(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    threshold: float,
+    self_join: bool,
+    use_metal_kernel: bool,
+) -> np.ndarray:
+    if use_metal_kernel:
+        from ._metal_sum import sum_threshold
+
+        return sum_threshold(prepared_a, prepared_b, m, threshold, self_join)
+
     accum = mx.zeros((prepared_a.subsequences,), dtype=prepared_a.windows.dtype)
     for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         filtered = mx.where(block > threshold, block, mx.zeros_like(block))
         accum = accum + mx.sum(filtered, axis=0)
     return np.asarray(accum, dtype=np.float64)
+
+
+def _metal_sum_workload_is_worthwhile(
+    column_subsequences: int,
+    row_subsequences: int,
+    m: int,
+    qualifying_density: float,
+    self_join: bool,
+) -> bool:
+    """Apply the benchmarked pair floor for a sampled SUM workload."""
+
+    if self_join:
+        active_diagonals = max(
+            column_subsequences - self_join_exclusion(m), 0
+        )
+        comparisons = active_diagonals * (active_diagonals + 1) // 2
+    else:
+        shorter = min(column_subsequences, row_subsequences)
+        longer = max(column_subsequences, row_subsequences)
+        if shorter <= 0 or longer > 2 * shorter:
+            return False
+        comparisons = column_subsequences * row_subsequences
+
+    if self_join and qualifying_density <= 0.05:
+        minimum_comparisons = 8_000_000
+    elif self_join and qualifying_density <= 0.18:
+        minimum_comparisons = 12_000_000
+    elif self_join and qualifying_density <= 0.35:
+        minimum_comparisons = 40_000_000
+    elif not self_join and qualifying_density <= 0.05:
+        minimum_comparisons = 144_000_000
+    elif not self_join and qualifying_density <= 0.18:
+        minimum_comparisons = 625_000_000
+    else:
+        return False
+
+    # Short windows make the portable matrix multiply cheap relative to Metal
+    # dispatch and atomic overhead.  Keep those crossovers farther out.
+    if m < 32:
+        minimum_comparisons *= 2
+    elif m < 64:
+        minimum_comparisons = minimum_comparisons * 3 // 2
+    return comparisons >= minimum_comparisons
+
+
+def _estimate_metal_sum_density(
+    values_a: Any,
+    values_b: Any,
+    m: int,
+    threshold: float,
+    self_join: bool,
+) -> float | None:
+    """Sample the fraction of pairs that would require a Metal atomic add."""
+
+    sample_count = min(256, 262_144 // m)
+    if sample_count < 32:
+        return None
+
+    source_a = np.asarray(values_a, dtype=np.float32).astype(np.float64)
+    source_b = (
+        source_a
+        if self_join
+        else np.asarray(values_b, dtype=np.float32).astype(np.float64)
+    )
+    n_a = source_a.size - m + 1
+    n_b = source_b.size - m + 1
+    seed = (
+        n_a * 0x9E3779B1
+        + n_b * 0x85EBCA6B
+        + m * 0xC2B2AE35
+        + int(self_join)
+    ) & ((1 << 64) - 1)
+    generator = np.random.default_rng(seed)
+
+    if self_join:
+        exclusion = self_join_exclusion(m)
+        sampled_rows: list[int] = []
+        sampled_columns: list[int] = []
+        while len(sampled_rows) < sample_count:
+            candidates = sample_count * 2
+            first = generator.integers(0, n_a, size=candidates)
+            second = generator.integers(0, n_a, size=candidates)
+            rows = np.minimum(first, second)
+            columns = np.maximum(first, second)
+            eligible = columns - rows >= exclusion
+            sampled_rows.extend(rows[eligible].tolist())
+            sampled_columns.extend(columns[eligible].tolist())
+        row_indices = np.asarray(sampled_rows[:sample_count])
+        column_indices = np.asarray(sampled_columns[:sample_count])
+    else:
+        column_indices = generator.integers(0, n_a, size=sample_count)
+        row_indices = generator.integers(0, n_b, size=sample_count)
+
+    finite_a = np.isfinite(source_a)
+    finite_b = finite_a if self_join else np.isfinite(source_b)
+    if np.any(finite_a):
+        source_a[finite_a] -= source_a[finite_a][0]
+    if not self_join and np.any(finite_b):
+        source_b[finite_b] -= source_b[finite_b][0]
+    source_a[~finite_a] = 0.0
+    if not self_join:
+        source_b[~finite_b] = 0.0
+
+    offsets = np.arange(m)
+    a_positions = column_indices[:, None] + offsets
+    b_positions = row_indices[:, None] + offsets
+    windows_a = source_a[a_positions]
+    windows_b = source_b[b_positions]
+    valid = np.all(finite_a[a_positions], axis=1) & np.all(
+        finite_b[b_positions], axis=1
+    )
+    windows_a -= np.mean(windows_a, axis=1, keepdims=True)
+    windows_b -= np.mean(windows_b, axis=1, keepdims=True)
+    norm_a_sq = np.sum(windows_a * windows_a, axis=1)
+    norm_b_sq = np.sum(windows_b * windows_b, axis=1)
+    valid &= (norm_a_sq > FLATNESS_EPSILON) & (
+        norm_b_sq > FLATNESS_EPSILON
+    )
+    correlations = np.full((sample_count,), SENTINEL, dtype=np.float64)
+    correlations[valid] = np.sum(
+        windows_a[valid] * windows_b[valid], axis=1
+    ) / np.sqrt(norm_a_sq[valid] * norm_b_sq[valid])
+    qualifying = int(np.count_nonzero(correlations > threshold))
+
+    # Five synthetic successes add a small upper margin so sampling near a
+    # bucket boundary chooses the more conservative crossover.
+    return min(1.0, (qualifying + 5) / sample_count)
+
+
+def _metal_sum_is_worthwhile(
+    values_a: Any,
+    values_b: Any,
+    column_subsequences: int,
+    row_subsequences: int,
+    m: int,
+    threshold: float,
+    self_join: bool,
+) -> bool:
+    """Estimate whether sparse Metal SUM should beat the portable reducer."""
+
+    if not _metal_sum_workload_is_worthwhile(
+        column_subsequences, row_subsequences, m, 0.0, self_join
+    ):
+        return False
+    density = _estimate_metal_sum_density(
+        values_a, values_b, m, threshold, self_join
+    )
+    return density is not None and _metal_sum_workload_is_worthwhile(
+        column_subsequences, row_subsequences, m, density, self_join
+    )
 
 
 def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, threshold: float, rows: int, cols: int, self_join: bool) -> np.ndarray:
@@ -518,6 +680,7 @@ def _run_profile(
     profile: str,
     k: int | None = None,
     use_metal_1nn: bool = False,
+    use_metal_sum: bool = False,
 ):
     has_b = b is not None
     float32_sources = _is_float32_input(a) and (
@@ -540,7 +703,24 @@ def _run_profile(
 
     self_join = not has_b
 
-    if profile == "1nn" and use_metal_1nn and float32_sources:
+    sum_recurrence = (
+        profile == "sum"
+        and use_metal_sum
+        and float32_sources
+        and threshold >= 0.0
+        and _metal_sum_is_worthwhile(
+            a,
+            a if self_join else b,
+            int(series_a.shape[0]) - m + 1,
+            int(series_b.shape[0]) - m + 1,
+            m,
+            threshold,
+            self_join,
+        )
+    )
+    if (
+        profile == "1nn" and use_metal_1nn and float32_sources
+    ) or sum_recurrence:
         recurrence_a = _prepare_metal_recurrence(series_a, m)
         recurrence_b = (
             recurrence_a
@@ -552,11 +732,20 @@ def _run_profile(
             and recurrence_b is not None
             and _metal_recurrence_is_safe(recurrence_a, recurrence_b, m)
         ):
-            return _best_match_profile(
+            if profile == "1nn":
+                return _best_match_profile(
+                    recurrence_a,
+                    recurrence_b,
+                    m,
+                    pearson,
+                    self_join,
+                    True,
+                )
+            return _sum_threshold_profile(
                 recurrence_a,
                 recurrence_b,
                 m,
-                pearson,
+                threshold,
                 self_join,
                 True,
             )
@@ -577,7 +766,14 @@ def _run_profile(
             False,
         )
     if profile == "sum":
-        return _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
+        return _sum_threshold_profile(
+            prepared_a,
+            prepared_b,
+            m,
+            threshold,
+            self_join,
+            False,
+        )
     if profile == "matrix":
         return _matrix_summary(
             prepared_a,
@@ -633,6 +829,7 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
             *args,
             precision=params["precision"],
             use_metal_1nn=use_metal_1nn,
+            use_metal_sum=use_metal_1nn,
             **kwargs,
         )
 
