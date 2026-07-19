@@ -1,266 +1,374 @@
 import inspect
-import json
-import os
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
-from pathlib import Path
 from unittest import mock
 
-import mlx.core as mx
 import numpy as np
 
 import mlx_native_scamp
-import mlx_native_scamp._autotune as mlx_autotune
-import mlx_native_scamp.core as scamp_core
+import mlx_native_scamp._autotune as tuning
 import pyscamp
 
 
-def _config(**overrides):
+def _profile_result(index=1):
+    return (
+        np.array([0.25, np.nan], dtype=np.float32),
+        np.array([index, -1], dtype=np.int32),
+    )
+
+
+def _small_workload(
+    profile="1nn_index", precision="single", **overrides
+):
     values = {
-        "preferred_1nn_backend": "metal",
-        "preferred_portable_backend": "cpu",
-        "cpu_block_rows": 128,
-        "metal_block_rows": 512,
-        "metal_threadgroup_width": 64,
-        "input_length": 4096,
-        "timings_ns": {"candidate": 100},
+        "name": f"test-{profile}-{precision}",
+        "profile": profile,
+        "precision": precision,
+        "n_a": 64,
+        "n_b": 64,
+        "m": 16,
+        "self_join": True,
     }
+    if profile == "sum_thresh":
+        values["threshold_density"] = 0.1
+    elif profile == "matrix_summary":
+        values["matrix_shape"] = (4, 4)
+    elif profile == "knn":
+        values["k"] = 3
     values.update(overrides)
-    return mlx_autotune.TuningConfig(**values)
+    return tuning.AutotuneWorkload(**values)
 
 
-class AutotuneTests(unittest.TestCase):
-    def test_signature_and_exports_match_upstream(self):
+class _CandidateClock:
+    def __init__(self, current, durations):
+        self.current = current
+        self.durations = durations
+        self.total = 0
+        self.starting = True
+
+    def __call__(self):
+        if self.starting:
+            self.starting = False
+            return self.total
+        self.total += self.durations[self.current[0]]
+        self.starting = True
+        return self.total
+
+
+class AutotunePlanTests(unittest.TestCase):
+    def test_strict_signature_and_namespace_remain_upstream_compatible(self):
         self.assertIs(pyscamp.autotune, mlx_native_scamp.autotune)
-        self.assertIn("autotune", pyscamp.__all__)
-        self.assertIn("autotune", mlx_native_scamp.__all__)
         signature = inspect.signature(pyscamp.autotune)
         self.assertEqual(["devices", "cache_path"], list(signature.parameters))
         self.assertIsNone(signature.parameters["devices"].default)
         self.assertEqual("", signature.parameters["cache_path"].default)
+        self.assertIn("autotune", pyscamp.__all__)
+        for extension in (
+            "autotune_plan",
+            "run_autotune",
+            "strategy_descriptions",
+        ):
+            self.assertIn(extension, mlx_native_scamp.__all__)
+            self.assertNotIn(extension, pyscamp.__all__)
 
-    def test_device_and_cache_arguments_are_validated(self):
+    def test_quick_plan_covers_five_upstream_families_and_precisions(self):
+        plan = tuning.autotune_plan("quick")
+        observed = {
+            (workload.profile, workload.precision)
+            for workload in plan.workloads
+        }
+        expected = {
+            (profile, precision)
+            for profile in tuning.UPSTREAM_PROFILE_FAMILIES
+            for precision in ("single", "double")
+        }
+        self.assertEqual(expected, observed)
+        self.assertEqual(10, len(plan.workloads))
+        self.assertEqual(len(plan.workloads), len({row.key for row in plan.workloads}))
+        self.assertLessEqual(max(row.n_a for row in plan.workloads), 512)
+
+    def test_full_plan_adds_large_asymmetric_profile_and_native_buckets(self):
+        quick = tuning.autotune_plan("quick")
+        full = tuning.autotune_plan("full")
+        self.assertEqual(quick.workloads, full.workloads[: len(quick.workloads)])
+        added = full.workloads[len(quick.workloads) :]
+        self.assertTrue(any(max(row.n_a, row.n_b) >= 4096 for row in added))
+        self.assertTrue(any(row.n_a != row.n_b for row in added))
+        self.assertTrue(
+            any(row.threshold_density in {0.01, 0.5} for row in added)
+        )
+        self.assertTrue(any(row.matrix_shape == (16, 64) for row in added))
+        self.assertTrue(any(row.k == 32 for row in added))
+        self.assertEqual(
+            {"single", "double"},
+            {
+                row.precision
+                for row in added
+                if row.profile == "bidirectional_ab"
+            },
+        )
+
+    def test_invalid_mode_is_rejected_without_running_work(self):
+        with self.assertRaisesRegex(ValueError, "quick.*full"):
+            tuning.autotune_plan("slow")
+
+    def test_strategy_descriptions_are_typed_and_complete(self):
+        descriptions = tuning.strategy_descriptions()
+        self.assertEqual(len(tuning.cache.STRATEGIES), len(descriptions))
+        self.assertEqual(
+            set(tuning.cache.STRATEGIES),
+            {description.strategy for description in descriptions},
+        )
+        self.assertTrue(all(description.summary for description in descriptions))
+        self.assertTrue(
+            all(
+                description.backend in {"cpu", "portable_metal", "custom_metal"}
+                for description in descriptions
+            )
+        )
+
+    def test_candidate_eligibility_is_precision_route_and_family_specific(self):
+        double = tuning._eligible_strategies(_small_workload(precision="double"))
+        ultra = tuning._eligible_strategies(_small_workload(precision="ultra"))
+        single = tuning._eligible_strategies(_small_workload())
+        self.assertTrue(double)
+        self.assertTrue(ultra)
+        self.assertTrue(all(row.route == "cpu" for row in double + ultra))
+        self.assertTrue(any(row.route == "metal_1nn" for row in single))
+        self.assertTrue(all(row.profile == "1nn_index" for row in single))
+
+
+class ResultEquivalenceTests(unittest.TestCase):
+    def test_array_profile_and_index_families_use_their_own_semantics(self):
+        tuning._assert_result_equivalent(
+            "1nn_value",
+            "single",
+            np.array([0.5 + 1e-5, np.nan]),
+            np.array([0.5, np.nan]),
+        )
+        tuning._assert_result_equivalent(
+            "1nn_index", "single", _profile_result(), _profile_result()
+        )
+        with self.assertRaises(AssertionError):
+            tuning._assert_result_equivalent(
+                "1nn_index", "single", _profile_result(2), _profile_result(1)
+            )
+
+    def test_knn_requires_exact_pairs_and_tolerates_small_score_error(self):
+        reference = [(1, 7, 0.5), (2, 8, 0.25)]
+        tuning._assert_result_equivalent(
+            "knn",
+            "single",
+            [(1, 7, 0.50001), (2, 8, 0.25)],
+            reference,
+        )
+        with self.assertRaises(AssertionError):
+            tuning._assert_result_equivalent(
+                "knn", "single", [(1, 6, 0.5), (2, 8, 0.25)], reference
+            )
+
+    def test_matrix_shape_and_bidirectional_indices_are_checked(self):
+        with self.assertRaises(AssertionError):
+            tuning._assert_result_equivalent(
+                "matrix_summary",
+                "single",
+                np.zeros((2, 2)),
+                np.zeros((4, 1)),
+            )
+        reference = (_profile_result(1), _profile_result(2))
+        tuning._assert_result_equivalent(
+            "bidirectional_ab", "single", reference, reference
+        )
+        with self.assertRaises(AssertionError):
+            tuning._assert_result_equivalent(
+                "bidirectional_ab",
+                "single",
+                (_profile_result(1), _profile_result(3)),
+                reference,
+            )
+
+    def test_malformed_results_are_rejected(self):
+        with self.assertRaises(AssertionError):
+            tuning._assert_result_equivalent(
+                "1nn_index", "single", np.zeros(2), _profile_result()
+            )
+
+
+class AutotuneRunnerTests(unittest.TestCase):
+    def test_devices_are_deduplicated_and_nonzero_devices_rejected(self):
+        plan = tuning.AutotunePlan(
+            "quick", (_small_workload(),), warmups=0, trials=1
+        )
+        records = []
+        ticks = iter(range(0, 10_000, 10))
+        with redirect_stdout(StringIO()):
+            result = tuning.run_autotune(
+                [0, 0, 0],
+                "cache.txt",
+                plan=plan,
+                executor=lambda *_: _profile_result(),
+                synchronize=lambda: None,
+                clock=lambda: next(ticks),
+                record_writer=lambda record, path: records.append((record, path)),
+            )
+        self.assertEqual(1, result)
+        self.assertEqual(1, len(records))
+        self.assertEqual("cache.txt", records[0][1])
+
+        for devices in ([1], [-1], [0, 1]):
+            with self.subTest(devices=devices):
+                with self.assertRaisesRegex(ValueError, "GPU device ID"):
+                    tuning.run_autotune(devices, executor=lambda *_: None, plan=plan)
         for devices in (0, "0", [0, 1.5]):
             with self.subTest(devices=devices):
                 with self.assertRaisesRegex(TypeError, "devices"):
-                    pyscamp.autotune(devices=devices)
+                    tuning.run_autotune(devices, executor=lambda *_: None, plan=plan)
 
-        for devices in ([1], [-1], [0, 0, 0, 1]):
-            with self.subTest(devices=devices):
-                with self.assertRaisesRegex(ValueError, "GPU device ID"):
-                    pyscamp.autotune(devices=devices)
+    def test_warmups_are_outside_synchronized_median_timing(self):
+        workload = _small_workload()
+        strategy = tuning._eligible_strategies(workload)[0]
+        events = []
+        ticks = iter((100, 111, 200, 235))
 
-        with self.assertRaisesRegex(TypeError, "cache_path"):
-            pyscamp.autotune(cache_path=None)
+        def executor(*_args):
+            events.append("execute")
+            return _profile_result()
 
-    def test_no_metal_device_matches_upstream_no_gpu_error(self):
-        with mock.patch.object(mx.metal, "is_available", return_value=False):
-            with self.assertRaisesRegex(ValueError, "No Metal device"):
-                pyscamp.autotune()
+        def synchronize():
+            events.append("sync")
 
-    def test_cache_path_resolution_matches_upstream_order(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            environment = {
-                "SCAMP_AUTOTUNE_CACHE": f"{temp_dir}/explicit.txt",
-                "XDG_CACHE_HOME": f"{temp_dir}/xdg",
-            }
-            with mock.patch.dict(os.environ, environment, clear=False):
-                self.assertEqual(
-                    Path(environment["SCAMP_AUTOTUNE_CACHE"]),
-                    mlx_autotune._default_cache_path(),
-                )
-            with mock.patch.dict(
-                os.environ,
-                {"XDG_CACHE_HOME": f"{temp_dir}/xdg"},
-                clear=True,
-            ):
-                self.assertEqual(
-                    Path(temp_dir) / "xdg" / "scamp" / "autotune.txt",
-                    mlx_autotune._default_cache_path(),
-                )
-
-    def test_sweep_selects_independent_launch_winners(self):
-        result = (np.zeros(4, dtype=np.float32), np.zeros(4, dtype=np.int32))
-
-        def benchmark(*_args):
-            return result
-
-        def deterministic_time(_benchmark, _reference, **kwargs):
-            if kwargs["workload"] == "metal_1nn":
-                return {32: 50, 64: 5, 128: 20, 256: 30}[
-                    kwargs["threadgroup_width"]
-                ]
-            if kwargs["device"] == "cpu":
-                return {64: 40, 128: 10, 256: 30, 512: 20}[
-                    kwargs["block_rows"]
-                ]
-            return {64: 60, 128: 45, 256: 35, 512: 25}[
-                kwargs["block_rows"]
-            ]
-
-        with mock.patch.object(
-            mlx_autotune,
-            "_benchmark_trials",
-            side_effect=deterministic_time,
-        ):
-            config = mlx_autotune._run_sweep(
-                benchmark, input_length=512, warmups=0, trials=1
-            )
-
-        self.assertEqual("metal", config.preferred_1nn_backend)
-        self.assertEqual("cpu", config.preferred_portable_backend)
-        self.assertEqual(128, config.cpu_block_rows)
-        self.assertEqual(512, config.metal_block_rows)
-        self.assertEqual(64, config.metal_threadgroup_width)
-
-    def test_candidate_is_rejected_before_a_bad_result_can_be_cached(self):
-        reference = (
-            np.array([0.5], dtype=np.float32),
-            np.array([2], dtype=np.int32),
+        measurement = tuning._measure_candidate(
+            workload,
+            strategy,
+            _profile_result(),
+            executor=executor,
+            synchronize=synchronize,
+            clock=lambda: next(ticks),
+            warmups=1,
+            trials=2,
         )
-        candidate = (
-            np.array([0.5], dtype=np.float32),
-            np.array([3], dtype=np.int32),
-        )
-        with self.assertRaisesRegex(RuntimeError, "correctness check"):
-            mlx_autotune._assert_equivalent(candidate, reference, "bad")
-
-    def test_autotune_atomically_writes_and_reloads_current_device(self):
-        config = _config()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_path = Path(temp_dir) / "nested" / "autotune.txt"
-            with mock.patch.object(
-                mx.metal, "is_available", return_value=True
-            ), mock.patch.object(
-                mlx_autotune, "_run_sweep", return_value=config
-            ), mock.patch.object(
-                mlx_autotune, "_device_key", return_value="test-device"
-            ), redirect_stdout(StringIO()):
-                tuned = pyscamp.autotune([], str(cache_path))
-                loaded = mlx_autotune.load_tuning(str(cache_path))
-
-            self.assertEqual(1, tuned)
-            self.assertEqual(config, loaded)
-            self.assertEqual(0o600, cache_path.stat().st_mode & 0o777)
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            self.assertEqual(mlx_autotune.CACHE_FORMAT, payload["format"])
-            self.assertEqual(config.cpu_block_rows, payload["records"]["test-device"]["cpu_block_rows"])
-            self.assertFalse(list(cache_path.parent.glob("*.tmp")))
-
-    def test_runtime_cache_changes_real_stream_and_launch_parameters(self):
-        config = _config(
-            preferred_1nn_backend="cpu", preferred_portable_backend="metal"
-        )
-        observed = []
-
-        def record_run(*_args, **kwargs):
-            observed.append((mx.default_device(), kwargs))
-            return (
-                np.zeros(5, dtype=np.float32),
-                np.zeros(5, dtype=np.int32),
-            )
-
-        series = np.arange(8, dtype=np.float32)
-        with mock.patch.object(
-            scamp_core, "load_tuning", return_value=config
-        ), mock.patch.object(scamp_core, "_run_profile", side_effect=record_run):
-            pyscamp.selfjoin(series, 4, precision="single")
-            pyscamp.selfjoin(series, 4, precision="single", gpus=[0])
-            pyscamp.selfjoin_sum(series, 4, precision="single")
-
-        self.assertEqual(mx.cpu, observed[0][0])
-        self.assertEqual(128, observed[0][1]["block_rows"])
-        self.assertEqual(mx.gpu, observed[1][0])
-        self.assertEqual(512, observed[1][1]["block_rows"])
-        self.assertEqual(64, observed[1][1]["metal_threadgroup_width"])
-        self.assertEqual(mx.gpu, observed[2][0])
-        self.assertEqual(512, observed[2][1]["block_rows"])
-
-    def test_foreign_or_malformed_cache_is_never_applied(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_path = Path(temp_dir) / "autotune.txt"
-            cache_path.write_text("SCAMP_AUTOTUNE_V1\n", encoding="utf-8")
-            self.assertIsNone(mlx_autotune.load_tuning(str(cache_path)))
-            with self.assertRaisesRegex(ValueError, "Unable to read|not in"):
-                mlx_autotune._save_tuning(_config(), cache_path)
-
-    def test_runtime_cache_file_is_loaded_only_once_per_process(self):
-        config = _config()
-        payload = {
-            "format": mlx_autotune.CACHE_FORMAT,
-            "records": {
-                "cached-device": {
-                    "preferred_1nn_backend": config.preferred_1nn_backend,
-                    "preferred_portable_backend": config.preferred_portable_backend,
-                    "cpu_block_rows": config.cpu_block_rows,
-                    "metal_block_rows": config.metal_block_rows,
-                    "metal_threadgroup_width": config.metal_threadgroup_width,
-                    "input_length": config.input_length,
-                    "timings_ns": config.timings_ns,
-                }
-            },
-        }
-        mlx_autotune._load_tuning_once.cache_clear()
-        try:
-            with mock.patch.object(
-                mlx_autotune, "_read_payload", return_value=payload
-            ) as read_payload, mock.patch.object(
-                mlx_autotune, "_device_key", return_value="cached-device"
-            ):
-                first = mlx_autotune.load_tuning("cache.txt")
-                second = mlx_autotune.load_tuning("cache.txt")
-        finally:
-            mlx_autotune._load_tuning_once.cache_clear()
-        self.assertEqual(config, first)
-        self.assertIs(first, second)
-        read_payload.assert_called_once()
-
-    def test_device_key_invalidates_software_and_kernel_changes(self):
-        mlx_autotune._device_key.cache_clear()
-        try:
-            with mock.patch.object(
-                mlx_autotune,
-                "_device_information",
-                return_value={
-                    "device_name": "Apple Test",
-                    "architecture": "applegpu_test",
-                    "memory_size": 16,
-                },
-            ), mock.patch.object(
-                mlx_autotune, "_mlx_version", return_value="1.2.3"
-            ):
-                key = mlx_autotune._device_key()
-        finally:
-            mlx_autotune._device_key.cache_clear()
-        self.assertIn("Apple Test", key)
-        self.assertIn("applegpu_test", key)
-        self.assertIn("mlx-1.2.3", key)
-        self.assertIn(mlx_autotune.KERNEL_REVISION, key)
-
-    def test_environment_controls_are_bounded_and_mockable(self):
-        with mock.patch.object(mx.metal, "is_available", return_value=True):
-            for name, value, message in (
-                ("SCAMP_AUTOTUNE_INPUT_LENGTH", "not-an-int", "integer"),
-                ("SCAMP_AUTOTUNE_INPUT_LENGTH", "255", "256"),
-                ("SCAMP_AUTOTUNE_WARMUP_RUNS", "-1", "0"),
-                ("MLX_SCAMP_AUTOTUNE_TRIALS", "0", "1"),
-            ):
-                with self.subTest(name=name, value=value):
-                    with mock.patch.dict(os.environ, {name: value}, clear=False):
-                        with self.assertRaisesRegex(ValueError, message):
-                            pyscamp.autotune(cache_path="unused")
-
-    def test_list_variants_describes_every_swept_choice(self):
-        descriptions = mlx_autotune.variant_descriptions()
+        self.assertEqual((11, 35), measurement.samples_ns)
+        self.assertEqual(23, measurement.duration_ns)
         self.assertEqual(
-            len(mlx_autotune.BLOCK_ROW_CANDIDATES)
-            + len(mlx_autotune.THREADGROUP_CANDIDATES),
-            len(descriptions),
+            [
+                "execute",
+                "sync",
+                "sync",
+                "execute",
+                "sync",
+                "sync",
+                "execute",
+                "sync",
+            ],
+            events,
         )
-        self.assertTrue(any("block_rows=512" in row for row in descriptions))
-        self.assertTrue(any("threadgroup_width=256" in row for row in descriptions))
+
+    def test_runner_rejects_wrong_candidate_and_uses_resource_tie_break(self):
+        workload = _small_workload()
+        plan = tuning.AutotunePlan("quick", (workload,), warmups=0, trials=3)
+        current = [""]
+        durations = {
+            strategy.name: (
+                50
+                if strategy.route == "cpu"
+                else 5
+                if strategy.route == "portable_metal"
+                and dict(strategy.parameters)["portable_row_cap"] in {64, 128}
+                else 100
+            )
+            for strategy in tuning._eligible_strategies(workload)
+        }
+        wrong = next(
+            strategy.name
+            for strategy in tuning._eligible_strategies(workload)
+            if strategy.route == "portable_metal"
+            and dict(strategy.parameters)["portable_row_cap"] == 64
+        )
+        records = []
+
+        def executor(_workload, strategy):
+            current[0] = strategy.name
+            return _profile_result(9 if strategy.name == wrong else 1)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            tuning.run_autotune(
+                plan=plan,
+                executor=executor,
+                synchronize=lambda: None,
+                clock=_CandidateClock(current, durations),
+                record_writer=lambda record, _path: records.append(record),
+            )
+
+        self.assertIn("rejected", output.getvalue())
+        self.assertEqual(1, len(records))
+        # rows-64 was incorrect, so equal-duration rows-128 beats the more
+        # resource-intensive candidates by the deterministic second key.
+        self.assertEqual(
+            "1nn_index:portable_metal:rows-128", records[0].candidate
+        )
+        self.assertEqual(5, records[0].duration_ns)
+
+    def test_injected_runner_never_resolves_lazy_core_hook(self):
+        plan = tuning.AutotunePlan(
+            "quick", (_small_workload(),), warmups=0, trials=1
+        )
+        ticks = iter(range(0, 10_000, 10))
+        with mock.patch.object(
+            tuning, "_default_executor", side_effect=AssertionError("imported")
+        ), redirect_stdout(StringIO()):
+            tuning.run_autotune(
+                plan=plan,
+                executor=lambda *_: _profile_result(),
+                synchronize=lambda: None,
+                clock=lambda: next(ticks),
+                record_writer=lambda *_: None,
+            )
+
+    def test_default_runner_checks_metal_before_resolving_core_hook(self):
+        with mock.patch.object(
+            tuning.mx.metal, "is_available", return_value=False
+        ), mock.patch.object(
+            tuning, "_default_executor", side_effect=AssertionError("resolved")
+        ):
+            with self.assertRaisesRegex(ValueError, "No Metal device"):
+                pyscamp.autotune(cache_path="unused")
+
+    def test_explicit_stdout_reports_plan_trials_selection_and_cache(self):
+        plan = tuning.AutotunePlan(
+            "quick", (_small_workload(),), warmups=0, trials=1
+        )
+        ticks = iter(range(0, 10_000, 10))
+        output = StringIO()
+        with redirect_stdout(output):
+            tuning.run_autotune(
+                plan=plan,
+                executor=lambda *_: _profile_result(),
+                synchronize=lambda: None,
+                clock=lambda: next(ticks),
+                record_writer=lambda *_: None,
+            )
+        text = output.getvalue()
+        self.assertIn("plan=quick", text)
+        self.assertIn("trial 1/1", text)
+        self.assertIn("selected:", text)
+        self.assertIn("cache=", text)
+
+    def test_cache_path_type_and_plan_counts_are_validated(self):
+        plan = tuning.AutotunePlan(
+            "quick", (_small_workload(),), warmups=0, trials=1
+        )
+        with self.assertRaisesRegex(TypeError, "cache_path"):
+            tuning.run_autotune(
+                cache_path=None, executor=lambda *_: None, plan=plan
+            )
+        for invalid in (
+            tuning.AutotunePlan("quick", plan.workloads, -1, 1),
+            tuning.AutotunePlan("quick", plan.workloads, 0, 0),
+        ):
+            with self.assertRaises(ValueError):
+                tuning.run_autotune(executor=lambda *_: None, plan=invalid)
 
 
 if __name__ == "__main__":

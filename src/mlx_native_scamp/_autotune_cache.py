@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import ctypes
 import tempfile
 import threading
 import time
@@ -30,7 +31,7 @@ SCHEMA_VERSION = 2
 CORE_ALGORITHM_REVISION = "tiled-v2-metal-profiles-v1"
 CANDIDATE_MANIFEST_VERSION = "2026-07-19-1"
 MAX_CACHE_BYTES = 4 * 1024 * 1024
-MAX_RECORDS = 4096
+MAX_RECORDS = 1024
 MAX_ENVIRONMENTS = 32
 MAX_DURATION_NS = 24 * 60 * 60 * 1_000_000_000
 PORTABLE_ROW_CAPS = (64, 128, 256)
@@ -107,6 +108,7 @@ class WorkloadKey:
     precision: str
     route: str
     join: str
+    alignment: str
     work_bucket: str
     window_bucket: str
     aspect_bucket: str
@@ -180,6 +182,7 @@ def make_workload_key(
     m: int,
     *,
     self_join: bool,
+    aligned: bool = False,
     dtype_class: str,
     max_tile_size: int | None,
     threshold_density: float | None = None,
@@ -226,6 +229,7 @@ def make_workload_key(
         precision=precision,
         route=route,
         join="self" if self_join else "ab",
+        alignment="self" if self_join else ("aligned" if aligned else "none"),
         work_bucket=_power_bucket(n_a * n_b),
         window_bucket=_power_bucket(m),
         aspect_bucket=_aspect_bucket(n_a, n_b, self_join),
@@ -237,16 +241,20 @@ def make_workload_key(
 
 def _default_upstream_cache_path() -> Path:
     override = os.environ.get("SCAMP_AUTOTUNE_CACHE")
-    if override is not None:
+    if override:
         return Path(override)
     xdg_cache = os.environ.get("XDG_CACHE_HOME")
-    if xdg_cache is not None:
-        return Path(xdg_cache) / "scamp" / "autotune.txt"
+    if xdg_cache:
+        xdg_path = Path(xdg_cache)
+        if xdg_path.is_absolute():
+            return xdg_path / "scamp" / "autotune.txt"
     return Path.home() / ".cache" / "scamp" / "autotune.txt"
 
 
 def sidecar_path(cache_path: str = "") -> Path:
     upstream_path = Path(cache_path) if cache_path else _default_upstream_cache_path()
+    if not upstream_path.name:
+        raise ValueError("cache_path must name a cache file")
     return upstream_path.with_name(f"{upstream_path.name}.mlx.json")
 
 
@@ -268,26 +276,89 @@ def _memory_bytes() -> int | None:
     return value if value > 0 else None
 
 
+def _sysctl_text(name: str) -> str | None:
+    try:
+        if os.uname().sysname != "Darwin":
+            return None
+        libc = ctypes.CDLL(None, use_errno=True)
+        sysctlbyname = libc.sysctlbyname
+        size = ctypes.c_size_t()
+        encoded_name = name.encode("ascii")
+        if sysctlbyname(
+            encoded_name, None, ctypes.byref(size), None, 0
+        ) != 0:
+            return None
+        if size.value <= 1 or size.value > 4096:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if sysctlbyname(
+            encoded_name, buffer, ctypes.byref(size), None, 0
+        ) != 0:
+            return None
+        value = buffer.raw[: size.value].rstrip(b"\0").decode("utf-8")
+    except (AttributeError, OSError, UnicodeError):
+        return None
+    return value or None
+
+
+@lru_cache(maxsize=1)
+def _hardware_identity() -> dict[str, str]:
+    identity: dict[str, str] = {}
+    for label, name in (
+        ("hardware_model", "hw.model"),
+        ("cpu_brand", "machdep.cpu.brand_string"),
+        ("target_type", "hw.targettype"),
+    ):
+        value = _sysctl_text(name)
+        if value is not None:
+            identity[label] = value
+    return identity
+
+
+def _device_information() -> dict[str, Any]:
+    getters = []
+    getter = getattr(mx, "device_info", None)
+    if getter is not None:
+        getters.append(getter)
+    metal = getattr(mx, "metal", None)
+    metal_getter = getattr(metal, "device_info", None)
+    if metal_getter is not None:
+        getters.append(metal_getter)
+    for candidate in getters:
+        try:
+            value = candidate()
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
 @lru_cache(maxsize=1)
 def environment_fingerprint() -> dict[str, Any]:
+    device = _device_information()
+    stable_device: dict[str, str | int | float | bool] = {}
+    for key, value in sorted(device.items())[:64]:
+        if not isinstance(value, (str, int, float, bool)):
+            continue
+        stable_key = str(key)[:128]
+        stable_device[stable_key] = value[:256] if isinstance(value, str) else value
     try:
-        device = dict(mx.device_info())
-    except Exception:
-        device = {}
-    stable_device = {
-        str(key): value
-        for key, value in sorted(device.items())
-        if isinstance(value, (str, int, float, bool))
-    }
+        uname = os.uname()
+        machine = uname.machine or "unknown"
+        os_build = uname.version or "unknown"
+    except (AttributeError, OSError):
+        machine = "unknown"
+        os_build = "unknown"
     return {
         "algorithm_revision": CORE_ALGORITHM_REVISION,
         "candidate_manifest": candidate_manifest_id(),
         "mlx_version": _mlx_version(),
         "macos_version": platform.mac_ver()[0] or "unknown",
-        "macos_build": platform.version(),
-        "machine": platform.machine() or "unknown",
-        "processor": platform.processor() or "unknown",
+        "macos_build": os_build,
+        "machine": machine,
         "memory_bytes": _memory_bytes(),
+        "hardware": _hardware_identity(),
         "device": stable_device,
     }
 
@@ -306,26 +377,51 @@ def _empty_payload() -> dict[str, Any]:
     }
 
 
-def _read_payload(path: Path) -> dict[str, Any]:
+def _cache_read_error(path: Path, reason: str) -> ValueError:
+    return ValueError(
+        f"Unable to update MLX autotune sidecar {path}: {reason}; "
+        "reset it or choose a different cache_path"
+    )
+
+
+def _read_payload(path: Path, *, strict: bool = False) -> dict[str, Any]:
     try:
         if path.stat().st_size > MAX_CACHE_BYTES:
+            if strict:
+                raise _cache_read_error(path, "file exceeds the size limit")
             return _empty_payload()
         raw = path.read_bytes()
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
+        return _empty_payload()
+    except OSError as exc:
+        if strict:
+            raise _cache_read_error(path, str(exc)) from exc
         return _empty_payload()
     if len(raw) > MAX_CACHE_BYTES:
+        if strict:
+            raise _cache_read_error(path, "file exceeds the size limit")
         return _empty_payload()
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        if strict:
+            raise _cache_read_error(path, "file is not valid JSON") from exc
         return _empty_payload()
     if not isinstance(payload, dict):
+        if strict:
+            raise _cache_read_error(path, "top level is not an object")
         return _empty_payload()
     if payload.get("format") != CACHE_FORMAT or payload.get("schema") != SCHEMA_VERSION:
+        if strict:
+            raise _cache_read_error(path, "format or schema is incompatible")
         return _empty_payload()
     if not isinstance(payload.get("records"), dict):
+        if strict:
+            raise _cache_read_error(path, "records is not an object")
         return _empty_payload()
     if not isinstance(payload.get("environments"), dict):
+        if strict:
+            raise _cache_read_error(path, "environments is not an object")
         return _empty_payload()
     return payload
 
@@ -345,6 +441,12 @@ def _workload_key_from_dict(value: Any) -> WorkloadKey | None:
     if key.precision not in PRECISIONS or key.route not in ROUTE_POLICIES:
         return None
     if key.join not in {"self", "ab"}:
+        return None
+    if key.alignment not in {"self", "aligned", "none"}:
+        return None
+    if key.join == "self" and key.alignment != "self":
+        return None
+    if key.join == "ab" and key.alignment == "self":
         return None
     if any(
         not isinstance(item, str) or not item or len(item) > 128
@@ -495,34 +597,49 @@ def save_record(record: TuningRecord, cache_path: str = "") -> Path:
         raise ValueError("autotune record uses a stale candidate manifest")
     path = sidecar_path(cache_path)
     with _locked_cache(path):
-        payload = _read_payload(path)
-        records = payload["records"]
+        source_payload = _read_payload(path, strict=True)
+        records = source_payload["records"]
         valid_records = [
             parsed
             for parsed in (
                 _record_from_dict(value)
                 for value in islice(records.values(), MAX_RECORDS)
             )
-            if parsed is not None
+            if parsed is not None and record_id(parsed) != record_id(validated)
         ]
         valid_records.append(validated)
         valid_records.sort(key=lambda item: item.created_ns, reverse=True)
         newest_by_key: dict[str, TuningRecord] = {}
         for item in valid_records:
             newest_by_key.setdefault(record_id(item), item)
+        allowed_environments = [record.environment_id]
+        for item in newest_by_key.values():
+            if item.environment_id in allowed_environments:
+                continue
+            if len(allowed_environments) >= MAX_ENVIRONMENTS:
+                break
+            allowed_environments.append(item.environment_id)
+        allowed = set(allowed_environments)
+        payload = _empty_payload()
         payload["records"] = {
             record_id(item): _record_to_dict(item)
-            for item in islice(newest_by_key.values(), MAX_RECORDS)
+            for item in islice(
+                (
+                    candidate
+                    for candidate in newest_by_key.values()
+                    if candidate.environment_id in allowed
+                ),
+                MAX_RECORDS,
+            )
         }
-        environments = payload["environments"]
-        environments[record.environment_id] = environment_fingerprint()
-        if len(environments) > MAX_ENVIRONMENTS:
-            keep = {item.environment_id for item in valid_records[:MAX_RECORDS]}
-            payload["environments"] = {
-                key: value
-                for key, value in environments.items()
-                if key in keep
-            }
+        payload["environments"] = {
+            identifier: (
+                environment_fingerprint()
+                if identifier == record.environment_id
+                else {}
+            )
+            for identifier in allowed_environments
+        }
         _write_payload(path, payload)
     _load_records_once.cache_clear()
     return path

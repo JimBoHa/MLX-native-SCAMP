@@ -18,6 +18,7 @@ def _key(
     m=64,
     self_join=True,
     route="auto",
+    aligned=False,
     max_tile_size=None,
     threshold_density=None,
     k=None,
@@ -31,6 +32,7 @@ def _key(
         n_b,
         m,
         self_join=self_join,
+        aligned=aligned,
         dtype_class="float32",
         max_tile_size=max_tile_size,
         threshold_density=threshold_density,
@@ -92,6 +94,26 @@ class AutotuneCacheTests(unittest.TestCase):
                     Path(f"{override}.mlx.json"), cache.sidecar_path()
                 )
 
+            with mock.patch.dict(
+                os.environ,
+                {"SCAMP_AUTOTUNE_CACHE": "", "XDG_CACHE_HOME": ""},
+                clear=False,
+            ), mock.patch.object(Path, "home", return_value=Path(temp_dir)):
+                self.assertEqual(
+                    Path(temp_dir) / ".cache/scamp/autotune.txt.mlx.json",
+                    cache.sidecar_path(),
+                )
+
+            with mock.patch.dict(
+                os.environ,
+                {"SCAMP_AUTOTUNE_CACHE": "", "XDG_CACHE_HOME": "relative"},
+                clear=False,
+            ), mock.patch.object(Path, "home", return_value=Path(temp_dir)):
+                self.assertEqual(
+                    Path(temp_dir) / ".cache/scamp/autotune.txt.mlx.json",
+                    cache.sidecar_path(),
+                )
+
     def test_workload_keys_separate_sizes_shapes_and_profile_knobs(self):
         baseline = _key()
         self.assertNotEqual(baseline, _key(n_a=4096, n_b=4096))
@@ -99,6 +121,10 @@ class AutotuneCacheTests(unittest.TestCase):
         self.assertNotEqual(
             _key(self_join=False, n_a=2048, n_b=256),
             _key(self_join=False, n_a=256, n_b=2048),
+        )
+        self.assertNotEqual(
+            _key(self_join=False, aligned=False),
+            _key(self_join=False, aligned=True),
         )
         self.assertNotEqual(baseline, _key(max_tile_size=1024))
         self.assertNotEqual(
@@ -154,6 +180,30 @@ class AutotuneCacheTests(unittest.TestCase):
             with mock.patch.object(cache, "MAX_CACHE_BYTES", 16):
                 self.assertEqual((), cache.load_records(upstream))
 
+    def test_save_preserves_malformed_or_future_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upstream = str(Path(temp_dir) / "autotune.txt")
+            sidecar = cache.sidecar_path(upstream)
+            record = _record(_key(), "1nn_index:cpu:rows-64")
+            for contents in (
+                "not json",
+                json.dumps(
+                    {
+                        "format": "MLX_SCAMP_AUTOTUNE_V3",
+                        "schema": 3,
+                        "records": {},
+                        "environments": {},
+                    }
+                ),
+            ):
+                with self.subTest(contents=contents[:16]):
+                    sidecar.write_text(contents, encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        ValueError, "reset.*different cache_path"
+                    ):
+                        cache.save_record(record, upstream)
+                    self.assertEqual(contents, sidecar.read_text(encoding="utf-8"))
+
     def test_same_key_keeps_newest_record(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             upstream = str(Path(temp_dir) / "autotune.txt")
@@ -165,6 +215,70 @@ class AutotuneCacheTests(unittest.TestCase):
             cache.save_record(newest, upstream)
 
             self.assertEqual(newest, cache.lookup_record(key, upstream))
+
+    def test_saved_replacement_wins_when_clock_moves_backward(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upstream = str(Path(temp_dir) / "autotune.txt")
+            key = _key()
+            cache.save_record(
+                _record(key, "1nn_index:cpu:rows-64", 100), upstream
+            )
+            replacement = _record(
+                key, "1nn_index:cpu:rows-256", 99
+            )
+            cache.save_record(replacement, upstream)
+
+            self.assertEqual(replacement, cache.lookup_record(key, upstream))
+
+    def test_save_sanitizes_unknown_near_limit_payload_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upstream = str(Path(temp_dir) / "autotune.txt")
+            sidecar = cache.sidecar_path(upstream)
+            payload = cache._empty_payload()
+            payload["junk"] = "x" * (cache.MAX_CACHE_BYTES - 512)
+            sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+            record = _record(_key(), "1nn_index:cpu:rows-64")
+            cache.save_record(record, upstream)
+
+            stored = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertNotIn("junk", stored)
+            self.assertEqual(
+                {"format", "schema", "environments", "records"},
+                set(stored),
+            )
+            self.assertIsNotNone(cache.lookup_record(record.key, upstream))
+
+    def test_save_caps_environments_and_their_records(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upstream = str(Path(temp_dir) / "autotune.txt")
+            sidecar = cache.sidecar_path(upstream)
+            payload = cache._empty_payload()
+            base = _record(_key(), "1nn_index:cpu:rows-64")
+            for index in range(cache.MAX_ENVIRONMENTS + 8):
+                environment = f"{index + 1:064x}"
+                item = replace(
+                    base,
+                    key=replace(base.key, work_bucket=f"2^{index + 10}"),
+                    environment_id=environment,
+                    created_ns=index + 1,
+                )
+                payload["records"][cache.record_id(item)] = cache._record_to_dict(item)
+                payload["environments"][environment] = {"junk": "ignored"}
+            sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+            cache.save_record(base, upstream)
+            stored = json.loads(sidecar.read_text(encoding="utf-8"))
+            environment_ids = set(stored["environments"])
+
+            self.assertLessEqual(len(environment_ids), cache.MAX_ENVIRONMENTS)
+            self.assertIn(cache.environment_id(), environment_ids)
+            self.assertTrue(
+                all(
+                    row["environment_id"] in environment_ids
+                    for row in stored["records"].values()
+                )
+            )
 
     def test_concurrent_writers_preserve_independent_records(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -216,16 +330,64 @@ class AutotuneCacheTests(unittest.TestCase):
         cache.environment_id.cache_clear()
         try:
             with mock.patch.object(
-                cache.mx, "device_info", side_effect=RuntimeError("old MLX")
-            ), mock.patch.object(cache.os, "sysconf", side_effect=OSError):
+                cache, "_device_information", return_value={}
+            ), mock.patch.object(
+                cache.os, "sysconf", side_effect=OSError
+            ), mock.patch.object(
+                cache,
+                "_hardware_identity",
+                return_value={"hardware_model": "Mac14,6"},
+            ), mock.patch(
+                "subprocess.check_output",
+                side_effect=AssertionError("environment probe spawned"),
+            ):
                 fingerprint = cache.environment_fingerprint()
         finally:
             cache.environment_fingerprint.cache_clear()
             cache.environment_id.cache_clear()
 
         self.assertEqual({}, fingerprint["device"])
+        self.assertEqual("Mac14,6", fingerprint["hardware"]["hardware_model"])
         self.assertIsNone(fingerprint["memory_bytes"])
         self.assertNotIn("subprocess", cache.__dict__)
+
+    def test_fallback_hardware_model_changes_environment_id(self):
+        def identifier(model):
+            cache.environment_fingerprint.cache_clear()
+            cache.environment_id.cache_clear()
+            with mock.patch.object(
+                cache, "_device_information", return_value={}
+            ), mock.patch.object(
+                cache,
+                "_hardware_identity",
+                return_value={"hardware_model": model},
+            ):
+                return cache.environment_id()
+
+        try:
+            first = identifier("Mac14,6")
+            second = identifier("Mac15,3")
+        finally:
+            cache.environment_fingerprint.cache_clear()
+            cache.environment_id.cache_clear()
+
+        self.assertNotEqual(first, second)
+
+    def test_huge_json_integer_and_deep_nesting_are_tolerated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upstream = str(Path(temp_dir) / "autotune.txt")
+            sidecar = cache.sidecar_path(upstream)
+            sidecar.write_text(
+                '{"format":"MLX_SCAMP_AUTOTUNE_V2","schema":2,'
+                f'"records":{{"bad":{("9" * 5000)}}},'
+                '"environments":{}}',
+                encoding="utf-8",
+            )
+            self.assertEqual((), cache.load_records(upstream))
+
+            cache._load_records_once.cache_clear()
+            sidecar.write_text("[" * 1200 + "]" * 1200, encoding="utf-8")
+            self.assertEqual((), cache.load_records(upstream))
 
     def test_reset_removes_only_the_mlx_sidecar(self):
         with tempfile.TemporaryDirectory() as temp_dir:

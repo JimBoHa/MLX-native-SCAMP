@@ -1,458 +1,665 @@
 from __future__ import annotations
 
-import importlib.metadata
-import json
 import operator
-import os
-import platform
 import statistics
-import subprocess
-import tempfile
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
-from functools import lru_cache
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import mlx.core as mx
 import numpy as np
 
+from . import _autotune_cache as cache
 
-CACHE_FORMAT = "MLX_SCAMP_AUTOTUNE_V1"
-KERNEL_REVISION = "metal-diagonal-1nn-v1"
-DEFAULT_INPUT_LENGTH = 4096
-DEFAULT_BLOCK_ROWS = 256
-DEFAULT_THREADGROUP_WIDTH = 256
-BLOCK_ROW_CANDIDATES = (64, 128, 256, 512)
-THREADGROUP_CANDIDATES = (32, 64, 128, 256)
+
+AutotuneMode = Literal["quick", "full"]
+UPSTREAM_PROFILE_FAMILIES = (
+    "1nn_index",
+    "1nn_value",
+    "sum_thresh",
+    "matrix_summary",
+    "knn",
+)
 
 
 @dataclass(frozen=True, slots=True)
-class TuningConfig:
-    """Launch choices measured for one Apple/MLX software-device tuple."""
+class AutotuneWorkload:
+    """One reproducible workload bucket in an explicit autotune plan."""
 
-    preferred_1nn_backend: str
-    preferred_portable_backend: str
-    cpu_block_rows: int
-    metal_block_rows: int
-    metal_threadgroup_width: int
-    input_length: int
-    timings_ns: dict[str, int]
+    name: str
+    profile: str
+    precision: str
+    n_a: int
+    n_b: int
+    m: int
+    self_join: bool
+    aligned: bool = False
+    route: str = "auto"
+    max_tile_size: int | None = None
+    threshold_density: float | None = None
+    k: int | None = None
+    matrix_shape: tuple[int, int] | None = None
 
+    @property
+    def dtype_class(self) -> str:
+        return "float32" if self.precision == "single" else "float64"
 
-BenchmarkResult = tuple[np.ndarray, np.ndarray]
-Benchmark = Callable[[str, str, int, int, np.ndarray, int], BenchmarkResult]
-
-
-def _default_cache_path() -> Path:
-    override = os.environ.get("SCAMP_AUTOTUNE_CACHE")
-    if override is not None:
-        return Path(override)
-    xdg_cache = os.environ.get("XDG_CACHE_HOME")
-    if xdg_cache is not None:
-        return Path(xdg_cache) / "scamp" / "autotune.txt"
-    return Path.home() / ".cache" / "scamp" / "autotune.txt"
-
-
-def _resolve_cache_path(cache_path: str = "") -> Path:
-    return Path(cache_path) if cache_path else _default_cache_path()
-
-
-@lru_cache(maxsize=1)
-def _mlx_version() -> str:
-    try:
-        return importlib.metadata.version("mlx")
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"
-
-
-def _sysctl_value(name: str) -> str | None:
-    try:
-        value = subprocess.check_output(
-            ["/usr/sbin/sysctl", "-n", name],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return value or None
+    @property
+    def key(self) -> cache.WorkloadKey:
+        return cache.make_workload_key(
+            self.profile,
+            self.precision,
+            self.route,
+            self.n_a,
+            self.n_b,
+            self.m,
+            self_join=self.self_join,
+            aligned=self.aligned,
+            dtype_class=self.dtype_class,
+            max_tile_size=self.max_tile_size,
+            threshold_density=self.threshold_density,
+            k=self.k,
+            matrix_shape=self.matrix_shape,
+        )
 
 
-@lru_cache(maxsize=1)
-def _device_information() -> dict[str, Any]:
-    try:
-        return dict(mx.device_info())
-    except (AttributeError, RuntimeError):
-        # MLX 0.23.x predates device_info(). Keep the minimum-supported
-        # release keyed to the physical Mac rather than collapsing every
-        # Apple Silicon generation to a generic arm64 cache record.
-        return {
-            "device_name": _sysctl_value("machdep.cpu.brand_string")
-            or "Apple Metal",
-            "architecture": _sysctl_value("hw.model") or "unknown",
-            "memory_size": _sysctl_value("hw.memsize") or "unknown",
-        }
+@dataclass(frozen=True, slots=True)
+class AutotunePlan:
+    """Immutable, inspectable work scheduled by :func:`run_autotune`."""
+
+    mode: AutotuneMode
+    workloads: tuple[AutotuneWorkload, ...]
+    warmups: int
+    trials: int
 
 
-@lru_cache(maxsize=1)
-def _device_key() -> str:
-    info = _device_information()
-    return "|".join(
+@dataclass(frozen=True, slots=True)
+class StrategyDescription:
+    """Typed presentation and tie-break metadata for a cached strategy."""
+
+    strategy: cache.Strategy
+    backend: Literal["cpu", "portable_metal", "custom_metal"]
+    resource_rank: tuple[int, int]
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateMeasurement:
+    """The synchronized duration samples accepted for one candidate."""
+
+    strategy: cache.Strategy
+    samples_ns: tuple[int, ...]
+    duration_ns: int
+    resource_rank: tuple[int, int]
+
+
+CandidateExecutor = Callable[[AutotuneWorkload, cache.Strategy], Any]
+Synchronize = Callable[[], None]
+Clock = Callable[[], int]
+RecordWriter = Callable[[cache.TuningRecord, str], Any]
+
+
+def _workload(
+    name: str,
+    profile: str,
+    precision: str,
+    *,
+    n_a: int,
+    n_b: int,
+    m: int,
+    self_join: bool,
+    aligned: bool = False,
+    max_tile_size: int | None = None,
+    threshold_density: float | None = None,
+    k: int | None = None,
+    matrix_shape: tuple[int, int] | None = None,
+) -> AutotuneWorkload:
+    workload = AutotuneWorkload(
+        name=name,
+        profile=profile,
+        precision=precision,
+        n_a=n_a,
+        n_b=n_b,
+        m=m,
+        self_join=self_join,
+        aligned=aligned,
+        max_tile_size=max_tile_size,
+        threshold_density=threshold_density,
+        k=k,
+        matrix_shape=matrix_shape,
+    )
+    # Constructing the key here makes an invalid built-in plan fail at import-
+    # independent plan construction, before an executor or cache is touched.
+    workload.key
+    return workload
+
+
+def _quick_workloads() -> tuple[AutotuneWorkload, ...]:
+    workloads: list[AutotuneWorkload] = []
+    representatives = (
+        ("1nn_index", dict(n_a=512, n_b=512, m=64, self_join=True)),
+        ("1nn_value", dict(n_a=384, n_b=512, m=48, self_join=False)),
         (
-            str(info.get("device_name", "Apple Metal")),
-            str(info.get("architecture", "unknown")),
-            str(info.get("memory_size", "unknown")),
-            platform.machine() or "unknown",
-            f"mlx-{_mlx_version()}",
-            KERNEL_REVISION,
-        )
-    )
-
-
-def variant_descriptions() -> tuple[str, ...]:
-    """Return the safe launch choices swept by the MLX autotuner."""
-
-    portable = tuple(
-        f"portable MLX CPU/Metal: block_rows={rows}"
-        for rows in BLOCK_ROW_CANDIDATES
-    )
-    diagonal = tuple(
-        f"Metal diagonal 1NN: threadgroup_width={width}"
-        for width in THREADGROUP_CANDIDATES
-    )
-    return portable + diagonal
-
-
-def _read_payload(path: Path, *, strict: bool) -> dict[str, Any]:
-    try:
-        with path.open("r", encoding="utf-8") as cache_file:
-            payload = json.load(cache_file)
-    except FileNotFoundError:
-        return {"format": CACHE_FORMAT, "records": {}}
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        if strict:
-            raise ValueError(f"Unable to read MLX autotune cache {path}: {exc}") from exc
-        return {"format": CACHE_FORMAT, "records": {}}
-
-    if not isinstance(payload, dict) or payload.get("format") != CACHE_FORMAT:
-        if strict:
-            raise ValueError(
-                f"Autotune cache {path} is not in {CACHE_FORMAT} format; "
-                "choose a different cache_path or remove the incompatible file"
-            )
-        return {"format": CACHE_FORMAT, "records": {}}
-    if not isinstance(payload.get("records"), dict):
-        if strict:
-            raise ValueError(f"Malformed MLX autotune cache {path}: records must be an object")
-        return {"format": CACHE_FORMAT, "records": {}}
-    return payload
-
-
-def _config_from_record(record: Any) -> TuningConfig | None:
-    if not isinstance(record, dict):
-        return None
-    try:
-        config = TuningConfig(
-            preferred_1nn_backend=str(record["preferred_1nn_backend"]),
-            preferred_portable_backend=str(record["preferred_portable_backend"]),
-            cpu_block_rows=operator.index(record["cpu_block_rows"]),
-            metal_block_rows=operator.index(record["metal_block_rows"]),
-            metal_threadgroup_width=operator.index(
-                record["metal_threadgroup_width"]
+            "sum_thresh",
+            dict(
+                n_a=512,
+                n_b=512,
+                m=64,
+                self_join=True,
+                threshold_density=0.1,
             ),
-            input_length=operator.index(record["input_length"]),
-            timings_ns={
-                str(name): operator.index(duration)
-                for name, duration in record["timings_ns"].items()
-            },
+        ),
+        (
+            "matrix_summary",
+            dict(
+                n_a=512,
+                n_b=384,
+                m=64,
+                self_join=False,
+                matrix_shape=(16, 16),
+            ),
+        ),
+        (
+            "knn",
+            dict(n_a=384, n_b=384, m=48, self_join=True, k=4),
+        ),
+    )
+    for profile, parameters in representatives:
+        for precision in ("single", "double"):
+            workloads.append(
+                _workload(
+                    f"quick-{profile}-{precision}",
+                    profile,
+                    precision,
+                    **parameters,
+                )
+            )
+    return tuple(workloads)
+
+
+def _full_workloads() -> tuple[AutotuneWorkload, ...]:
+    return _quick_workloads() + (
+        _workload(
+            "full-large-1nn-index-single",
+            "1nn_index",
+            "single",
+            n_a=4096,
+            n_b=4096,
+            m=128,
+            self_join=True,
+        ),
+        _workload(
+            "full-asymmetric-1nn-value-double",
+            "1nn_value",
+            "double",
+            n_a=2048,
+            n_b=512,
+            m=96,
+            self_join=False,
+        ),
+        _workload(
+            "full-sparse-sum-single",
+            "sum_thresh",
+            "single",
+            n_a=2048,
+            n_b=2048,
+            m=96,
+            self_join=True,
+            threshold_density=0.01,
+        ),
+        _workload(
+            "full-dense-sum-double",
+            "sum_thresh",
+            "double",
+            n_a=1024,
+            n_b=2048,
+            m=64,
+            self_join=False,
+            threshold_density=0.5,
+        ),
+        _workload(
+            "full-wide-matrix-single",
+            "matrix_summary",
+            "single",
+            n_a=2048,
+            n_b=1024,
+            m=64,
+            self_join=False,
+            matrix_shape=(16, 64),
+        ),
+        _workload(
+            "full-large-k-double",
+            "knn",
+            "double",
+            n_a=1024,
+            n_b=1024,
+            m=64,
+            self_join=True,
+            k=32,
+        ),
+        _workload(
+            "full-bidirectional-single",
+            "bidirectional_ab",
+            "single",
+            n_a=1536,
+            n_b=768,
+            m=64,
+            self_join=False,
+        ),
+        _workload(
+            "full-bidirectional-double",
+            "bidirectional_ab",
+            "double",
+            n_a=768,
+            n_b=1536,
+            m=64,
+            self_join=False,
+        ),
+    )
+
+
+def autotune_plan(mode: AutotuneMode = "quick") -> AutotunePlan:
+    """Return the deterministic work plan without running any benchmark."""
+
+    if mode == "quick":
+        plan = AutotunePlan(mode, _quick_workloads(), warmups=1, trials=3)
+    elif mode == "full":
+        plan = AutotunePlan(mode, _full_workloads(), warmups=2, trials=5)
+    else:
+        raise ValueError("mode must be 'quick' or 'full'")
+
+    keys = [workload.key for workload in plan.workloads]
+    if len(keys) != len(set(keys)):
+        raise RuntimeError("autotune plan contains duplicate workload keys")
+    return plan
+
+
+def _describe_strategy(strategy: cache.Strategy) -> StrategyDescription:
+    parameters = dict(strategy.parameters)
+    row_cap = parameters.get("portable_row_cap", 256)
+    if strategy.route == "cpu":
+        backend: Literal["cpu", "portable_metal", "custom_metal"] = "cpu"
+        backend_rank = 0
+        label = "MLX CPU"
+    elif strategy.route == "portable_metal":
+        backend = "portable_metal"
+        backend_rank = 1
+        label = "portable MLX Metal"
+    else:
+        backend = "custom_metal"
+        backend_rank = 2
+        label = f"custom {strategy.route} kernel"
+    parameter_text = (
+        f", portable_row_cap={row_cap}" if strategy.parameters else ""
+    )
+    return StrategyDescription(
+        strategy=strategy,
+        backend=backend,
+        resource_rank=(row_cap, backend_rank),
+        summary=f"{strategy.profile}: {label}{parameter_text}",
+    )
+
+
+def strategy_descriptions() -> tuple[StrategyDescription, ...]:
+    """Describe every versioned cache strategy with typed metadata."""
+
+    return tuple(_describe_strategy(strategy) for strategy in cache.STRATEGIES)
+
+
+def _snapshot_array(value: Any) -> np.ndarray:
+    return np.array(value, copy=True)
+
+
+def _snapshot_result(profile: str, value: Any) -> Any:
+    if profile in {"1nn_value", "sum_thresh", "matrix_summary"}:
+        return _snapshot_array(value)
+    if profile == "1nn_index":
+        profile_values, indices = value
+        return _snapshot_array(profile_values), _snapshot_array(indices)
+    if profile == "knn":
+        return tuple(
+            (operator.index(row), operator.index(column), float(score))
+            for row, column, score in value
         )
-    except (KeyError, TypeError, AttributeError):
-        return None
-
-    if config.preferred_1nn_backend not in {"cpu", "metal"}:
-        return None
-    if config.preferred_portable_backend not in {"cpu", "metal"}:
-        return None
-    if config.cpu_block_rows not in BLOCK_ROW_CANDIDATES:
-        return None
-    if config.metal_block_rows not in BLOCK_ROW_CANDIDATES:
-        return None
-    if config.metal_threadgroup_width not in THREADGROUP_CANDIDATES:
-        return None
-    if config.input_length < 256:
-        return None
-    if any(duration <= 0 for duration in config.timings_ns.values()):
-        return None
-    return config
+    if profile == "bidirectional_ab":
+        (values_a, indices_a), (values_b, indices_b) = value
+        return (
+            (_snapshot_array(values_a), _snapshot_array(indices_a)),
+            (_snapshot_array(values_b), _snapshot_array(indices_b)),
+        )
+    raise ValueError(f"unknown autotune result family {profile!r}")
 
 
-@lru_cache(maxsize=8)
-def _load_tuning_once(path_string: str, device_key: str) -> TuningConfig | None:
-    payload = _read_payload(Path(path_string), strict=False)
-    return _config_from_record(payload["records"].get(device_key))
+def _assert_array_equivalent(
+    candidate: Any,
+    reference: Any,
+    *,
+    precision: str,
+    exact: bool = False,
+) -> None:
+    candidate_array = np.asarray(candidate)
+    reference_array = np.asarray(reference)
+    if candidate_array.shape != reference_array.shape:
+        raise AssertionError(
+            f"shape {candidate_array.shape} != {reference_array.shape}"
+        )
+    if exact:
+        np.testing.assert_array_equal(candidate_array, reference_array)
+        return
+    tolerance = 5e-4 if precision == "single" else 1e-9
+    np.testing.assert_allclose(
+        candidate_array,
+        reference_array,
+        rtol=tolerance,
+        atol=tolerance,
+        equal_nan=True,
+    )
 
 
-def load_tuning(cache_path: str = "") -> TuningConfig | None:
-    """Load a tuning record once per path/device for process-fast lookup."""
+def _assert_result_equivalent(
+    profile: str,
+    precision: str,
+    candidate: Any,
+    reference: Any,
+) -> None:
+    """Compare candidate results using the semantics of each profile family."""
 
-    return _load_tuning_once(str(_resolve_cache_path(cache_path)), _device_key())
-
-
-def _save_tuning(config: TuningConfig, path: Path) -> None:
-    payload = _read_payload(path, strict=True)
-    payload["records"][_device_key()] = asdict(config)
-    parent = path.parent
-    if parent != Path(""):
-        parent.mkdir(parents=True, exist_ok=True)
-
-    temp_name: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=parent if parent != Path("") else Path("."),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-            temp_name = temp_file.name
-            json.dump(payload, temp_file, indent=2, sort_keys=True)
-            temp_file.write("\n")
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-        os.chmod(temp_name, 0o600)
-        os.replace(temp_name, path)
-        _load_tuning_once.cache_clear()
-    finally:
-        if temp_name is not None:
-            try:
-                Path(temp_name).unlink()
-            except FileNotFoundError:
-                pass
+        candidate = _snapshot_result(profile, candidate)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AssertionError("result has the wrong structure") from exc
+
+    if profile in {"1nn_value", "sum_thresh", "matrix_summary"}:
+        _assert_array_equivalent(candidate, reference, precision=precision)
+        return
+    if profile == "1nn_index":
+        _assert_array_equivalent(candidate[0], reference[0], precision=precision)
+        _assert_array_equivalent(
+            candidate[1], reference[1], precision=precision, exact=True
+        )
+        return
+    if profile == "knn":
+        if len(candidate) != len(reference):
+            raise AssertionError(
+                f"KNN row count {len(candidate)} != {len(reference)}"
+            )
+        _assert_array_equivalent(
+            [(row, column) for row, column, _ in candidate],
+            [(row, column) for row, column, _ in reference],
+            precision=precision,
+            exact=True,
+        )
+        _assert_array_equivalent(
+            [score for _, _, score in candidate],
+            [score for _, _, score in reference],
+            precision=precision,
+        )
+        return
+    if profile == "bidirectional_ab":
+        for candidate_pair, reference_pair in zip(candidate, reference, strict=True):
+            _assert_array_equivalent(
+                candidate_pair[0], reference_pair[0], precision=precision
+            )
+            _assert_array_equivalent(
+                candidate_pair[1],
+                reference_pair[1],
+                precision=precision,
+                exact=True,
+            )
+        return
+    raise ValueError(f"unknown autotune result family {profile!r}")
 
 
-def _parse_environment_int(name: str, default: int, minimum: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer") from exc
-    if value < minimum:
-        raise ValueError(f"{name} must be greater than or equal to {minimum}")
-    return value
+# The explicit runner is defined below the pure plan/comparison layer so this
+# module remains importable even before core grows its lazy executor hook.
 
 
-def _validate_devices(devices: Sequence[int] | None) -> list[int]:
+def _validate_devices(devices: Sequence[int] | None) -> tuple[int, ...]:
     if devices is None:
-        return [0]
+        return (0,)
     if isinstance(devices, (str, bytes)) or not isinstance(devices, Sequence):
         raise TypeError("devices must be a sequence of integer device IDs or None")
+
     targets: list[int] = []
     for device in devices:
         try:
             device_id = operator.index(device)
         except TypeError as exc:
-            raise TypeError("devices must contain only integer device IDs") from exc
+            raise TypeError(
+                "devices must contain only integer device IDs"
+            ) from exc
         if device_id != 0:
             raise ValueError(
                 f"Unsupported GPU device ID {device_id!r}; "
                 "MLX/Metal exposes only GPU device 0"
             )
-        targets.append(device_id)
-    return targets or [0]
+        if device_id not in targets:
+            targets.append(device_id)
+    return tuple(targets or (0,))
 
 
-def _assert_equivalent(
-    candidate: BenchmarkResult, reference: BenchmarkResult, label: str
-) -> None:
-    candidate_profile, candidate_index = candidate
-    reference_profile, reference_index = reference
-    if candidate_profile.shape != reference_profile.shape:
-        raise RuntimeError(f"Autotune candidate {label} returned the wrong shape")
+def _eligible_strategies(
+    workload: AutotuneWorkload,
+) -> tuple[cache.Strategy, ...]:
+    eligible: list[cache.Strategy] = []
+    for strategy in cache.STRATEGIES:
+        if strategy.profile != workload.profile:
+            continue
+        if workload.precision != "single" and strategy.route != "cpu":
+            continue
+        if workload.route == "cpu" and strategy.route != "cpu":
+            continue
+        if workload.route == "metal" and strategy.route == "cpu":
+            continue
+        eligible.append(strategy)
+    return tuple(eligible)
+
+
+def _default_executor(
+    workload: AutotuneWorkload, strategy: cache.Strategy
+) -> Any:
+    """Import the core benchmark hook only after the user starts tuning."""
+
     try:
-        np.testing.assert_allclose(
-            candidate_profile,
-            reference_profile,
-            rtol=2e-4,
-            atol=2e-4,
-            equal_nan=True,
-        )
-        np.testing.assert_array_equal(candidate_index, reference_index)
-    except AssertionError as exc:
+        from .core import _autotune_execute_candidate
+    except ImportError as exc:  # pragma: no cover - transitional integration
         raise RuntimeError(
-            f"Autotune candidate {label} failed its correctness check"
+            "The installed core does not provide the autotune executor hook"
         ) from exc
+    return _autotune_execute_candidate(workload, strategy)
 
 
-def _benchmark_trials(
-    benchmark: Benchmark,
-    reference: BenchmarkResult,
+def _measure_candidate(
+    workload: AutotuneWorkload,
+    strategy: cache.Strategy,
+    reference: Any,
     *,
-    workload: str,
-    device: str,
-    block_rows: int,
-    threadgroup_width: int,
-    series: np.ndarray,
-    window: int,
+    executor: CandidateExecutor,
+    synchronize: Synchronize,
+    clock: Clock,
     warmups: int,
     trials: int,
-) -> int:
-    label = (
-        f"{device}:{workload}:rows={block_rows}:"
-        f"threadgroup={threadgroup_width}"
-    )
-    for _ in range(warmups):
-        result = benchmark(
-            workload, device, block_rows, threadgroup_width, series, window
+) -> CandidateMeasurement:
+    for warmup in range(warmups):
+        warm_result = executor(workload, strategy)
+        synchronize()
+        _assert_result_equivalent(
+            workload.profile,
+            workload.precision,
+            warm_result,
+            reference,
         )
-        _assert_equivalent(result, reference, label)
+        print(f"    warmup {warmup + 1}/{warmups}: correct")
 
     samples: list[int] = []
-    for _ in range(trials):
-        start = time.perf_counter_ns()
-        result = benchmark(
-            workload, device, block_rows, threadgroup_width, series, window
-        )
-        elapsed = time.perf_counter_ns() - start
-        _assert_equivalent(result, reference, label)
-        samples.append(elapsed)
-    return int(statistics.median(samples))
-
-
-def _run_sweep(
-    benchmark: Benchmark,
-    *,
-    input_length: int,
-    warmups: int,
-    trials: int,
-) -> TuningConfig:
-    rng = np.random.default_rng(1729)
-    series = (
-        rng.standard_normal(input_length).astype(np.float32)
-        + np.sin(np.arange(input_length, dtype=np.float32) / 17.0)
-    )
-    window = min(128, max(16, input_length // 32))
-    reference = benchmark(
-        "portable_1nn",
-        "cpu",
-        DEFAULT_BLOCK_ROWS,
-        DEFAULT_THREADGROUP_WIDTH,
-        series,
-        window,
-    )
-
-    timings: dict[str, int] = {}
-    for device in ("cpu", "metal"):
-        for block_rows in BLOCK_ROW_CANDIDATES:
-            label = f"{device}.portable.block_rows.{block_rows}"
-            timings[label] = _benchmark_trials(
-                benchmark,
-                reference,
-                workload="portable_1nn",
-                device=device,
-                block_rows=block_rows,
-                threadgroup_width=DEFAULT_THREADGROUP_WIDTH,
-                series=series,
-                window=window,
-                warmups=warmups,
-                trials=trials,
-            )
-
-    for threadgroup_width in THREADGROUP_CANDIDATES:
-        label = f"metal.diagonal.threadgroup.{threadgroup_width}"
-        timings[label] = _benchmark_trials(
-            benchmark,
+    for trial in range(trials):
+        synchronize()
+        start = clock()
+        result = executor(workload, strategy)
+        synchronize()
+        elapsed = clock() - start
+        if elapsed <= 0:
+            raise RuntimeError("autotune clock returned a non-positive duration")
+        _assert_result_equivalent(
+            workload.profile,
+            workload.precision,
+            result,
             reference,
-            workload="metal_1nn",
-            device="metal",
-            block_rows=DEFAULT_BLOCK_ROWS,
-            threadgroup_width=threadgroup_width,
-            series=series,
-            window=window,
-            warmups=warmups,
-            trials=trials,
         )
+        samples.append(elapsed)
+        print(f"    trial {trial + 1}/{trials}: {elapsed} ns, correct")
 
-    cpu_rows = min(
-        BLOCK_ROW_CANDIDATES,
-        key=lambda rows: (timings[f"cpu.portable.block_rows.{rows}"], rows),
-    )
-    metal_rows = min(
-        BLOCK_ROW_CANDIDATES,
-        key=lambda rows: (timings[f"metal.portable.block_rows.{rows}"], rows),
-    )
-    metal_threadgroup = min(
-        THREADGROUP_CANDIDATES,
-        key=lambda width: (
-            timings[f"metal.diagonal.threadgroup.{width}"],
-            width,
-        ),
-    )
-    cpu_1nn = timings[f"cpu.portable.block_rows.{cpu_rows}"]
-    metal_1nn = timings[f"metal.diagonal.threadgroup.{metal_threadgroup}"]
-    preferred_1nn_backend = "metal" if metal_1nn <= cpu_1nn else "cpu"
-    metal_portable = timings[f"metal.portable.block_rows.{metal_rows}"]
-    preferred_portable_backend = "metal" if metal_portable <= cpu_1nn else "cpu"
-    return TuningConfig(
-        preferred_1nn_backend=preferred_1nn_backend,
-        preferred_portable_backend=preferred_portable_backend,
-        cpu_block_rows=cpu_rows,
-        metal_block_rows=metal_rows,
-        metal_threadgroup_width=metal_threadgroup,
-        input_length=input_length,
-        timings_ns=timings,
+    description = _describe_strategy(strategy)
+    return CandidateMeasurement(
+        strategy=strategy,
+        samples_ns=tuple(samples),
+        duration_ns=int(statistics.median(samples)),
+        resource_rank=description.resource_rank,
     )
 
 
-def autotune(devices: Sequence[int] | None = None, cache_path: str = "") -> int:
-    """Benchmark MLX execution choices and persist the winners for this Mac.
+def _validate_plan(plan: AutotunePlan) -> None:
+    if plan.mode not in {"quick", "full"}:
+        raise ValueError("plan mode must be 'quick' or 'full'")
+    if type(plan.warmups) is not int or plan.warmups < 0:
+        raise ValueError("plan warmups must be a non-negative integer")
+    if type(plan.trials) is not int or plan.trials <= 0:
+        raise ValueError("plan trials must be a positive integer")
+    if not plan.workloads:
+        raise ValueError("autotune plan must contain at least one workload")
+    keys = [workload.key for workload in plan.workloads]
+    if len(keys) != len(set(keys)):
+        raise ValueError("autotune plan contains duplicate workload keys")
 
-    The public signature and return value match upstream ``pyscamp.autotune``.
-    On Apple Silicon, MLX exposes a single Metal device (ID 0); each requested
-    target benchmarks Metal against MLX CPU as well as safe launch/block sizes.
+
+def run_autotune(
+    devices: Sequence[int] | None = None,
+    cache_path: str = "",
+    *,
+    mode: AutotuneMode = "quick",
+    executor: CandidateExecutor | None = None,
+    synchronize: Synchronize | None = None,
+    clock: Clock | None = None,
+    record_writer: RecordWriter | None = None,
+    plan: AutotunePlan | None = None,
+) -> int:
+    """Run an explicit MLX tuning plan and cache one winner per workload.
+
+    The injectable executor, synchronizer, clock, and writer keep selection
+    logic deterministic and testable without importing the core runtime.
     """
 
     targets = _validate_devices(devices)
     if not isinstance(cache_path, str):
         raise TypeError("cache_path must be a string")
-    if not mx.metal.is_available():
-        raise ValueError(
-            "No Metal device available; pyscamp.autotune() needs Apple Metal"
-        )
+    selected_plan = autotune_plan(mode) if plan is None else plan
+    _validate_plan(selected_plan)
 
-    input_length = _parse_environment_int(
-        "SCAMP_AUTOTUNE_INPUT_LENGTH", DEFAULT_INPUT_LENGTH, 256
+    if executor is None:
+        try:
+            metal_available = bool(mx.metal.is_available())
+        except Exception:
+            metal_available = False
+        if not metal_available:
+            raise ValueError(
+                "No Metal device available; pyscamp.autotune() needs Apple Metal"
+            )
+        executor = _default_executor
+    synchronize = mx.synchronize if synchronize is None else synchronize
+    clock = time.perf_counter_ns if clock is None else clock
+    writer = cache.save_record if record_writer is None else record_writer
+
+    print(
+        "MLX SCAMP autotune: "
+        f"plan={selected_plan.mode}, devices={list(targets)}, "
+        f"workloads={len(selected_plan.workloads)}, "
+        f"warmups={selected_plan.warmups}, trials={selected_plan.trials}"
     )
-    warmups = _parse_environment_int("SCAMP_AUTOTUNE_WARMUP_RUNS", 1, 0)
-    trials = _parse_environment_int("MLX_SCAMP_AUTOTUNE_TRIALS", 3, 1)
-
-    # Imported lazily to keep core -> cache lookup imports acyclic.
-    from .core import _autotune_benchmark_candidate
-
-    resolved_path = _resolve_cache_path(cache_path)
-    for device_id in targets:
+    for workload_index, workload in enumerate(selected_plan.workloads, start=1):
+        strategies = _eligible_strategies(workload)
+        if not strategies:
+            raise RuntimeError(
+                f"No eligible autotune candidates for {workload.name}"
+            )
         print(
-            f"MLX SCAMP autotune: Metal device {device_id}, "
-            f"input length {input_length}"
+            f"  plan {workload_index}/{len(selected_plan.workloads)}: "
+            f"{workload.name} ({len(strategies)} candidates)"
         )
-        config = _run_sweep(
-            _autotune_benchmark_candidate,
-            input_length=input_length,
-            warmups=warmups,
-            trials=trials,
+
+        reference_strategy = min(
+            (strategy for strategy in strategies if strategy.route == "cpu"),
+            key=lambda strategy: (
+                _describe_strategy(strategy).resource_rank,
+                strategy.name,
+            ),
+            default=None,
         )
-        _save_tuning(config, resolved_path)
+        if reference_strategy is None:
+            raise RuntimeError(
+                f"No CPU correctness reference for {workload.name}"
+            )
+        try:
+            reference = executor(workload, reference_strategy)
+            synchronize()
+            reference = _snapshot_result(workload.profile, reference)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to compute reference for {workload.name}"
+            ) from exc
+
+        measurements: list[CandidateMeasurement] = []
+        for candidate_index, strategy in enumerate(strategies, start=1):
+            print(
+                f"    candidate {candidate_index}/{len(strategies)}: "
+                f"{_describe_strategy(strategy).summary}"
+            )
+            try:
+                measurement = _measure_candidate(
+                    workload,
+                    strategy,
+                    reference,
+                    executor=executor,
+                    synchronize=synchronize,
+                    clock=clock,
+                    warmups=selected_plan.warmups,
+                    trials=selected_plan.trials,
+                )
+            except (AssertionError, RuntimeError, TypeError, ValueError) as exc:
+                print(f"      rejected: {exc}")
+                continue
+            measurements.append(measurement)
+            print(f"      median: {measurement.duration_ns} ns")
+
+        if not measurements:
+            raise RuntimeError(
+                f"Every autotune candidate was rejected for {workload.name}"
+            )
+        winner = min(
+            measurements,
+            key=lambda measurement: (
+                measurement.duration_ns,
+                measurement.resource_rank,
+                measurement.strategy.name,
+            ),
+        )
+        record = cache.new_record(
+            workload.key,
+            winner.strategy.name,
+            winner.duration_ns,
+            selected_plan.trials,
+        )
+        writer(record, cache_path)
         print(
-            "  selected "
-            f"1nn_backend={config.preferred_1nn_backend}, "
-            f"portable_backend={config.preferred_portable_backend}, "
-            f"cpu_block_rows={config.cpu_block_rows}, "
-            f"metal_block_rows={config.metal_block_rows}, "
-            f"metal_threadgroup={config.metal_threadgroup_width}"
+            f"    selected: {winner.strategy.name} "
+            f"({winner.duration_ns} ns median)"
         )
-    print(f"  cache={resolved_path}")
+
+    print(f"  cache={cache.sidecar_path(cache_path)}")
     return len(targets)
+
+
+def autotune(devices: Sequence[int] | None = None, cache_path: str = "") -> int:
+    """Run the laptop-safe explicit plan with upstream's API signature."""
+
+    return run_autotune(devices, cache_path, mode="quick")
