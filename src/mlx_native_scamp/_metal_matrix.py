@@ -128,6 +128,7 @@ _UINT32_MAX = int(np.iinfo(np.uint32).max)
 def indexing_is_safe(
     n_a: int,
     n_b: int,
+    m: int,
     rows: int,
     cols: int,
     self_join: bool,
@@ -135,9 +136,11 @@ def indexing_is_safe(
 ) -> bool:
     """Return whether every Metal matrix coordinate fits its kernel type."""
 
-    if min(n_a, n_b, rows, cols) <= 0 or exclusion < 0:
+    if min(n_a, n_b, m, rows, cols) <= 0 or exclusion < 0:
         return False
-    if max(n_a, n_b, rows, cols) > _UINT32_MAX:
+    if max(n_a, n_b, m, rows, cols) > _UINT32_MAX:
+        return False
+    if n_a + m - 2 > _UINT32_MAX or n_b + m - 2 > _UINT32_MAX:
         return False
     if exclusion > _INT32_MAX or rows * cols > _UINT32_MAX:
         return False
@@ -162,7 +165,7 @@ def matrix_summary(
     n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
     if not indexing_is_safe(
-        n_a, n_b, rows, cols, self_join, exclusion
+        n_a, n_b, m, rows, cols, self_join, exclusion
     ):
         raise ValueError("matrix dimensions exceed Metal indexing limits")
     diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1

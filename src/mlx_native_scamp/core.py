@@ -1709,6 +1709,7 @@ def _run_profile(
         matrix_recurrence = indexing_is_safe(
             subsequences_a,
             subsequences_b,
+            m,
             mheight,
             mwidth,
             self_join,

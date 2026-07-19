@@ -14,22 +14,22 @@ class MetalMatrixIndexingTests(unittest.TestCase):
 
         self.assertTrue(
             _metal_matrix.indexing_is_safe(
-                int32_max + 1, int32_max + 1, 1, 1, True, 0
+                int32_max + 1, int32_max + 1, 1, 1, 1, True, 0
             )
         )
         self.assertFalse(
             _metal_matrix.indexing_is_safe(
-                int32_max + 2, int32_max + 2, 1, 1, True, 0
+                int32_max + 2, int32_max + 2, 1, 1, 1, True, 0
             )
         )
         self.assertTrue(
             _metal_matrix.indexing_is_safe(
-                int32_max + 1, 1, 1, 1, False, 0
+                int32_max + 1, 1, 1, 1, 1, False, 0
             )
         )
         self.assertFalse(
             _metal_matrix.indexing_is_safe(
-                int32_max + 2, 1, 1, 1, False, 0
+                int32_max + 2, 1, 1, 1, 1, False, 0
             )
         )
 
@@ -40,6 +40,7 @@ class MetalMatrixIndexingTests(unittest.TestCase):
             _metal_matrix.indexing_is_safe(
                 int32_max + 1,
                 int32_max + 1,
+                1,
                 65_535,
                 65_537,
                 True,
@@ -48,7 +49,7 @@ class MetalMatrixIndexingTests(unittest.TestCase):
         )
         self.assertFalse(
             _metal_matrix.indexing_is_safe(
-                8, 8, 65_536, 65_536, True, 0
+                8, 8, 1, 65_536, 65_536, True, 0
             )
         )
         self.assertFalse(
@@ -57,8 +58,33 @@ class MetalMatrixIndexingTests(unittest.TestCase):
                 int32_max + 1,
                 1,
                 1,
+                1,
                 True,
                 int32_max + 1,
+            )
+        )
+
+    def test_raw_input_index_boundaries(self):
+        uint32_max = int(np.iinfo(np.uint32).max)
+
+        self.assertTrue(
+            _metal_matrix.indexing_is_safe(
+                1, 1, uint32_max, 1, 1, False, 0
+            )
+        )
+        self.assertFalse(
+            _metal_matrix.indexing_is_safe(
+                1, 1, uint32_max + 1, 1, 1, False, 0
+            )
+        )
+        self.assertTrue(
+            _metal_matrix.indexing_is_safe(
+                2, 1, uint32_max, 1, 1, False, 0
+            )
+        )
+        self.assertFalse(
+            _metal_matrix.indexing_is_safe(
+                3, 1, uint32_max, 1, 1, False, 0
             )
         )
 
@@ -396,7 +422,7 @@ class MetalMatrixSummaryTests(unittest.TestCase):
                 gpus=[0],
             )
 
-        indexing_is_safe.assert_called_once_with(57, 57, 5, 7, True, 2)
+        indexing_is_safe.assert_called_once_with(57, 57, 8, 5, 7, True, 2)
         metal_preparation.assert_not_called()
         kernel.assert_not_called()
         self.assertEqual((5, 7), summary.shape)
