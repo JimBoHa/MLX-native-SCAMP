@@ -126,20 +126,43 @@ def execute_1nn_tile(
             if not separated:
                 base_delta = row_start - column_start
                 int32 = np.iinfo(np.int32)
-                if not int32.min <= base_delta <= int32.max:
-                    raise ValueError("overlapping tile offset cannot be represented safely")
-                row_indices = mx.arange(row_stop - row_start, dtype=mx.int32)
-                column_indices = mx.arange(
-                    column_stop - column_start, dtype=mx.int32
-                )
-                trivial = (
-                    mx.abs(
-                        row_indices[:, None]
-                        - column_indices[None, :]
-                        + int(base_delta)
+                row_count = row_stop - row_start
+                column_count = column_stop - column_start
+                expression_min = base_delta - (column_count - 1)
+                expression_max = base_delta + (row_count - 1)
+                if (
+                    int32.min <= expression_min
+                    and expression_max <= int32.max
+                ):
+                    row_indices = mx.arange(row_count, dtype=mx.int32)
+                    column_indices = mx.arange(column_count, dtype=mx.int32)
+                    trivial = (
+                        mx.abs(
+                            row_indices[:, None]
+                            - column_indices[None, :]
+                            + int(base_delta)
+                        )
+                        < exclusion_zone
                     )
-                    < exclusion_zone
-                )
+                else:
+                    # Metal's fast int32 path cannot represent this boundary.
+                    # Construct the rare large-offset mask with safe host int64
+                    # arithmetic, then transfer only the boolean mask.
+                    column_indices = np.arange(column_count, dtype=np.int64)
+                    host_mask = np.empty(
+                        (row_count, column_count), dtype=np.bool_
+                    )
+                    # Fill one row at a time so the fallback retains only the
+                    # boolean matrix plus one int64 row, not an additional
+                    # dense int64 distance matrix outside the preflight bound.
+                    for row_index in range(row_count):
+                        differences = (
+                            np.int64(base_delta + row_index) - column_indices
+                        )
+                        host_mask[row_index] = (
+                            np.abs(differences) < exclusion_zone
+                        )
+                    trivial = mx.array(host_mask)
                 block = mx.where(
                     trivial,
                     mx.full(block.shape, SENTINEL, dtype=mx.float32),

@@ -261,6 +261,31 @@ class DistributedWorkerTests(unittest.TestCase):
         np.testing.assert_allclose(output.column_values, np.ones(9), atol=2e-6)
         self.assertTrue(np.all(output.column_indices >= 2**32))
 
+    def test_int32_exclusion_boundary_does_not_wrap(self):
+        window = 3
+        a = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        b = np.array([0.0, 1.0, 0.0, -1.0, 0.5], dtype=np.float32)
+        row_start = int(np.iinfo(np.int32).max) - 1
+        output = execute_1nn_tile(
+            a,
+            b,
+            window,
+            row_start=row_start,
+            row_stop=row_start + 3,
+            column_start=0,
+            column_stop=1,
+            exclusion_zone=int(np.iinfo(np.int32).max),
+            compute_rows=True,
+            compute_columns=True,
+            device=self.server.service.device,
+            series_a_offset=0,
+            series_b_offset=row_start,
+        )
+        self.assertEqual(-2.0, output.row_values[0])
+        self.assertEqual(-1, output.row_indices[0])
+        self.assertTrue(np.all(output.row_values[1:] >= -1.0))
+        np.testing.assert_array_equal(output.row_indices[1:], np.zeros(2, dtype=np.int64))
+
     def test_client_rejects_mismatched_response_identity(self):
         request = make_tile_request(self.a, self.b, window=self.window)
         bad_result = messages.ProfileTileResult(
