@@ -165,7 +165,7 @@ class PyScampCompatTests(unittest.TestCase):
         original_profile = scamp_core._best_match_profile
         cases = [
             (mx.gpu, {"gpus": []}, mx.cpu),
-            (mx.cpu, {"gpus": [0]}, mx.gpu),
+            (mx.cpu, {"gpus": [0], "precision": "single"}, mx.gpu),
         ]
 
         for outer_device, kwargs, selected_device in cases:
@@ -238,6 +238,7 @@ class PyScampCompatTests(unittest.TestCase):
                 self.m,
                 pearson=True,
                 gpus=[0],
+                precision="single",
             )
             self.assertEqual(mx.cpu, mx.default_device())
             np.testing.assert_allclose(
@@ -250,6 +251,40 @@ class PyScampCompatTests(unittest.TestCase):
             np.testing.assert_array_equal(valid_idx, out_idx)
 
         self.assertEqual(original_device, mx.default_device())
+
+    def test_metal_rejects_float64_precision_modes(self):
+        for precision in ("double", "ultra"):
+            with self.subTest(precision=precision):
+                with self.assertRaisesRegex(ValueError, "Metal does not support float64"):
+                    mp.selfjoin(
+                        self.a,
+                        self.m,
+                        gpus=[0],
+                        precision=precision,
+                    )
+
+    def test_double_and_ultra_preserve_high_offset_variation(self):
+        series = np.array([1e8, 1e8 + 1, 1e8 + 2, 1e8 + 4], dtype=np.float64)
+
+        for kwargs in ({}, {"precision": "double"}, {"precision": "ultra"}):
+            with self.subTest(kwargs=kwargs):
+                out_corr, out_idx = mp.abjoin(series, series, 4, pearson=True, **kwargs)
+                np.testing.assert_allclose(out_corr, np.array([1.0], dtype=np.float32), atol=1e-6)
+                np.testing.assert_array_equal(out_idx, np.array([0], dtype=np.int32))
+
+        single_corr, single_idx = mp.abjoin(
+            series,
+            series,
+            4,
+            pearson=True,
+            precision="single",
+        )
+        self.assertTrue(np.isnan(single_corr[0]))
+        np.testing.assert_array_equal(single_idx, np.array([-1], dtype=np.int32))
+
+    def test_removed_mixed_precision_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "single, double, ultra"):
+            mp.selfjoin(self.a, self.m, precision="mixed")
 
     def test_invalid_kwargs_raise(self):
         with self.assertRaises(ValueError):

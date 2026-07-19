@@ -33,7 +33,7 @@ import numpy as np
 import pyscamp as mp
 
 series = np.random.random(4096).astype(np.float32)
-profile, index = mp.selfjoin(series, 128, pearson=True)
+profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 ```
 
 ## Notes
@@ -49,6 +49,12 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
 - Concurrent CPU+GPU workers are not exposed by MLX, so supplying both selectors
   is rejected rather than silently ignoring one or claiming SCAMP's
   heterogeneous-worker behavior.
-- Other compatibility kwargs such as `precision` are accepted, but CUDA-specific
-  behavior is not reproduced.
+- `precision="single"` computes in float32 on the selected MLX device (normally Metal).
+- The default `precision="double"` and `precision="ultra"` share a float64
+  MLX CPU implementation because Metal does not support float64. Upstream
+  SCAMP gives `ultra` a separate recurrence; this port computes normalized
+  window dot products directly, so the two modes currently have identical
+  numerical behavior.
+- Explicit `gpus=[0]` requests with `double` or `ultra` are rejected instead of
+  silently moving float64 work to CPU.
 - The implementation currently targets dense 1D numeric arrays.
