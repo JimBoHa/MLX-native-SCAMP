@@ -17,8 +17,8 @@ BLOCK_ROWS = 256
 
 @dataclass(slots=True)
 class PreparedSeries:
-    windows: Any
-    valid: Any
+    windows: Any | None
+    valid: Any | None
     subsequences: int
     recurrence_clean: Any | None = None
     recurrence_means: Any | None = None
@@ -159,6 +159,156 @@ def _prepare_series(values: Any, m: int) -> PreparedSeries:
         recurrence_inv_norm=inv_norm,
         recurrence_df=df,
         recurrence_dg=dg,
+    )
+
+
+def _rolling_mean_and_norm_sq(
+    clean: np.ndarray, m: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Compute sliding statistics without constructing an ``(n, m)`` view.
+
+    The compensated moving sum follows SCAMP's Ogita-style CPU precompute.  A
+    remove/add variance recurrence then retains linear time and memory without
+    subtracting two large rolling sums of squares.
+    """
+
+    subsequences = clean.size - m + 1
+    means = np.empty((subsequences,), dtype=np.float64)
+    norms_sq = np.empty((subsequences,), dtype=np.float64)
+
+    primary_sum = clean[0]
+    correction = 0.0
+    for value in clean[1:m]:
+        combined = primary_sum + value
+        displacement = combined - primary_sum
+        correction += (primary_sum - (combined - displacement)) + (
+            value - displacement
+        )
+        primary_sum = combined
+
+    mean = (primary_sum + correction) / m
+    differences = clean[:m] - mean
+    norm_sq = float(np.sum(differences * differences, dtype=np.float64))
+    if not np.isfinite(mean) or not np.isfinite(norm_sq):
+        return None
+    means[0] = mean
+    norms_sq[0] = max(norm_sq, 0.0)
+
+    for start in range(1, subsequences):
+        outgoing = clean[start - 1]
+        incoming = clean[start + m - 1]
+        previous_mean = mean
+
+        combined = primary_sum - outgoing
+        displacement = combined - primary_sum
+        correction += (primary_sum - (combined - displacement)) - (
+            outgoing + displacement
+        )
+        primary_sum = combined
+
+        combined = primary_sum + incoming
+        displacement = combined - primary_sum
+        correction += (primary_sum - (combined - displacement)) + (
+            incoming - displacement
+        )
+        primary_sum = combined
+        mean = (primary_sum + correction) / m
+        update = (incoming - outgoing) * (
+            incoming - mean + outgoing - previous_mean
+        )
+        next_norm_sq = norm_sq + update
+        if not np.isfinite(mean) or not np.isfinite(next_norm_sq):
+            return None
+
+        # Roundoff can put an exactly flat window infinitesimally below zero.
+        # A materially negative value means the recurrence has lost stability;
+        # let the caller use the portable normalized-window implementation.
+        error_scale = max(abs(norm_sq), abs(update), 1.0)
+        error_bound = (
+            256.0 * m * np.finfo(np.float64).eps * error_scale
+        )
+        if next_norm_sq < -error_bound:
+            return None
+        norm_sq = max(next_norm_sq, 0.0)
+        means[start] = mean
+        norms_sq[start] = norm_sq
+
+    return means, norms_sq
+
+
+def _prepare_metal_recurrence(values: Any, m: int) -> PreparedSeries | None:
+    """Prepare the arrays consumed by the float32 diagonal Metal kernel.
+
+    Input values have already been quantized to float32.  Converting those
+    values to float64 *before* subtracting a finite per-series origin preserves
+    their remaining variation at large offsets.  Statistics are then computed
+    on the CPU in float64 and transferred as five linear-sized float32 arrays.
+    """
+
+    source = np.asarray(values, dtype=np.float32)
+    finite = np.isfinite(source)
+    clean = np.zeros(source.shape, dtype=np.float64)
+    if np.any(finite):
+        finite_values = source[finite].astype(np.float64)
+        clean[finite] = finite_values - finite_values[0]
+    if not np.all(np.isfinite(clean)):
+        return None
+
+    statistics = _rolling_mean_and_norm_sq(clean, m)
+    if statistics is None:
+        return None
+    means, norms_sq = statistics
+
+    invalid_prefix = np.concatenate(
+        [np.zeros((1,), dtype=np.int64), np.cumsum(~finite, dtype=np.int64)]
+    )
+    if m == 1:
+        nonflat = np.zeros(norms_sq.shape, dtype=bool)
+    else:
+        changes = clean[1:] != clean[:-1]
+        change_prefix = np.concatenate(
+            [
+                np.zeros((1,), dtype=np.int64),
+                np.cumsum(changes, dtype=np.int64),
+            ]
+        )
+        nonflat = change_prefix[m - 1 :] - change_prefix[: -(m - 1)] > 0
+    # Centering translates values but never scales them, so SCAMP's flatness
+    # threshold remains expressed in the original input units.
+    valid = (invalid_prefix[m:] - invalid_prefix[:-m] == 0) & (
+        norms_sq > FLATNESS_EPSILON
+    ) & nonflat
+    inv_norm = np.zeros(norms_sq.shape, dtype=np.float64)
+    inv_norm[valid] = 1.0 / np.sqrt(norms_sq[valid])
+
+    df = np.zeros(means.shape, dtype=np.float64)
+    dg = np.zeros(means.shape, dtype=np.float64)
+    if means.size > 1:
+        df[:-1] = (clean[m:] - clean[:-m]) * 0.5
+        dg[:-1] = (clean[m:] - means[1:]) + (clean[:-m] - means[:-1])
+
+    recurrence = (clean, means, inv_norm, df, dg)
+    float32_limit = float(np.finfo(np.float32).max)
+    if any(
+        not np.all(np.isfinite(array))
+        or (array.size and float(np.max(np.abs(array))) > float32_limit)
+        for array in recurrence
+    ):
+        return None
+
+    clean32, means32, inv_norm32, df32, dg32 = (
+        mx.array(array.astype(np.float32, copy=False), dtype=mx.float32)
+        for array in recurrence
+    )
+    return PreparedSeries(
+        windows=None,
+        valid=None,
+        subsequences=int(means.size),
+        recurrence_clean=clean32,
+        recurrence_means=means32,
+        recurrence_inv_norm=inv_norm32,
+        recurrence_df=df32,
+        recurrence_dg=dg32,
     )
 
 
@@ -388,23 +538,43 @@ def _run_profile(
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
 
-    prepared_a = _prepare_series(series_a, m)
-    prepared_b = _prepare_series(series_b, m)
     self_join = not has_b
 
-    if profile == "1nn":
-        use_metal_1nn = (
-            use_metal_1nn
-            and float32_sources
-            and _metal_recurrence_is_safe(prepared_a, prepared_b, m)
+    if profile == "1nn" and use_metal_1nn and float32_sources:
+        recurrence_a = _prepare_metal_recurrence(series_a, m)
+        recurrence_b = (
+            recurrence_a
+            if self_join
+            else _prepare_metal_recurrence(series_b, m)
         )
+        if (
+            recurrence_a is not None
+            and recurrence_b is not None
+            and _metal_recurrence_is_safe(recurrence_a, recurrence_b, m)
+        ):
+            return _best_match_profile(
+                recurrence_a,
+                recurrence_b,
+                m,
+                pearson,
+                self_join,
+                True,
+            )
+
+    # Portable reducers intentionally retain their normalized-window path.
+    # It is only materialized after the custom recurrence is ineligible or has
+    # conservatively rejected the input.
+    prepared_a = _prepare_series(series_a, m)
+    prepared_b = _prepare_series(series_b, m)
+
+    if profile == "1nn":
         return _best_match_profile(
             prepared_a,
             prepared_b,
             m,
             pearson,
             self_join,
-            use_metal_1nn,
+            False,
         )
     if profile == "sum":
         return _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
