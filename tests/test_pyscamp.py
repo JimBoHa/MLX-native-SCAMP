@@ -1,9 +1,11 @@
 import unittest
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from unittest.mock import patch
 
 import mlx.core as mx
 import numpy as np
 
+import mlx_native_scamp
 import mlx_native_scamp.core as scamp_core
 import pyscamp as mp
 
@@ -46,8 +48,22 @@ class PyScampCompatTests(unittest.TestCase):
 
     def test_public_surface_matches_upstream_bindings(self):
         exported = {name for name in EXPECTED_PUBLIC_CALLABLES if hasattr(mp, name)}
+        try:
+            installed_version = distribution_version("mlx-native-scamp")
+        except PackageNotFoundError:
+            installed_version = "dev"
         self.assertEqual(EXPECTED_PUBLIC_CALLABLES, exported)
-        self.assertEqual("dev", mp.__version__)
+        self.assertEqual(installed_version, mlx_native_scamp.__version__)
+        self.assertEqual(mlx_native_scamp.__version__, mp.__version__)
+
+    def test_source_tree_version_falls_back_to_dev(self):
+        missing_distribution = PackageNotFoundError("mlx-native-scamp")
+        with patch.object(
+            mlx_native_scamp,
+            "_distribution_version",
+            side_effect=missing_distribution,
+        ):
+            self.assertEqual("dev", mlx_native_scamp._resolve_version())
 
     def test_gpu_supported_is_independent_of_default_device(self):
         previous_device = mx.default_device()
