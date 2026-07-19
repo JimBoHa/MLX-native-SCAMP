@@ -125,7 +125,7 @@ def _dtype_itemsize(dtype: Any) -> int:
     raise TypeError(f"Unsupported MLX compute dtype: {dtype}")
 
 
-def _default_max_tile_size(m: int) -> int:
+def _default_max_tile_size() -> int:
     try:
         selected_metal = mx.default_device() == mx.gpu
     except Exception:
@@ -135,7 +135,7 @@ def _default_max_tile_size(m: int) -> int:
         if selected_metal
         else UPSTREAM_CPU_MAX_TILE_SIZE
     )
-    return max(1024, 2 * m, upstream_default)
+    return upstream_default
 
 
 def _tile_subsequence_count(max_tile_size: int, m: int) -> int:
@@ -1386,7 +1386,12 @@ def _run_profile(
     use_metal_sum: bool = False,
 ):
     m = _normalize_window_size(m)
-    if max_tile_size is not None and max_tile_size < 2 * m:
+    effective_max_tile_size = (
+        _default_max_tile_size()
+        if max_tile_size is None
+        else max_tile_size
+    )
+    if effective_max_tile_size < 2 * m:
         raise ValueError("max_tile_size must be at least twice m")
     has_b = b is not None
     float32_sources = _is_float32_input(a) and (
@@ -1420,9 +1425,9 @@ def _run_profile(
             )
 
     self_join = not has_b
-    explicit_tile_covers_join = max_tile_size is None or (
-        int(series_a.shape[0]) <= max_tile_size
-        and int(series_b.shape[0]) <= max_tile_size
+    join_fits_tile = (
+        int(series_a.shape[0]) <= effective_max_tile_size
+        and int(series_b.shape[0]) <= effective_max_tile_size
     )
     exclusion = (
         self_join_exclusion(m)
@@ -1434,7 +1439,7 @@ def _run_profile(
         profile == "sum"
         and use_metal_sum
         and float32_sources
-        and explicit_tile_covers_join
+        and join_fits_tile
         and threshold >= 0.0
         and _metal_sum_is_worthwhile(
             a,
@@ -1450,7 +1455,7 @@ def _run_profile(
         profile == "1nn"
         and use_metal_1nn
         and float32_sources
-        and explicit_tile_covers_join
+        and join_fits_tile
     ) or sum_recurrence:
         recurrence_a = _prepare_metal_recurrence(series_a, m)
         recurrence_b = (
@@ -1486,17 +1491,12 @@ def _run_profile(
     # Portable reducers normalize only overlapping tile segments. The full
     # (subsequences, m) tensor and full pairwise distance matrix are never
     # materialized by this path.
-    resolved_max_tile_size = (
-        _default_max_tile_size(m)
-        if max_tile_size is None
-        else max_tile_size
-    )
     tile_rows, tile_columns = _portable_tile_shape(
         subsequences_b,
         subsequences_a,
         m,
         compute_dtype,
-        resolved_max_tile_size,
+        effective_max_tile_size,
     )
     prepared_a = _prepare_tiled_series(series_a, m)
     prepared_b = (

@@ -121,17 +121,19 @@ remain follow-up work.
   Explicit values retain upstream's 1024-sample and `2 * window` minimums.
 - KNN results order equal-correlation matches by the smallest global row index,
   keeping the selected rows deterministic when tile geometry changes.
-- With no explicit limit, the upstream CPU/Metal defaults (128K/512K) remain
-  upper ceilings while an 8–64 MiB transient target is selected from Apple's
-  recommended unified-memory working set. The byte target is advisory because
-  MLX controls allocator internals; the row/column dimensional ceilings are
-  enforced. Linear input, recurrence, reducer, and output storage is outside
-  this transient tile target.
+- With no explicit limit, the upstream CPU/Metal default (128K/512K) is the
+  enforced upper ceiling while an 8–64 MiB transient target is selected from
+  Apple's recommended unified-memory working set. Windows larger than half
+  that resource default require an explicit larger `max_tile_size`, matching
+  upstream validation. The byte target is advisory because MLX controls
+  allocator internals; the row/column dimensional ceilings are enforced.
+  Linear input, recurrence, reducer, and output storage is outside this
+  transient tile target.
 - The 1NN kernel keeps profile output state linear in the series length, but it
-  currently walks each diagonal in one Metal dispatch. An explicit
-  `max_tile_size` that cannot contain the join selects the bounded portable
-  path; checkpointed multi-dispatch execution in the custom Metal kernel
-  remains a follow-up for exceptionally long joins.
+  currently walks each diagonal in one Metal dispatch. A `max_tile_size`
+  ceiling that cannot contain the join selects the bounded portable path;
+  checkpointed multi-dispatch execution in the custom Metal kernel remains a
+  follow-up for exceptionally long joins.
 - For nonnegative thresholds, sufficiently large SUM workloads use a sparse
   Metal reducer. It refreshes covariance directly every 64 diagonal steps,
   bounds float32 atomic accumulation to 2,048 diagonals at a time, and merges

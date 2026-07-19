@@ -5,6 +5,7 @@ import mlx.core as mx
 import numpy as np
 
 import mlx_native_scamp._metal_1nn as metal_1nn
+import mlx_native_scamp._metal_sum as metal_sum
 import mlx_native_scamp.core as scamp_core
 import pyscamp as mp
 
@@ -57,6 +58,13 @@ class MaxTileSizeTests(unittest.TestCase):
         series = np.arange(513, dtype=np.float32)
         with self.assertRaisesRegex(ValueError, "at least twice m"):
             mp.abjoin(series, series, 513, max_tile_size=1024)
+        with (
+            patch.object(
+                scamp_core, "_default_max_tile_size", return_value=1024
+            ),
+            self.assertRaisesRegex(ValueError, "at least twice m"),
+        ):
+            mp.abjoin(series, series, 513)
 
         boundary = np.arange(512, dtype=np.float32)
         profile, index = mp.abjoin(
@@ -112,6 +120,18 @@ class MaxTileSizeTests(unittest.TestCase):
         self.assertEqual(scamp_core.MIN_SIMILARITY_TILE_BUDGET_BYTES, small)
         self.assertEqual(scamp_core.MAX_SIMILARITY_TILE_BUDGET_BYTES, large)
 
+    def test_default_tile_size_matches_upstream_resource_defaults(self):
+        with mx.stream(mx.cpu):
+            self.assertEqual(
+                scamp_core.UPSTREAM_CPU_MAX_TILE_SIZE,
+                scamp_core._default_max_tile_size(),
+            )
+        with mx.stream(mx.gpu):
+            self.assertEqual(
+                scamp_core.UPSTREAM_METAL_MAX_TILE_SIZE,
+                scamp_core._default_max_tile_size(),
+            )
+
     def test_forced_multitile_profiles_match_single_tile_results(self):
         options = {"gpus": [], "precision": "double"}
         calls = {
@@ -158,6 +178,73 @@ class MaxTileSizeTests(unittest.TestCase):
                     return_value=64 * 1024,
                 ):
                     actual = call(max_tile_size=1024)
+                self._assert_profile_equal(expected, actual)
+
+    def test_tiny_budget_selfjoin_profiles_preserve_global_exclusion(self):
+        rng = np.random.default_rng(2302)
+        series = rng.normal(size=52).astype(np.float64)
+        m = 8
+        options = {
+            "gpus": [],
+            "precision": "double",
+            "max_tile_size": 1024,
+        }
+        calls = {
+            "1nn": lambda: mp.selfjoin(
+                series, m, pearson=True, **options
+            ),
+            "sum": lambda: mp.selfjoin_sum(
+                series, m, threshold=0.1, **options
+            ),
+            "matrix": lambda: mp.selfjoin_matrix(
+                series,
+                m,
+                threshold=0.0,
+                mheight=4,
+                mwidth=5,
+                pearson=True,
+                **options,
+            ),
+            "knn": lambda: mp.selfjoin_knn(
+                series,
+                m,
+                3,
+                threshold=0.0,
+                pearson=True,
+                **options,
+            ),
+        }
+        subsequences = series.size - m + 1
+        with patch.object(
+            scamp_core,
+            "_similarity_tile_budget_bytes",
+            return_value=8 * 1024,
+        ):
+            tile_rows, tile_columns = scamp_core._portable_tile_shape(
+                subsequences,
+                subsequences,
+                m,
+                mx.float64,
+                1024,
+            )
+        self.assertLess(tile_rows, subsequences)
+        self.assertLess(tile_columns, subsequences)
+        self.assertNotEqual(tile_rows, tile_columns)
+
+        for name, call in calls.items():
+            with self.subTest(profile=name):
+                with patch.object(
+                    scamp_core,
+                    "_similarity_tile_budget_bytes",
+                    return_value=64 * scamp_core.MIB,
+                ):
+                    expected = call()
+                with patch.object(
+                    scamp_core,
+                    "_similarity_tile_budget_bytes",
+                    return_value=8 * 1024,
+                ):
+                    actual = call()
                 self._assert_profile_equal(expected, actual)
 
     def test_knn_equal_correlations_prefer_smallest_rows_for_every_tile_shape(self):
@@ -261,6 +348,69 @@ class MaxTileSizeTests(unittest.TestCase):
         kernel.assert_not_called()
         self.assertEqual((1023,), profile.shape)
         self.assertEqual(profile.shape, index.shape)
+
+    def test_omitted_tile_size_uses_default_ceiling_before_metal_routing(self):
+        series = np.arange(1025, dtype=np.float32)
+        calls = (
+            lambda: mp.selfjoin(
+                series,
+                8,
+                pearson=True,
+                precision="single",
+                gpus=[0],
+            ),
+            lambda: mp.selfjoin_sum(
+                series,
+                8,
+                threshold=0.2,
+                precision="single",
+                gpus=[0],
+            ),
+        )
+        original_prepare = scamp_core._prepare_series_tile
+
+        for call in calls:
+            spans = []
+
+            def record_prepare(tiled_series, start, end, m):
+                spans.append(end - start)
+                return original_prepare(tiled_series, start, end, m)
+
+            with (
+                self.subTest(call=call),
+                patch.object(
+                    scamp_core, "_default_max_tile_size", return_value=1024
+                ),
+                patch.object(
+                    scamp_core,
+                    "_metal_sum_is_worthwhile",
+                    return_value=True,
+                ) as sum_worthwhile,
+                patch.object(
+                    metal_1nn,
+                    "best_match",
+                    side_effect=AssertionError("join-wide Metal bypassed ceiling"),
+                ) as one_nn_kernel,
+                patch.object(
+                    metal_sum,
+                    "sum_threshold",
+                    side_effect=AssertionError("join-wide Metal bypassed ceiling"),
+                ) as sum_kernel,
+                patch.object(
+                    scamp_core,
+                    "_prepare_series_tile",
+                    side_effect=record_prepare,
+                ),
+            ):
+                output = call()
+
+            one_nn_kernel.assert_not_called()
+            sum_kernel.assert_not_called()
+            sum_worthwhile.assert_not_called()
+            self.assertTrue(spans)
+            self.assertLessEqual(max(spans), 1024 - 8 + 1)
+            result_size = output[0].size if isinstance(output, tuple) else output.size
+            self.assertEqual(series.size - 8 + 1, result_size)
 
     def _assert_profile_equal(self, expected, actual):
         if isinstance(expected, tuple):
