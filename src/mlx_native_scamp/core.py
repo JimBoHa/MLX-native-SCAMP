@@ -4,6 +4,7 @@ import math
 import operator
 from contextlib import nullcontext
 from dataclasses import dataclass
+from numbers import Real
 from typing import Any
 
 import mlx.core as mx
@@ -95,11 +96,40 @@ def _ensure_1d_array(values: Any, name: str, dtype: Any) -> Any:
     return array
 
 
-def _positive_knn_k(value: Any) -> int:
+def _index_kwarg(value: Any, name: str) -> int:
     try:
-        k = operator.index(value)
+        return operator.index(value)
     except TypeError:
-        raise TypeError("k must be an integer") from None
+        raise TypeError(f"{name} must be an integer") from None
+
+
+def _normalize_window_size(m: Any) -> int:
+    normalized = _index_kwarg(m, "m")
+    if normalized < 3:
+        raise ValueError("m must be at least 3")
+    return normalized
+
+
+def _bool_kwarg(value: Any, name: str) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, (Real, np.bool_)):
+        raise TypeError(f"{name} must be a boolean-compatible number or None")
+    return bool(value)
+
+
+def _gpu_kwarg(value: Any) -> list[int]:
+    if value is None:
+        raise TypeError("gpus must be a sequence of integer device IDs")
+    try:
+        devices = iter(value)
+    except TypeError:
+        raise TypeError("gpus must be a sequence of integer device IDs") from None
+    return [_index_kwarg(device, "GPU device ID") for device in devices]
+
+
+def _positive_knn_k(value: Any) -> int:
+    k = _index_kwarg(value, "k")
     if k <= 0:
         raise ValueError("k must be greater than 0")
     return k
@@ -117,28 +147,33 @@ def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, all
         raise ValueError(f"Invalid keyword argument specified unknown argument: {sorted(unknown)[0]}")
 
     precision = kwargs.get("precision", "double")
+    if not isinstance(precision, str):
+        raise TypeError("precision must be a string")
     if precision not in VALID_PRECISIONS:
         raise ValueError("Invalid precision type specified: valid options are single, double, ultra")
 
-    threshold = float(kwargs.get("threshold", 0.0))
+    threshold_value = kwargs.get("threshold", 0.0)
+    if not isinstance(threshold_value, Real):
+        raise TypeError("threshold must be a real number")
+    threshold = float(threshold_value)
     if allow_threshold and (not np.isfinite(threshold) or threshold < -1.0 or threshold > 1.0):
         raise ValueError("Invalid threshold specified: value must be finite and between -1 and 1")
 
-    threads = int(kwargs.get("threads", 0))
+    threads = _index_kwarg(kwargs.get("threads", 0), "threads")
     if threads < 0:
         raise ValueError("Invalid number of cpu worker threads specified, must be greater than or equal to 0.")
 
     params = {
-        "pearson": bool(kwargs.get("pearson", False)),
+        "pearson": _bool_kwarg(kwargs.get("pearson", False), "pearson"),
         "precision": precision,
         "threshold": threshold,
-        "verbose": bool(kwargs.get("verbose", False)),
+        "verbose": _bool_kwarg(kwargs.get("verbose", False), "verbose"),
         "threads": threads,
-        "gpus": kwargs.get("gpus", None),
+        "gpus": _gpu_kwarg(kwargs["gpus"]) if "gpus" in kwargs else None,
     }
     if allow_matrix:
-        params["mheight"] = int(kwargs.get("mheight", 50))
-        params["mwidth"] = int(kwargs.get("mwidth", 50))
+        params["mheight"] = _index_kwarg(kwargs.get("mheight", 50), "mheight")
+        params["mwidth"] = _index_kwarg(kwargs.get("mwidth", 50), "mwidth")
         if params["mheight"] <= 0:
             raise ValueError("Invalid matrix height specified: value must be greater than 0")
         if params["mwidth"] <= 0:
@@ -901,6 +936,7 @@ def _run_profile(
     use_metal_1nn: bool = False,
     use_metal_sum: bool = False,
 ):
+    m = _normalize_window_size(m)
     has_b = b is not None
     float32_sources = _is_float32_input(a) and (
         not has_b or _is_float32_input(b)
@@ -911,14 +947,25 @@ def _run_profile(
     # Upstream's ultra mode changes its sliding recurrence, while this direct
     # normalized-window implementation uses the same float64 path for both.
     series_a = _ensure_1d_array(a, "a", compute_dtype)
-    if m <= 0:
-        raise ValueError("m must be greater than 0")
     if int(series_a.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(a)")
 
     series_b = _ensure_1d_array(b, "b", compute_dtype) if has_b else series_a
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
+
+    if profile == "matrix":
+        subsequences_a = int(series_a.shape[0]) - m + 1
+        subsequences_b = int(series_b.shape[0]) - m + 1
+        if mwidth > subsequences_a:
+            raise ValueError(
+                "mwidth must be less than or equal to the number of subsequences in a"
+            )
+        if mheight > subsequences_b:
+            height_series = "b" if has_b else "a"
+            raise ValueError(
+                f"mheight must be less than or equal to the number of subsequences in {height_series}"
+            )
 
     self_join = not has_b
 
