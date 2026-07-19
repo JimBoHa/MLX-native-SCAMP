@@ -375,6 +375,82 @@ class PyScampCompatTests(unittest.TestCase):
         np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
         np.testing.assert_array_equal(valid_idx, out_idx)
 
+    def test_numpy_compatible_inputs_are_forcecast_and_contiguous(self):
+        inputs = (
+            range(16),
+            np.arange(16, dtype=np.float64),
+            np.ascontiguousarray(np.arange(16, dtype=np.float64)[::-1])[::-1],
+            np.array([str(value) for value in range(16)]),
+            np.array(range(16), dtype=object),
+        )
+        for precision in ("single", "double"):
+            expected_dist, expected_idx = mp.selfjoin(
+                np.arange(16, dtype=np.float64),
+                4,
+                pearson=True,
+                precision=precision,
+            )
+            for values in inputs:
+                with self.subTest(
+                    precision=precision,
+                    input_type=type(values),
+                    dtype=getattr(values, "dtype", None),
+                ):
+                    out_dist, out_idx = mp.selfjoin(
+                        values,
+                        4,
+                        pearson=True,
+                        precision=precision,
+                    )
+                    np.testing.assert_allclose(
+                        expected_dist,
+                        out_dist,
+                        equal_nan=True,
+                        rtol=1e-4,
+                        atol=1e-4,
+                    )
+                    np.testing.assert_array_equal(expected_idx, out_idx)
+
+    def test_numpy_coercion_preserves_selected_precision(self):
+        numeric_strings = np.array(["100000000", "100000001", "100000002"])
+
+        with mx.stream(mx.cpu):
+            single = scamp_core._ensure_1d_array(
+                numeric_strings, "a", mx.float32
+            )
+            double = scamp_core._ensure_1d_array(
+                numeric_strings, "a", mx.float64
+            )
+            mx.eval(single, double)
+            single_value = float(np.asarray(single)[1])
+            double_value = float(np.asarray(double)[1])
+
+        self.assertEqual(mx.float32, single.dtype)
+        self.assertEqual(mx.float64, double.dtype)
+        self.assertEqual(100000000.0, single_value)
+        self.assertEqual(100000001.0, double_value)
+
+    def test_mlx_inputs_stay_on_the_device_native_conversion_path(self):
+        source = mx.array([0.0, 1.0, 2.0], dtype=mx.float32)
+
+        with patch.object(
+            scamp_core.np,
+            "asarray",
+            side_effect=AssertionError("unexpected host conversion"),
+        ):
+            with mx.stream(mx.cpu):
+                converted = scamp_core._ensure_1d_array(source, "a", mx.float64)
+                mx.eval(converted)
+
+        self.assertEqual(mx.float64, converted.dtype)
+        np.testing.assert_array_equal(np.asarray(converted), np.arange(3))
+
+    def test_non_1d_numpy_compatible_inputs_are_rejected_clearly(self):
+        for values in (42, [[0, 1], [2, 3]], np.zeros((2, 2))):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, "a must be a 1D array"):
+                    mp.selfjoin(values, 3)
+
     def test_compatibility_kwargs_are_accepted(self):
         out_dist, out_idx = mp.selfjoin(
             self.a,
