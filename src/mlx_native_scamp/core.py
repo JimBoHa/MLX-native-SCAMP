@@ -128,6 +128,13 @@ def _gpu_kwarg(value: Any) -> list[int]:
     return [_index_kwarg(device, "GPU device ID") for device in devices]
 
 
+def _positive_knn_k(value: Any) -> int:
+    k = _index_kwarg(value, "k")
+    if k <= 0:
+        raise ValueError("k must be greater than 0")
+    return k
+
+
 def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, allow_threshold: bool = False) -> dict[str, Any]:
     valid_keys = {"verbose", "precision", "pearson", "gpus", "threads"}
     if allow_threshold:
@@ -1174,6 +1181,7 @@ def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
+    k = _positive_knn_k(k)
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile_with_resources(
         params,
@@ -1188,6 +1196,7 @@ def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, 
 
 
 def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
+    k = _positive_knn_k(k)
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile_with_resources(
         params,

@@ -284,6 +284,39 @@ class PyScampCompatTests(unittest.TestCase):
         matches = mp.abjoin_knn(self.a, self.b, self.m, 3, threshold=0.2, pearson=True)
         self._assert_knn_matches_reference(matches, self.dm_ab, 0.2)
 
+    def test_knn_neighbor_count_must_be_a_positive_integer(self):
+        for call in (
+            lambda k: mp.selfjoin_knn(self.a, self.m, k),
+            lambda k: mp.abjoin_knn(self.a, self.b, self.m, k),
+        ):
+            with self.subTest(join=call):
+                matches = call(np.int64(2))
+                self.assertIsInstance(matches, list)
+                for invalid in (2.5, "2", None):
+                    with (
+                        self.subTest(invalid=invalid),
+                        patch.object(
+                            scamp_core,
+                            "_run_profile_with_resources",
+                            side_effect=AssertionError("unexpected MLX execution"),
+                        ) as run_profile,
+                        self.assertRaisesRegex(TypeError, "integer"),
+                    ):
+                        call(invalid)
+                    run_profile.assert_not_called()
+                for invalid in (0, -1):
+                    with (
+                        self.subTest(invalid=invalid),
+                        patch.object(
+                            scamp_core,
+                            "_run_profile_with_resources",
+                            side_effect=AssertionError("unexpected MLX execution"),
+                        ) as run_profile,
+                        self.assertRaisesRegex(ValueError, "greater than 0"),
+                    ):
+                        call(invalid)
+                    run_profile.assert_not_called()
+
     def test_profiles_schedule_compact_reducer_state_per_block(self):
         rng = np.random.default_rng(7)
         a = rng.normal(size=10).astype(np.float32)
