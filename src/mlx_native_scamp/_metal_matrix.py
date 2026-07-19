@@ -37,7 +37,8 @@ _SOURCE = r"""
     uint row_bin_lower = 0;
     uint row_bin_upper = matrix_rows;
     while (row_bin_lower + 1 < row_bin_upper) {
-        uint middle = (row_bin_lower + row_bin_upper) / 2;
+        uint middle = row_bin_lower +
+            (row_bin_upper - row_bin_lower) / 2;
         if (row >= row_edges[middle]) {
             row_bin_lower = middle;
         } else {
@@ -49,7 +50,8 @@ _SOURCE = r"""
     uint col_bin_lower = 0;
     uint col_bin_upper = matrix_cols;
     while (col_bin_lower + 1 < col_bin_upper) {
-        uint middle = (col_bin_lower + col_bin_upper) / 2;
+        uint middle = col_bin_lower +
+            (col_bin_upper - col_bin_lower) / 2;
         if (col >= col_edges[middle]) {
             col_bin_lower = middle;
         } else {
