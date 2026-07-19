@@ -346,7 +346,9 @@ class MetalDiagonal1NNTests(unittest.TestCase):
             )
 
         kernel.assert_not_called()
-        self.assertEqual(2, portable_preparation.call_count)
+        # The tiled fallback reuses a normalized block when both axes cover
+        # the same self-join region.
+        self.assertEqual(1, portable_preparation.call_count)
         np.testing.assert_allclose(
             actual[0], expected[0], rtol=2e-5, atol=2e-5, equal_nan=True
         )

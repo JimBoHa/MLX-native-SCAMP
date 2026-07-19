@@ -30,21 +30,23 @@ class IndexFree1NNTests(unittest.TestCase):
         expected_self = mp.selfjoin(a, 9, pearson=True, gpus=[])[0]
         expected_ab = mp.abjoin(a, b, 9, pearson=False, gpus=[])[0]
 
-        with mock.patch.object(
-            core,
-            "_portable_best_match",
-            wraps=core._portable_best_match,
-        ) as reducer:
+        with (
+            mock.patch.object(
+                core,
+                "_iterate_tiled_blocks",
+                wraps=core._iterate_tiled_blocks,
+            ) as tiled_blocks,
+            mock.patch.object(
+                core.mx,
+                "argmax",
+                side_effect=AssertionError("value-only reducer requested indices"),
+            ) as argmax,
+        ):
             actual_self = mp.selfjoin_1nn(a, 9, pearson=True, gpus=[])
             actual_ab = mp.abjoin_1nn(a, b, 9, pearson=False, gpus=[])
 
-        self.assertEqual(2, reducer.call_count)
-        self.assertTrue(
-            all(
-                call.kwargs["include_indices"] is False
-                for call in reducer.call_args_list
-            )
-        )
+        self.assertEqual(2, tiled_blocks.call_count)
+        argmax.assert_not_called()
         np.testing.assert_array_equal(actual_self, expected_self)
         np.testing.assert_array_equal(actual_ab, expected_ab)
 
@@ -68,13 +70,75 @@ class IndexFree1NNTests(unittest.TestCase):
 
         with mock.patch.object(
             core,
-            "_portable_best_match",
-            wraps=core._portable_best_match,
-        ) as reducer:
+            "_iterate_tiled_blocks",
+            wraps=core._iterate_tiled_blocks,
+        ) as tiled_blocks:
             actual = mp.abjoin_1nn(a, b, m, **options)
 
-        self.assertEqual(exclusion, reducer.call_args.args[2])
+        self.assertEqual(exclusion, tiled_blocks.call_args.args[3])
         np.testing.assert_array_equal(actual, expected)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal is unavailable")
+    def test_restrictive_tiles_bound_value_only_fallback_without_argmax(self):
+        rng = np.random.default_rng(2601)
+        series = rng.normal(size=1025).astype(np.float32)
+        m = 3
+        max_tile_size = 1024
+        subsequences = series.size - m + 1
+        max_tile_subsequences = max_tile_size - m + 1
+        expected = mp.selfjoin(
+            series,
+            m,
+            pearson=True,
+            precision="single",
+            gpus=[0],
+            max_tile_size=max_tile_size,
+        )[0]
+
+        for explicit_limit in (True, False):
+            kwargs = {"max_tile_size": max_tile_size} if explicit_limit else {}
+            with (
+                self.subTest(explicit_limit=explicit_limit),
+                mock.patch.object(
+                    core,
+                    "_default_max_tile_size",
+                    return_value=max_tile_size,
+                ),
+                mock.patch.object(
+                    core,
+                    "_iterate_tiled_blocks",
+                    wraps=core._iterate_tiled_blocks,
+                ) as tiled_blocks,
+                mock.patch.object(
+                    core.mx,
+                    "argmax",
+                    side_effect=AssertionError(
+                        "value-only reducer requested indices"
+                    ),
+                ) as argmax,
+                mock.patch.object(_metal_1nn, "best_profile") as metal_profile,
+                mock.patch.object(_metal_1nn, "_INDEX_KERNEL") as index_kernel,
+            ):
+                actual = mp.selfjoin_1nn(
+                    series,
+                    m,
+                    pearson=True,
+                    precision="single",
+                    gpus=[0],
+                    **kwargs,
+                )
+
+            tiled_blocks.assert_called_once()
+            tile_rows = tiled_blocks.call_args.args[4]
+            tile_columns = tiled_blocks.call_args.args[5]
+            self.assertLess(tile_rows, subsequences)
+            self.assertLess(tile_columns, subsequences)
+            self.assertLessEqual(tile_rows, max_tile_subsequences)
+            self.assertLessEqual(tile_columns, max_tile_subsequences)
+            argmax.assert_not_called()
+            metal_profile.assert_not_called()
+            index_kernel.assert_not_called()
+            np.testing.assert_array_equal(actual, expected)
 
     def test_value_api_reuses_validation_and_resource_contract(self):
         series = np.arange(32, dtype=np.float32)
