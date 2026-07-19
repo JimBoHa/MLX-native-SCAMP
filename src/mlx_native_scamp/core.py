@@ -590,7 +590,11 @@ def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
         block = block_b @ prepared_a.windows.T
         valid_mask = row_valid[:, None] & prepared_a.valid[None, :]
         sentinel_block = mx.full(block.shape, SENTINEL, dtype=block.dtype)
-        block = mx.where(valid_mask, block, sentinel_block)
+        block = mx.where(
+            valid_mask,
+            mx.clip(block, -1.0, 1.0),
+            sentinel_block,
+        )
         if self_join and exclusion > 0:
             diag_mask = mx.abs(row_indices[:, None] - col_indices[None, :]) < exclusion
             block = mx.where(diag_mask, sentinel_block, block)

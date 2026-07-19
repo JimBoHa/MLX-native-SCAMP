@@ -1,9 +1,11 @@
 import unittest
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from unittest.mock import patch
 
 import mlx.core as mx
 import numpy as np
 
+import mlx_native_scamp
 import mlx_native_scamp.core as scamp_core
 import pyscamp as mp
 
@@ -46,8 +48,22 @@ class PyScampCompatTests(unittest.TestCase):
 
     def test_public_surface_matches_upstream_bindings(self):
         exported = {name for name in EXPECTED_PUBLIC_CALLABLES if hasattr(mp, name)}
+        try:
+            installed_version = distribution_version("mlx-native-scamp")
+        except PackageNotFoundError:
+            installed_version = "dev"
         self.assertEqual(EXPECTED_PUBLIC_CALLABLES, exported)
-        self.assertEqual("dev", mp.__version__)
+        self.assertEqual(installed_version, mlx_native_scamp.__version__)
+        self.assertEqual(mlx_native_scamp.__version__, mp.__version__)
+
+    def test_source_tree_version_falls_back_to_dev(self):
+        missing_distribution = PackageNotFoundError("mlx-native-scamp")
+        with patch.object(
+            mlx_native_scamp,
+            "_distribution_version",
+            side_effect=missing_distribution,
+        ):
+            self.assertEqual("dev", mlx_native_scamp._resolve_version())
 
     def test_gpu_supported_is_independent_of_default_device(self):
         previous_device = mx.default_device()
@@ -68,6 +84,125 @@ class PyScampCompatTests(unittest.TestCase):
         out_dist, out_idx = mp.abjoin(self.a, self.b, self.m, pearson=True)
         np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
         np.testing.assert_array_equal(valid_idx, out_idx)
+
+    def test_portable_reducers_clamp_perfect_correlations(self):
+        series_by_precision = {
+            "single": np.array(
+                [-0.5038742, -1.1873481, -0.28324285],
+                dtype=np.float32,
+            ),
+            "double": np.array(
+                [-0.7908847696275746, 0.2369731299165827, 0.05437949611686499],
+                dtype=np.float64,
+            ),
+        }
+
+        for precision, series in series_by_precision.items():
+            window = len(series)
+            expected_distance = {
+                1.0: np.array([0.0], dtype=np.float32),
+                -1.0: np.array(
+                    [2.0 * np.sqrt(window)],
+                    dtype=np.float32,
+                ),
+            }
+            options = {"gpus": [], "precision": precision}
+            for correlation, other in ((1.0, series), (-1.0, -series)):
+                with self.subTest(precision=precision, correlation=correlation):
+                    out_corr, out_idx = mp.abjoin(
+                        series,
+                        other,
+                        window,
+                        pearson=True,
+                        **options,
+                    )
+                    out_dist, dist_idx = mp.abjoin(
+                        series,
+                        other,
+                        window,
+                        pearson=False,
+                        **options,
+                    )
+                    summed = mp.abjoin_sum(
+                        series,
+                        other,
+                        window,
+                        threshold=-1.0 if correlation < 0.0 else 0.0,
+                        **options,
+                    )
+                    matrix = mp.abjoin_matrix(
+                        series,
+                        other,
+                        window,
+                        threshold=-1.0 if correlation < 0.0 else 0.0,
+                        mheight=1,
+                        mwidth=1,
+                        pearson=True,
+                        **options,
+                    )
+                    matches = mp.abjoin_knn(
+                        series,
+                        other,
+                        window,
+                        1,
+                        threshold=-1.0 if correlation < 0.0 else 0.0,
+                        pearson=True,
+                        **options,
+                    )
+
+                    np.testing.assert_array_equal(
+                        out_corr,
+                        np.array([correlation], dtype=np.float32),
+                    )
+                    np.testing.assert_array_equal(
+                        out_idx,
+                        np.array([0], dtype=np.int32),
+                    )
+                    np.testing.assert_array_equal(
+                        out_dist,
+                        expected_distance[correlation],
+                    )
+                    np.testing.assert_array_equal(dist_idx, out_idx)
+                    np.testing.assert_array_equal(
+                        summed,
+                        np.array(
+                            [1.0 if correlation > 0.0 else 0.0],
+                            dtype=np.float64,
+                        ),
+                    )
+                    np.testing.assert_array_equal(
+                        matrix,
+                        np.array([[correlation]], dtype=np.float32),
+                    )
+                    self.assertEqual(
+                        [(0, 0, 1.0)] if correlation > 0.0 else [],
+                        matches,
+                    )
+
+    def test_portable_clamping_preserves_exclusion_sentinel(self):
+        series = np.arange(8, dtype=np.float32)
+
+        with mx.stream(mx.cpu):
+            prepared = scamp_core._prepare_series(mx.array(series), 4)
+            blocks = list(
+                scamp_core._iterate_blocks(
+                    prepared,
+                    prepared,
+                    4,
+                    True,
+                    block_rows=prepared.subsequences,
+                )
+            )
+
+        self.assertEqual(1, len(blocks))
+        block = np.asarray(blocks[0][3])
+        np.testing.assert_array_equal(
+            np.diag(block),
+            np.full((prepared.subsequences,), scamp_core.SENTINEL),
+        )
+        valid = block != scamp_core.SENTINEL
+        self.assertTrue(np.all(block[valid] >= -1.0))
+        self.assertTrue(np.all(block[valid] <= 1.0))
 
     def test_selfjoin_euclidean_matches_reference_conversion(self):
         valid_corr, valid_idx = reduce_1nn_index(self.dm_self)
