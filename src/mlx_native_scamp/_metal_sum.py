@@ -5,9 +5,6 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from ._exclusion import self_join_exclusion
-
-
 _INPUT_NAMES = [
     "clean_a",
     "clean_b",
@@ -32,6 +29,7 @@ _SOURCE = r"""
     uint m = config[0];
     uint exclusion = config[1];
     bool self_join = config[2] != 0;
+    bool apply_exclusion = config[5] != 0;
 
     int diagonal;
     if (self_join) {
@@ -56,8 +54,10 @@ _SOURCE = r"""
 
     uint steps_until_checkpoint = config[4];
     for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
+        bool excluded = apply_exclusion &&
+            metal::abs(int(col) - int(row)) < int(exclusion);
         float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
+        if (!excluded && norm_product > 0.0f) {
             float corr = covariance * norm_product;
             if (metal::isfinite(corr)) {
                 corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
@@ -127,12 +127,12 @@ def sum_threshold(
     m: int,
     threshold: float,
     self_join: bool,
+    exclusion: int,
 ) -> np.ndarray:
     """Compute a single-precision SUM_THRESH profile by diagonal recurrence."""
 
     n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
-    exclusion = self_join_exclusion(m) if self_join else 0
     diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
     if diagonal_count <= 0:
         return np.zeros((n_a,), dtype=np.float64)
@@ -161,6 +161,7 @@ def sum_threshold(
                 int(self_join),
                 diagonal_start,
                 RECURRENCE_CHECKPOINT,
+                int(exclusion > 0),
             ],
             dtype=mx.uint32,
         )

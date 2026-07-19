@@ -282,7 +282,19 @@ def _gpu_kwarg(value: Any) -> list[int]:
     return [_index_kwarg(device, "GPU device ID") for device in devices]
 
 
-def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, allow_threshold: bool = False) -> dict[str, Any]:
+def _positive_knn_k(value: Any) -> int:
+    k = _index_kwarg(value, "k")
+    if k <= 0:
+        raise ValueError("k must be greater than 0")
+    return k
+
+
+def _parse_common_kwargs(
+    kwargs: dict[str, Any],
+    allow_matrix: bool = False,
+    allow_threshold: bool = False,
+    is_ab_join: bool = False,
+) -> dict[str, Any]:
     valid_keys = {
         "verbose",
         "precision",
@@ -295,6 +307,13 @@ def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, all
         valid_keys.add("threshold")
     if allow_matrix:
         valid_keys.update({"mheight", "mwidth"})
+    if is_ab_join:
+        valid_keys.add("allow_trivial_match")
+    elif "allow_trivial_match" in kwargs:
+        raise ValueError(
+            "allow_trivial_match is only valid for ab-joins; "
+            "self-joins always exclude trivial matches."
+        )
 
     unknown = set(kwargs) - valid_keys
     if unknown:
@@ -336,6 +355,11 @@ def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, all
         "gpus": _gpu_kwarg(kwargs["gpus"]) if "gpus" in kwargs else None,
         "max_tile_size": max_tile_size,
     }
+    if is_ab_join:
+        params["allow_trivial_match"] = _bool_kwarg(
+            kwargs.get("allow_trivial_match", True),
+            "allow_trivial_match",
+        )
     if allow_matrix:
         params["mheight"] = _index_kwarg(kwargs.get("mheight", 50), "mheight")
         params["mwidth"] = _index_kwarg(kwargs.get("mwidth", 50), "mwidth")
@@ -430,11 +454,10 @@ def _iterate_tiled_blocks(
     series_a: TiledSeries,
     series_b: TiledSeries,
     m: int,
-    self_join: bool,
+    exclusion: int,
     tile_rows: int,
     tile_columns: int,
 ):
-    exclusion = self_join_exclusion(m)
     for col_start, col_end in _tile_ranges(
         series_a.subsequences, tile_columns
     ):
@@ -443,7 +466,11 @@ def _iterate_tiled_blocks(
         for row_start, row_end in _tile_ranges(
             series_b.subsequences, tile_rows
         ):
-            if self_join and row_start == col_start and row_end == col_end:
+            if (
+                series_a is series_b
+                and row_start == col_start
+                and row_end == col_end
+            ):
                 prepared_b = prepared_a
             else:
                 prepared_b = _prepare_series_tile(
@@ -458,7 +485,7 @@ def _iterate_tiled_blocks(
                 mx.clip(block, -1.0, 1.0),
                 sentinel_block,
             )
-            if self_join and exclusion > 0:
+            if exclusion > 0:
                 diag_mask = (
                     mx.abs(row_indices[:, None] - col_indices[None, :])
                     < exclusion
@@ -865,9 +892,13 @@ def _convert_match_value(corr: float, m: int, pearson: bool) -> float:
     return float(np.sqrt(max(2.0 * m * (1.0 - corr), 0.0)))
 
 
-def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, self_join: bool, block_rows: int):
+def _iterate_blocks(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    exclusion: int,
+    block_rows: int,
+):
     n_cols = prepared_a.subsequences
-    exclusion = self_join_exclusion(m)
     col_indices = mx.arange(n_cols, dtype=mx.int32)
     for row_start in range(0, prepared_b.subsequences, block_rows):
         row_end = min(prepared_b.subsequences, row_start + block_rows)
@@ -882,7 +913,7 @@ def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
             mx.clip(block, -1.0, 1.0),
             sentinel_block,
         )
-        if self_join and exclusion > 0:
+        if exclusion > 0:
             diag_mask = mx.abs(row_indices[:, None] - col_indices[None, :]) < exclusion
             block = mx.where(diag_mask, sentinel_block, block)
         yield row_start, row_end, row_indices, block
@@ -894,6 +925,7 @@ def _best_match_profile(
     m: int,
     pearson: bool,
     self_join: bool,
+    exclusion: int,
     use_metal_kernel: bool,
     tile_rows: int | None = None,
     tile_columns: int | None = None,
@@ -901,7 +933,9 @@ def _best_match_profile(
     if use_metal_kernel:
         from ._metal_1nn import best_match
 
-        corr_np, idx_np = best_match(prepared_a, prepared_b, m, self_join)
+        corr_np, idx_np = best_match(
+            prepared_a, prepared_b, m, self_join, exclusion
+        )
         return _convert_profile_output(corr_np, m, pearson), idx_np
 
     if not isinstance(prepared_a, TiledSeries) or not isinstance(
@@ -929,7 +963,7 @@ def _best_match_profile(
         prepared_a,
         prepared_b,
         m,
-        self_join,
+        exclusion,
         tile_rows,
         tile_columns,
     ):
@@ -970,6 +1004,7 @@ def _sum_threshold_profile(
     m: int,
     threshold: float,
     self_join: bool,
+    exclusion: int,
     use_metal_kernel: bool,
     tile_rows: int | None = None,
     tile_columns: int | None = None,
@@ -977,7 +1012,9 @@ def _sum_threshold_profile(
     if use_metal_kernel:
         from ._metal_sum import sum_threshold
 
-        return sum_threshold(prepared_a, prepared_b, m, threshold, self_join)
+        return sum_threshold(
+            prepared_a, prepared_b, m, threshold, self_join, exclusion
+        )
 
     if not isinstance(prepared_a, TiledSeries) or not isinstance(
         prepared_b, TiledSeries
@@ -998,7 +1035,7 @@ def _sum_threshold_profile(
         prepared_a,
         prepared_b,
         m,
-        self_join,
+        exclusion,
         tile_rows,
         tile_columns,
     ):
@@ -1179,6 +1216,7 @@ def _matrix_summary(
     rows: int,
     cols: int,
     self_join: bool,
+    exclusion: int,
     tile_rows: int,
     tile_columns: int,
 ) -> np.ndarray:
@@ -1196,7 +1234,7 @@ def _matrix_summary(
         prepared_a,
         prepared_b,
         m,
-        self_join,
+        exclusion,
         tile_rows,
         tile_columns,
     ):
@@ -1257,7 +1295,7 @@ def _knn_profile(
     k: int,
     threshold: float,
     pearson: bool,
-    self_join: bool,
+    exclusion: int,
     tile_rows: int,
     tile_columns: int,
 ) -> list[tuple[int, int, float]]:
@@ -1280,7 +1318,7 @@ def _knn_profile(
         prepared_a,
         prepared_b,
         m,
-        self_join,
+        exclusion,
         tile_rows,
         tile_columns,
     ):
@@ -1344,6 +1382,7 @@ def _run_profile(
     threshold: float = 0.0,
     mheight: int = 50,
     mwidth: int = 50,
+    allow_trivial_match: bool = True,
     profile: str,
     k: int | None = None,
     max_tile_size: int | None = None,
@@ -1389,6 +1428,11 @@ def _run_profile(
         int(series_a.shape[0]) <= max_tile_size
         and int(series_b.shape[0]) <= max_tile_size
     )
+    exclusion = (
+        self_join_exclusion(m)
+        if self_join or not allow_trivial_match
+        else 0
+    )
 
     sum_recurrence = (
         profile == "sum"
@@ -1430,6 +1474,7 @@ def _run_profile(
                     m,
                     pearson,
                     self_join,
+                    exclusion,
                     True,
                 )
             return _sum_threshold_profile(
@@ -1438,6 +1483,7 @@ def _run_profile(
                 m,
                 threshold,
                 self_join,
+                exclusion,
                 True,
             )
 
@@ -1468,6 +1514,7 @@ def _run_profile(
             m,
             pearson,
             self_join,
+            exclusion,
             False,
             tile_rows,
             tile_columns,
@@ -1479,6 +1526,7 @@ def _run_profile(
             m,
             threshold,
             self_join,
+            exclusion,
             False,
             tile_rows,
             tile_columns,
@@ -1493,6 +1541,7 @@ def _run_profile(
             mheight,
             mwidth,
             self_join,
+            exclusion,
             tile_rows,
             tile_columns,
         )
@@ -1506,7 +1555,7 @@ def _run_profile(
             k,
             threshold,
             pearson,
-            self_join,
+            exclusion,
             tile_rows,
             tile_columns,
         )
@@ -1567,13 +1616,14 @@ def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
 
 
 def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
-    params = _parse_common_kwargs(kwargs)
+    params = _parse_common_kwargs(kwargs, is_ab_join=True)
     return _run_profile_with_resources(
         params,
         a,
         b,
         m,
         pearson=params["pearson"],
+        allow_trivial_match=params["allow_trivial_match"],
         profile="1nn",
     )
 
@@ -1592,7 +1642,9 @@ def selfjoin_sum(a: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
-    params = _parse_common_kwargs(kwargs, allow_threshold=True)
+    params = _parse_common_kwargs(
+        kwargs, allow_threshold=True, is_ab_join=True
+    )
     return _run_profile_with_resources(
         params,
         a,
@@ -1600,6 +1652,7 @@ def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
         m,
         pearson=True,
         threshold=params["threshold"],
+        allow_trivial_match=params["allow_trivial_match"],
         profile="sum",
     )
 
@@ -1620,7 +1673,12 @@ def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
-    params = _parse_common_kwargs(kwargs, allow_threshold=True, allow_matrix=True)
+    params = _parse_common_kwargs(
+        kwargs,
+        allow_threshold=True,
+        allow_matrix=True,
+        is_ab_join=True,
+    )
     return _run_profile_with_resources(
         params,
         a,
@@ -1630,11 +1688,13 @@ def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
         threshold=params["threshold"],
         mheight=params["mheight"],
         mwidth=params["mwidth"],
+        allow_trivial_match=params["allow_trivial_match"],
         profile="matrix",
     )
 
 
 def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
+    k = _positive_knn_k(k)
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile_with_resources(
         params,
@@ -1649,7 +1709,10 @@ def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, 
 
 
 def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
-    params = _parse_common_kwargs(kwargs, allow_threshold=True)
+    k = _positive_knn_k(k)
+    params = _parse_common_kwargs(
+        kwargs, allow_threshold=True, is_ab_join=True
+    )
     return _run_profile_with_resources(
         params,
         a,
@@ -1657,6 +1720,7 @@ def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int,
         m,
         pearson=params["pearson"],
         threshold=params["threshold"],
+        allow_trivial_match=params["allow_trivial_match"],
         profile="knn",
         k=k,
     )

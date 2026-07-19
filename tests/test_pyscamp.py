@@ -46,6 +46,48 @@ class PyScampCompatTests(unittest.TestCase):
             best_row = int(np.nanargmax(dm[:, col]))
             self.assertEqual(group[0][0], best_row)
 
+    def _assert_knn_equals_reference(self, matches, dm, k, threshold):
+        expected = []
+        for col in range(dm.shape[1]):
+            order = np.argsort(dm[:, col])[::-1][:k]
+            for row in order:
+                corr = float(dm[row, col])
+                if corr > threshold and corr >= -1.0:
+                    expected.append((col, int(row), corr))
+
+        self.assertEqual(
+            [(col, row) for col, row, _ in expected],
+            [(col, row) for col, row, _ in matches],
+        )
+        np.testing.assert_allclose(
+            [corr for _, _, corr in expected],
+            [corr for _, _, corr in matches],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+    def _aligned_ab_fixture(self):
+        rng = np.random.default_rng(17)
+        a = rng.standard_normal(96).astype(np.float32)
+        b = rng.standard_normal(96).astype(np.float32)
+        m = 33
+        floor_exclusion = m // 4
+        source_start = 20
+        target_start = source_start + floor_exclusion
+        b[target_start : target_start + m] = a[
+            source_start : source_start + m
+        ]
+
+        unmasked = distance_matrix(a, b, m)
+        self.assertEqual(target_start, np.argmax(unmasked[:, source_start]))
+        exclusion = (m + 3) // 4
+        rows = np.arange(unmasked.shape[0])[:, None]
+        cols = np.arange(unmasked.shape[1])[None, :]
+        masked = unmasked.copy()
+        masked[np.abs(rows - cols) < exclusion] = -2.0
+        self.assertNotEqual(target_start, np.argmax(masked[:, source_start]))
+        return a, b, m, masked
+
     def test_public_surface_matches_upstream_bindings(self):
         exported = {name for name in EXPECTED_PUBLIC_CALLABLES if hasattr(mp, name)}
         try:
@@ -84,6 +126,164 @@ class PyScampCompatTests(unittest.TestCase):
         out_dist, out_idx = mp.abjoin(self.a, self.b, self.m, pearson=True)
         np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
         np.testing.assert_array_equal(valid_idx, out_idx)
+
+    def test_aligned_ab_exclusion_matches_all_portable_profiles(self):
+        a, b, m, matrix = self._aligned_ab_fixture()
+        expected_corr, expected_index = reduce_1nn_index(matrix)
+        actual_corr, actual_index = mp.abjoin(
+            a,
+            b,
+            m,
+            pearson=True,
+            allow_trivial_match=False,
+            gpus=[],
+        )
+        np.testing.assert_allclose(
+            actual_corr,
+            expected_corr,
+            equal_nan=True,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        np.testing.assert_array_equal(actual_index, expected_index)
+
+        threshold = 0.2
+        expected_sum = reduce_sum_thresh(matrix, threshold)
+        actual_sum = mp.abjoin_sum(
+            a,
+            b,
+            m,
+            threshold=threshold,
+            allow_trivial_match=False,
+            gpus=[],
+        )
+        np.testing.assert_allclose(
+            actual_sum, expected_sum, rtol=1e-4, atol=1e-4
+        )
+
+        size = matrix.shape[0]
+        expected_matrix = reduce_matrix(matrix, size, size, False)
+        actual_matrix = mp.abjoin_matrix(
+            a,
+            b,
+            m,
+            threshold=-1.0,
+            mheight=size,
+            mwidth=size,
+            pearson=True,
+            allow_trivial_match=False,
+            gpus=[],
+        )
+        np.testing.assert_allclose(
+            actual_matrix,
+            expected_matrix,
+            equal_nan=True,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+        matches = mp.abjoin_knn(
+            a,
+            b,
+            m,
+            3,
+            threshold=threshold,
+            pearson=True,
+            allow_trivial_match=False,
+            gpus=[],
+        )
+        self._assert_knn_equals_reference(matches, matrix, 3, threshold)
+
+    def test_allow_trivial_match_defaults_true_for_all_ab_profiles(self):
+        options = {"pearson": True, "gpus": []}
+        default_corr, default_index = mp.abjoin(
+            self.a, self.b, self.m, **options
+        )
+        explicit_corr, explicit_index = mp.abjoin(
+            self.a,
+            self.b,
+            self.m,
+            allow_trivial_match=True,
+            **options,
+        )
+        np.testing.assert_allclose(default_corr, explicit_corr, equal_nan=True)
+        np.testing.assert_array_equal(default_index, explicit_index)
+
+        default_sum = mp.abjoin_sum(
+            self.a, self.b, self.m, threshold=0.2, gpus=[]
+        )
+        explicit_sum = mp.abjoin_sum(
+            self.a,
+            self.b,
+            self.m,
+            threshold=0.2,
+            allow_trivial_match=True,
+            gpus=[],
+        )
+        np.testing.assert_allclose(default_sum, explicit_sum)
+
+        matrix_options = {
+            "threshold": 0.0,
+            "mheight": 4,
+            "mwidth": 5,
+            "pearson": True,
+            "gpus": [],
+        }
+        default_matrix = mp.abjoin_matrix(
+            self.a, self.b, self.m, **matrix_options
+        )
+        explicit_matrix = mp.abjoin_matrix(
+            self.a,
+            self.b,
+            self.m,
+            allow_trivial_match=True,
+            **matrix_options,
+        )
+        np.testing.assert_allclose(
+            default_matrix, explicit_matrix, equal_nan=True
+        )
+
+        default_knn = mp.abjoin_knn(
+            self.a,
+            self.b,
+            self.m,
+            3,
+            threshold=0.2,
+            pearson=True,
+            gpus=[],
+        )
+        explicit_knn = mp.abjoin_knn(
+            self.a,
+            self.b,
+            self.m,
+            3,
+            threshold=0.2,
+            pearson=True,
+            allow_trivial_match=True,
+            gpus=[],
+        )
+        self.assertEqual(default_knn, explicit_knn)
+
+    def test_allow_trivial_match_is_rejected_by_selfjoins(self):
+        calls = (
+            lambda: mp.selfjoin(
+                self.a, self.m, allow_trivial_match=False
+            ),
+            lambda: mp.selfjoin_sum(
+                self.a, self.m, allow_trivial_match=False
+            ),
+            lambda: mp.selfjoin_matrix(
+                self.a, self.m, allow_trivial_match=False
+            ),
+            lambda: mp.selfjoin_knn(
+                self.a, self.m, 3, allow_trivial_match=False
+            ),
+        )
+        for call in calls:
+            with self.subTest(call=call), self.assertRaisesRegex(
+                ValueError, "only valid for ab-joins"
+            ):
+                call()
 
     def test_portable_reducers_clamp_perfect_correlations(self):
         series_by_precision = {
@@ -188,8 +388,7 @@ class PyScampCompatTests(unittest.TestCase):
                 scamp_core._iterate_blocks(
                     prepared,
                     prepared,
-                    4,
-                    True,
+                    (4 + 3) // 4,
                     block_rows=prepared.subsequences,
                 )
             )
@@ -283,6 +482,39 @@ class PyScampCompatTests(unittest.TestCase):
     def test_abjoin_knn_contains_valid_top_matches(self):
         matches = mp.abjoin_knn(self.a, self.b, self.m, 3, threshold=0.2, pearson=True)
         self._assert_knn_matches_reference(matches, self.dm_ab, 0.2)
+
+    def test_knn_neighbor_count_must_be_a_positive_integer(self):
+        for call in (
+            lambda k: mp.selfjoin_knn(self.a, self.m, k),
+            lambda k: mp.abjoin_knn(self.a, self.b, self.m, k),
+        ):
+            with self.subTest(join=call):
+                matches = call(np.int64(2))
+                self.assertIsInstance(matches, list)
+                for invalid in (2.5, "2", None):
+                    with (
+                        self.subTest(invalid=invalid),
+                        patch.object(
+                            scamp_core,
+                            "_run_profile_with_resources",
+                            side_effect=AssertionError("unexpected MLX execution"),
+                        ) as run_profile,
+                        self.assertRaisesRegex(TypeError, "integer"),
+                    ):
+                        call(invalid)
+                    run_profile.assert_not_called()
+                for invalid in (0, -1):
+                    with (
+                        self.subTest(invalid=invalid),
+                        patch.object(
+                            scamp_core,
+                            "_run_profile_with_resources",
+                            side_effect=AssertionError("unexpected MLX execution"),
+                        ) as run_profile,
+                        self.assertRaisesRegex(ValueError, "greater than 0"),
+                    ):
+                        call(invalid)
+                    run_profile.assert_not_called()
 
     def test_profiles_schedule_compact_reducer_state_per_block(self):
         rng = np.random.default_rng(7)
@@ -515,6 +747,25 @@ class PyScampCompatTests(unittest.TestCase):
                 with self.subTest(profile=profile, keyword=keyword):
                     with self.assertRaisesRegex(TypeError, "integer"):
                         call(**{keyword: value})
+
+        ab_calls = {
+            "abjoin": lambda **kwargs: mp.abjoin(
+                self.a, self.b, self.m, **kwargs
+            ),
+            "abjoin_sum": lambda **kwargs: mp.abjoin_sum(
+                self.a, self.b, self.m, **kwargs
+            ),
+            "abjoin_matrix": lambda **kwargs: mp.abjoin_matrix(
+                self.a, self.b, self.m, **kwargs
+            ),
+            "abjoin_knn": lambda **kwargs: mp.abjoin_knn(
+                self.a, self.b, self.m, 2, **kwargs
+            ),
+        }
+        for profile, call in ab_calls.items():
+            with self.subTest(profile=profile, keyword="allow_trivial_match"):
+                with self.assertRaisesRegex(TypeError, "boolean-compatible"):
+                    call(allow_trivial_match="false")
 
     def test_numpy_scalar_compatibility_kwargs_are_accepted(self):
         common = {
