@@ -67,8 +67,8 @@ def execute_1nn_tile(
     a coordinator can merge independently scheduled tiles directly.
     """
 
-    if window <= 0:
-        raise ValueError("window must be greater than zero")
+    if window < 3:
+        raise ValueError("window must be at least 3")
     if not compute_rows and not compute_columns:
         raise ValueError("at least one tile profile direction must be requested")
     if exclusion_zone < 0:

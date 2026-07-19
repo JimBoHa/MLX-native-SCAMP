@@ -71,15 +71,57 @@ class _FailOncePool:
     def discover_serving(self):
         return self.pool.discover_serving()
 
-    def execute_tile(self, request):
+    @property
+    def max_message_bytes(self):
+        return self.pool.max_message_bytes
+
+    def execute_tile(self, request, *, eligible_targets=None):
         self.calls += 1
         self.request_ids.append(request.request_id)
         if self.calls == 1:
             raise _TransientError()
-        return self.pool.execute_tile(request)
+        return self.pool.execute_tile(
+            request, eligible_targets=eligible_targets
+        )
+
+
+class _RefreshAddsWorkerPool:
+    def __init__(self, pool: WorkerPool, initial_worker_id: str) -> None:
+        self.pool = pool
+        self.initial_worker_id = initial_worker_id
+        self.discovery_calls = 0
+        self.execution_calls = 0
+        self.eligible_targets = []
+
+    @property
+    def max_message_bytes(self):
+        return self.pool.max_message_bytes
+
+    def discover_serving(self):
+        self.discovery_calls += 1
+        if self.discovery_calls == 1:
+            return tuple(
+                snapshot
+                for snapshot in self.pool.discover()
+                if snapshot.capabilities.worker_id == self.initial_worker_id
+            )
+        return self.pool.discover_serving()
+
+    def execute_tile(self, request, *, eligible_targets=None):
+        self.execution_calls += 1
+        self.eligible_targets.append(eligible_targets)
+        if self.execution_calls == 1:
+            raise _TransientError()
+        return self.pool.execute_tile(
+            request, eligible_targets=eligible_targets
+        )
 
 
 class DistributedTilePlanningTests(unittest.TestCase):
+    def test_window_must_match_upstream_scamp_minimum(self):
+        with self.assertRaisesRegex(ValueError, "at least 3"):
+            plan_1nn_tiles(8, 8, 2, self_join=True)
+
     def test_self_join_uses_only_upper_triangle_and_transpose_profiles(self):
         plan = plan_1nn_tiles(
             10,
@@ -376,6 +418,40 @@ class DistributedCoordinatorTests(unittest.TestCase):
         self.assertGreater(after["coordinator-worker"], before["coordinator-worker"])
         self.assertGreater(after["second-worker"], before["second-worker"])
 
+    def test_retry_refresh_does_not_admit_an_unvalidated_worker(self):
+        with WorkerServer(
+            backend="cpu", worker_id="newly-recovered-worker"
+        ) as second_server:
+            with WorkerPool(
+                [self.server.target, second_server.target], timeout=15.0
+            ) as pool:
+                wrapped = _RefreshAddsWorkerPool(pool, "coordinator-worker")
+                coordinator = DistributedCoordinator(
+                    wrapped,
+                    max_in_flight=1,
+                    max_retries=2,
+                    retry_backoff=0.0,
+                )
+                before = pool.discover()[1].health.completed_requests
+                series = np.random.default_rng(79).normal(size=36).astype(
+                    np.float32
+                )
+                result = coordinator.selfjoin(
+                    series, 5, tile_size=100, pearson=True
+                )
+                after = pool.discover()[1].health.completed_requests
+
+        self.assertEqual(1, result.progress.retry_attempts)
+        self.assertGreaterEqual(wrapped.discovery_calls, 2)
+        self.assertEqual(before, after)
+        self.assertTrue(
+            all(
+                targets == wrapped.eligible_targets[0]
+                for targets in wrapped.eligible_targets
+            )
+        )
+        self.assertEqual(1, len(wrapped.eligible_targets[0]))
+
     def test_planner_honors_the_smallest_worker_working_set_limit(self):
         worker_limit = 4096
         with WorkerServer(
@@ -397,6 +473,30 @@ class DistributedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(
                     completed, pool.discover()[0].health.completed_requests
                 )
+
+    def test_planner_honors_the_client_channel_message_limit(self):
+        client_limit = 8 * 1024
+        with WorkerServer(
+            backend="cpu",
+            worker_id="large-message-worker",
+            max_message_bytes=1024 * 1024,
+        ) as server:
+            with WorkerPool(
+                [server.target],
+                timeout=15.0,
+                max_message_bytes=client_limit,
+            ) as pool:
+                coordinator = DistributedCoordinator(pool, retry_backoff=0.0)
+                series = np.random.default_rng(103).normal(size=220).astype(
+                    np.float32
+                )
+                result = coordinator.selfjoin(series, 16, pearson=True)
+                self.assertEqual(client_limit, result.plan.max_message_bytes)
+                self.assertLess(result.plan.tile_size, series.size - 16 + 1)
+
+    def test_complete_job_rejects_a_window_below_three(self):
+        with self.assertRaisesRegex(ValueError, "at least 3"):
+            self.coordinator.selfjoin(np.arange(8, dtype=np.float32), 2)
 
     def test_worker_pool_discovers_and_fails_over_from_an_offline_peer(self):
         listener = socket.socket()

@@ -127,6 +127,12 @@ b_distances = ab_result.row_values
 print(events[-1].fraction, events[-1].eta_seconds)
 ```
 
+`WorkerPool(max_message_bytes=...)` can lower the client channels' send and
+receive cap when required by the network or process budget. Automatic tile
+planning uses the smallest of that cap and every serving worker's advertised
+limit, so it never schedules a request or expected response the client cannot
+accept.
+
 Like `pyscamp`, output values are Euclidean distances by default; pass
 `pearson=True` for correlations. Global indices remain signed 64-bit values so
 large distributed jobs are not limited to 32-bit offsets. Invalid or flat
@@ -142,6 +148,11 @@ Transient RPC failures are first failed over within `WorkerPool`, then retried
 up to three times by the coordinator. Protocol, authentication, permission,
 and invalid-request errors fail immediately. A retry reuses the request ID, so
 workers and logs can associate attempts with the same tile.
+
+Each job pins scheduling to the serving workers whose protocol, profile,
+precision, message, and working-set capabilities were validated when its plan
+was created. Those workers may recover during a retry; a newly appearing Mac
+joins the next job instead of bypassing the current plan's resource bounds.
 
 ## Execute one tile directly
 

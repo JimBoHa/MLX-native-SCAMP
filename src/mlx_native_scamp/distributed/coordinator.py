@@ -212,6 +212,8 @@ def plan_1nn_tiles(
     ):
         if not isinstance(value, Integral) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    if window < 3:
+        raise ValueError("window must be at least 3")
     if self_join and row_subsequences != column_subsequences:
         raise ValueError("a self-join must have equal row and column dimensions")
     resolved_exclusion = (
@@ -423,13 +425,17 @@ def _execute_with_retries(
     pool: WorkerPool,
     request: messages.ProfileTileRequest,
     *,
+    eligible_targets: frozenset[str],
     max_retries: int,
     retry_backoff: float,
 ) -> tuple[messages.ProfileTileResult, int]:
     retries = 0
     while True:
         try:
-            return pool.execute_tile(request), retries
+            return (
+                pool.execute_tile(request, eligible_targets=eligible_targets),
+                retries,
+            )
         except grpc.RpcError as error:
             if error.code() not in _TRANSIENT_RPC_CODES or retries >= max_retries:
                 raise
@@ -546,8 +552,8 @@ class DistributedCoordinator:
         pearson: bool,
         progress: ProgressCallback | None,
     ) -> Distributed1NNResult:
-        if not isinstance(window, Integral) or window <= 0:
-            raise ValueError("window must be a positive integer")
+        if not isinstance(window, Integral) or window < 3:
+            raise ValueError("window must be an integer at least 3")
         a = np.asarray(series_a, dtype=np.float32)
         b = None if series_b is None else np.asarray(series_b, dtype=np.float32)
         if a.ndim != 1 or (b is not None and b.ndim != 1):
@@ -556,7 +562,18 @@ class DistributedCoordinator:
             raise ValueError("window must fit both input series")
 
         snapshots = self.pool.discover_serving()
-        max_message_bytes, worker_tile_bytes = _validate_worker_capabilities(snapshots)
+        worker_message_bytes, worker_tile_bytes = _validate_worker_capabilities(
+            snapshots
+        )
+        max_message_bytes = min(
+            worker_message_bytes,
+            int(
+                getattr(
+                    self.pool, "max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES
+                )
+            ),
+        )
+        eligible_targets = frozenset(snapshot.target for snapshot in snapshots)
         columns = int(a.size - window + 1)
         rows = columns if b is None else int(b.size - window + 1)
         plan = plan_1nn_tiles(
@@ -629,6 +646,7 @@ class DistributedCoordinator:
                 _execute_with_retries,
                 self.pool,
                 request,
+                eligible_targets=eligible_targets,
                 max_retries=self.max_retries,
                 retry_backoff=self.retry_backoff,
             )

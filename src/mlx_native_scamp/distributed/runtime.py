@@ -429,11 +429,14 @@ class WorkerClient:
         timeout: float = 10.0,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     ) -> None:
+        if max_message_bytes <= 0:
+            raise ValueError("max_message_bytes must be positive")
         self.target = target
         self.timeout = timeout
+        self.max_message_bytes = int(max_message_bytes)
         options = (
-            ("grpc.max_receive_message_length", max_message_bytes),
-            ("grpc.max_send_message_length", max_message_bytes),
+            ("grpc.max_receive_message_length", self.max_message_bytes),
+            ("grpc.max_send_message_length", self.max_message_bytes),
         )
         self.channel = grpc.insecure_channel(target, options=options)
         self.stub = services.ScampWorkerStub(self.channel)
@@ -485,9 +488,23 @@ class WorkerClient:
 class WorkerPool:
     """Small coordinator that discovers workers and schedules single tiles."""
 
-    def __init__(self, targets: Iterable[str], *, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        targets: Iterable[str],
+        *,
+        timeout: float = 10.0,
+        max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+    ) -> None:
+        if max_message_bytes <= 0:
+            raise ValueError("max_message_bytes must be positive")
+        self._max_message_bytes = int(max_message_bytes)
         self._clients = tuple(
-            WorkerClient(target, timeout=timeout) for target in targets
+            WorkerClient(
+                target,
+                timeout=timeout,
+                max_message_bytes=self._max_message_bytes,
+            )
+            for target in targets
         )
         if not self._clients:
             raise ValueError("at least one worker target is required")
@@ -539,17 +556,29 @@ class WorkerPool:
         raise RuntimeError("no serving distributed workers are available")
 
     def execute_tile(
-        self, request: messages.ProfileTileRequest
+        self,
+        request: messages.ProfileTileRequest,
+        *,
+        eligible_targets: frozenset[str] | None = None,
     ) -> messages.ProfileTileResult:
         with self._lock:
-            eligible = tuple(
+            allowed = tuple(
                 client
                 for client in self._clients
+                if eligible_targets is None or client.target in eligible_targets
+            )
+            if not allowed:
+                raise RuntimeError("no eligible distributed workers are configured")
+            eligible = tuple(
+                client
+                for client in allowed
                 if self._preferred_targets is None
                 or client.target in self._preferred_targets
             )
             if not eligible:
-                eligible = self._clients
+                # Health is a snapshot. Retrying the job-approved workers lets
+                # one recover without admitting an unvalidated endpoint.
+                eligible = allowed
             start = self._next_worker % len(eligible)
             candidates = eligible[start:] + eligible[:start]
             self._next_worker = (start + 1) % len(eligible)
@@ -574,6 +603,12 @@ class WorkerPool:
         """Number of configured worker endpoints."""
 
         return len(self._clients)
+
+    @property
+    def max_message_bytes(self) -> int:
+        """Maximum request or response accepted by every client channel."""
+
+        return self._max_message_bytes
 
     def __enter__(self) -> "WorkerPool":
         return self
@@ -602,8 +637,8 @@ def make_tile_request(
     b = None if series_b is None else np.asarray(series_b, dtype=np.float32)
     if a.ndim != 1 or (b is not None and b.ndim != 1):
         raise ValueError("distributed input series must be one-dimensional")
-    if window <= 0 or a.size < window or (b is not None and b.size < window):
-        raise ValueError("window must be positive and fit both input series")
+    if window < 3 or a.size < window or (b is not None and b.size < window):
+        raise ValueError("window must be at least 3 and fit both input series")
     column_count = a.size - window + 1
     row_count = (a if b is None else b).size - window + 1
     resolved_row_stop = row_count if row_stop is None else row_stop
