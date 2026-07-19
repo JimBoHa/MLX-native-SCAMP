@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,8 @@ SENTINEL = -2.0
 FLATNESS_EPSILON = 1e-13
 VALID_PRECISIONS = {"single", "double", "ultra"}
 BLOCK_ROWS = 256
+ROLLING_STATISTICS_BLOCK = 4096
+ROLLING_STATISTICS_SAFETY_FACTOR = 262144.0
 
 
 @dataclass(slots=True)
@@ -162,10 +165,10 @@ def _prepare_series(values: Any, m: int) -> PreparedSeries:
     )
 
 
-def _rolling_mean_and_norm_sq(
+def _rolling_mean_and_norm_sq_scalar(
     clean: np.ndarray, m: int
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Compute sliding statistics without constructing an ``(n, m)`` view.
+    """Compute sliding statistics with SCAMP's compensated scalar recurrence.
 
     The compensated moving sum follows SCAMP's Ogita-style CPU precompute.  A
     remove/add variance recurrence then retains linear time and memory without
@@ -234,6 +237,180 @@ def _rolling_mean_and_norm_sq(
         norms_sq[start] = norm_sq
 
     return means, norms_sq
+
+
+def _rolling_mean_and_norm_sq_vectorized(
+    clean: np.ndarray, m: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Vectorize stable rolling statistics in bounded, checked blocks.
+
+    Each block starts from a high-accuracy window sum and a directly
+    centered norm. NumPy then evaluates the same remove/add mean and variance
+    recurrences as the scalar implementation. Blocks span at least one window,
+    so checkpoint work remains O(n) even when ``m`` is large. Conservative
+    forward-error bounds reject cancellation-sensitive blocks rather than
+    letting a fast approximation change the normalized profile.
+    """
+
+    subsequences = clean.size - m + 1
+    means = np.empty((subsequences,), dtype=np.float64)
+    norms_sq = np.empty((subsequences,), dtype=np.float64)
+    epsilon = np.finfo(np.float64).eps
+    block_span = max(ROLLING_STATISTICS_BLOCK, m)
+
+    for block_start in range(0, subsequences, block_span):
+        block_end = min(block_start + block_span, subsequences)
+        block_size = block_end - block_start
+        window = clean[block_start : block_start + m]
+
+        try:
+            primary_sum = math.fsum(window)
+            absolute_sum = math.fsum(np.abs(window))
+        except (OverflowError, ValueError):
+            return None
+        mean = primary_sum / m
+        differences = window - mean
+        squared_differences = differences * differences
+        norm_sq = float(np.sum(squared_differences, dtype=np.float64))
+        if not np.isfinite(mean) or not np.isfinite(norm_sq):
+            return None
+
+        means[block_start] = mean
+        norms_sq[block_start] = max(norm_sq, 0.0)
+        if block_size == 1:
+            continue
+
+        outgoing = clean[block_start : block_end - 1]
+        incoming = clean[block_start + m : block_end + m - 1]
+        delta = incoming - outgoing
+        absolute_incoming = np.abs(incoming)
+        absolute_outgoing = np.abs(outgoing)
+        delta_round_error = epsilon * (
+            absolute_incoming + absolute_outgoing
+        )
+        cumulative_delta = np.cumsum(delta, dtype=np.float64)
+        block_means = means[block_start:block_end]
+        block_means[1:] = (primary_sum + cumulative_delta) / m
+
+        second_factor = (
+            incoming
+            - block_means[1:]
+            + outgoing
+            - block_means[:-1]
+        )
+        updates = delta * second_factor
+        cumulative_update = np.cumsum(updates, dtype=np.float64)
+        block_norms = norms_sq[block_start:block_end]
+        block_norms[1:] = norm_sq + cumulative_update
+
+        recurrence_arrays = (
+            cumulative_delta,
+            block_means,
+            updates,
+            block_norms,
+        )
+        if any(not np.all(np.isfinite(array)) for array in recurrence_arrays):
+            return None
+
+        steps_epsilon = (block_size - 1) * epsilon
+        window_epsilon = m * epsilon
+        if steps_epsilon >= 1.0 or window_epsilon >= 1.0:
+            return None
+        steps_gamma = steps_epsilon / (1.0 - steps_epsilon)
+        window_gamma = window_epsilon / (1.0 - window_epsilon)
+
+        cumulative_delta_scale = float(np.sum(np.abs(delta), dtype=np.float64))
+        maximum_delta_sum = float(np.max(np.abs(cumulative_delta)))
+        sum_error = (
+            epsilon * absolute_sum
+            + float(np.sum(delta_round_error, dtype=np.float64))
+            + steps_gamma * cumulative_delta_scale
+            + epsilon * (abs(primary_sum) + maximum_delta_sum)
+        )
+        mean_error = sum_error / m
+
+        checkpoint_mean_error = (
+            epsilon * (absolute_sum + abs(primary_sum)) / m
+        )
+        difference_error = (
+            epsilon * (np.abs(window) + abs(mean))
+            + checkpoint_mean_error
+        )
+        initial_norm_error = (
+            (window_gamma + epsilon)
+            * float(np.sum(squared_differences, dtype=np.float64))
+            + 2.0
+            * float(
+                np.sum(
+                    np.abs(differences) * difference_error,
+                    dtype=np.float64,
+                )
+            )
+            + float(np.sum(difference_error * difference_error, dtype=np.float64))
+        )
+        second_factor_error = (
+            2.0 * mean_error
+            + 4.0
+            * epsilon
+            * (
+                absolute_incoming
+                + absolute_outgoing
+                + np.abs(block_means[1:])
+                + np.abs(block_means[:-1])
+            )
+        )
+        update_error = (
+            np.abs(delta) * second_factor_error
+            + delta_round_error * np.abs(second_factor)
+            + 2.0 * epsilon * np.abs(updates)
+        )
+        norm_error = (
+            initial_norm_error
+            + float(np.sum(update_error, dtype=np.float64))
+            + steps_gamma * float(np.sum(np.abs(updates), dtype=np.float64))
+            + epsilon
+            * (abs(norm_sq) + float(np.max(np.abs(cumulative_update))))
+        )
+        if not np.isfinite(mean_error) or not np.isfinite(norm_error):
+            return None
+
+        # The scalar path clamps tiny negative recurrence noise after every
+        # update. Re-run it when vectorized accumulation could cross zero, or
+        # when its forward error exceeds the accepted ~3.8e-6 fraction of the
+        # window's norm or centering scale.
+        if np.any(block_norms < 0.0):
+            return None
+        positive_norms = block_norms[block_norms > 0.0]
+        if positive_norms.size:
+            minimum_norm = float(np.min(positive_norms))
+            minimum_scale = math.sqrt(minimum_norm / m)
+            if (
+                ROLLING_STATISTICS_SAFETY_FACTOR * norm_error >= minimum_norm
+                or ROLLING_STATISTICS_SAFETY_FACTOR * mean_error
+                >= minimum_scale
+                or np.any(
+                    np.abs(block_norms - FLATNESS_EPSILON)
+                    <= ROLLING_STATISTICS_SAFETY_FACTOR * norm_error
+                )
+            ):
+                return None
+        if np.any(block_norms == 0.0):
+            covered = clean[block_start : block_end + m - 1]
+            if not np.all(covered == covered[0]):
+                return None
+
+    return means, norms_sq
+
+
+def _rolling_mean_and_norm_sq(
+    clean: np.ndarray, m: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Use vectorized rolling statistics with an exact scalar fallback."""
+
+    statistics = _rolling_mean_and_norm_sq_vectorized(clean, m)
+    if statistics is not None:
+        return statistics
+    return _rolling_mean_and_norm_sq_scalar(clean, m)
 
 
 def _prepare_metal_recurrence(values: Any, m: int) -> PreparedSeries | None:
