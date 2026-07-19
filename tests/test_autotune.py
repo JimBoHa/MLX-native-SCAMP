@@ -705,6 +705,34 @@ class AutotuneCoreIntegrationTests(unittest.TestCase):
                     )
         self.assertIsNotNone(sparse_workload)
 
+    def test_sum_calibration_handles_empty_and_single_diagonal_self_joins(self):
+        m = 64
+        exclusion = scamp_core.self_join_exclusion(m)
+        scamp_core._AUTOTUNE_SUM_THRESHOLDS.clear()
+        self.addCleanup(scamp_core._AUTOTUNE_SUM_THRESHOLDS.clear)
+        for n_a in (exclusion, exclusion + 1):
+            workload = tuning.AutotuneWorkload(
+                name=f"edge-self-sum-{n_a}",
+                profile="sum_thresh",
+                precision="single",
+                n_a=n_a,
+                n_b=n_a,
+                m=m,
+                self_join=True,
+                threshold_density=0.0,
+            )
+            series = np.random.default_rng(n_a).standard_normal(
+                n_a + m - 1
+            ).astype(np.float32)
+            with self.subTest(n_a=n_a):
+                _, density = scamp_core._autotune_sum_threshold(
+                    workload, series, None
+                )
+                self.assertEqual(
+                    workload.key.profile_bucket,
+                    tuning_cache._density_bucket(density),
+                )
+
     @unittest.skipUnless(mx.metal.is_available(), "Metal is unavailable")
     def test_default_executor_runs_real_portable_and_custom_candidates(self):
         workload = _small_workload(n_a=32, n_b=32, m=8)

@@ -1333,10 +1333,6 @@ def _estimate_metal_sum_density(
 ) -> float | None:
     """Sample the fraction of pairs that would require a Metal atomic add."""
 
-    sample_count = min(256, 262_144 // m)
-    if sample_count < 32:
-        return None
-
     source_a = np.asarray(values_a)
     source_b = source_a if self_join else np.asarray(values_b)
     if source_a.ndim != 1 or source_b.ndim != 1:
@@ -1344,6 +1340,14 @@ def _estimate_metal_sum_density(
     n_a = source_a.size - m + 1
     n_b = source_b.size - m + 1
     if min(n_a, n_b) <= 0:
+        return None
+    exclusion = self_join_exclusion(m) if self_join else 0
+    active_rows = n_a - exclusion
+    if self_join and active_rows <= 0:
+        return 0.0
+
+    sample_count = min(256, 262_144 // m)
+    if sample_count < 32:
         return None
     seed = (
         n_a * 0x9E3779B1
@@ -1354,20 +1358,27 @@ def _estimate_metal_sum_density(
     generator = np.random.default_rng(seed)
 
     if self_join:
-        exclusion = self_join_exclusion(m)
-        sampled_rows: list[int] = []
-        sampled_columns: list[int] = []
-        while len(sampled_rows) < sample_count:
-            candidates = sample_count * 2
-            first = generator.integers(0, n_a, size=candidates)
-            second = generator.integers(0, n_a, size=candidates)
-            rows = np.minimum(first, second)
-            columns = np.maximum(first, second)
-            eligible = columns - rows >= exclusion
-            sampled_rows.extend(rows[eligible].tolist())
-            sampled_columns.extend(columns[eligible].tolist())
-        row_indices = np.asarray(sampled_rows[:sample_count])
-        column_indices = np.asarray(sampled_columns[:sample_count])
+        # Enumerate the eligible upper triangle as one flat range, then invert
+        # triangular offsets. This samples comparisons uniformly without a
+        # rejection loop that degenerates when only a few diagonals remain.
+        total_pairs = active_rows * (active_rows + 1) // 2
+        if total_pairs > np.iinfo(np.int64).max:
+            return None
+        flat_indices = generator.integers(
+            0, total_pairs, size=sample_count, dtype=np.int64
+        )
+        row_indices = np.empty(sample_count, dtype=np.int64)
+        column_indices = np.empty(sample_count, dtype=np.int64)
+        for index, flat_value in enumerate(flat_indices):
+            flat = int(flat_value)
+            remaining = total_pairs - flat
+            tail = (math.isqrt(8 * remaining + 1) - 1) // 2
+            if tail * (tail + 1) // 2 < remaining:
+                tail += 1
+            row = active_rows - tail
+            row_start = total_pairs - tail * (tail + 1) // 2
+            row_indices[index] = row
+            column_indices[index] = row + exclusion + flat - row_start
     else:
         column_indices = generator.integers(0, n_a, size=sample_count)
         row_indices = generator.integers(0, n_b, size=sample_count)
