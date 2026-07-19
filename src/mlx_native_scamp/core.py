@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import itertools
 import math
 import operator
+import threading
+import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any
+from typing import Any, Literal
 
 import mlx.core as mx
 import numpy as np
@@ -81,6 +85,121 @@ class ReducerScheduler:
 class _ResolvedTuningStrategy:
     strategy: Any | None
     sum_density: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionDecision:
+    join: Literal["selfjoin", "abjoin"]
+    profile: str
+    subsequences_a: int
+    subsequences_b: int
+    window: int
+    precision: str
+    compute_dtype: Literal["float32", "float64"]
+    backend: Literal["cpu", "portable_metal", "custom_metal"]
+    implementation: str
+    max_tile_size: int
+    geometry: Literal["portable", "full-diagonal"]
+    tile_rows: int | None = None
+    tile_columns: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionEvent:
+    operation_id: int
+    phase: Literal["start", "complete", "error"]
+    decision: _ExecutionDecision
+    elapsed_ns: int | None = None
+    error_type: str | None = None
+
+
+ExecutionEventSink = Callable[[_ExecutionEvent], None]
+_EXECUTION_EVENT_LOCK = threading.Lock()
+_EXECUTION_OPERATION_IDS = itertools.count(1)
+
+
+def _format_execution_event(event: _ExecutionEvent) -> str:
+    decision = event.decision
+    prefix = (
+        f"mlx-scamp op={event.operation_id} "
+        f"{decision.join}/{decision.profile} {event.phase}:"
+    )
+    if event.phase == "start":
+        if decision.geometry == "portable":
+            geometry = f"{decision.tile_rows}x{decision.tile_columns}"
+        else:
+            geometry = decision.geometry
+        return (
+            f"{prefix} a_subsequences={decision.subsequences_a} "
+            f"b_subsequences={decision.subsequences_b} "
+            f"window={decision.window} precision={decision.precision} "
+            f"dtype={decision.compute_dtype} backend={decision.backend} "
+            f"implementation={decision.implementation} "
+            f"max_tile_size={decision.max_tile_size} geometry={geometry}"
+        )
+    elapsed = 0 if event.elapsed_ns is None else event.elapsed_ns
+    suffix = (
+        f"backend={decision.backend} "
+        f"implementation={decision.implementation} "
+        f"elapsed={elapsed / 1_000_000_000:.6f}s"
+    )
+    if event.phase == "error":
+        suffix += f" exception={event.error_type or 'Exception'}"
+    return f"{prefix} {suffix}"
+
+
+def _stdout_execution_event(event: _ExecutionEvent) -> None:
+    print(_format_execution_event(event))
+
+
+_EXECUTION_EVENT_SINK: ExecutionEventSink = _stdout_execution_event
+
+
+def _start_execution_event(decision: _ExecutionDecision) -> int:
+    with _EXECUTION_EVENT_LOCK:
+        operation_id = next(_EXECUTION_OPERATION_IDS)
+        _EXECUTION_EVENT_SINK(
+            _ExecutionEvent(operation_id, "start", decision)
+        )
+    return operation_id
+
+
+def _finish_execution_event(event: _ExecutionEvent) -> None:
+    with _EXECUTION_EVENT_LOCK:
+        _EXECUTION_EVENT_SINK(event)
+
+
+def _execute_with_reporting(
+    decision: _ExecutionDecision,
+    started_ns: int,
+    operation: Callable[[], Any],
+) -> Any:
+    operation_id = _start_execution_event(decision)
+    try:
+        result = operation()
+        # MLX is lazy. Completion is not truthful until all scheduled device
+        # work has finished, so verbose timing alone pays this synchronization.
+        mx.synchronize()
+    except Exception as exc:
+        _finish_execution_event(
+            _ExecutionEvent(
+                operation_id,
+                "error",
+                decision,
+                elapsed_ns=time.perf_counter_ns() - started_ns,
+                error_type=type(exc).__name__,
+            )
+        )
+        raise
+    _finish_execution_event(
+        _ExecutionEvent(
+            operation_id,
+            "complete",
+            decision,
+            elapsed_ns=time.perf_counter_ns() - started_ns,
+        )
+    )
+    return result
 
 
 def _schedule_reducer_state(*state: Any) -> None:
@@ -1654,6 +1773,8 @@ def _run_profile(
     use_metal_sum: bool = False,
     portable_row_cap: int = BLOCK_ROWS,
     sum_density: float | None = None,
+    verbose: bool = False,
+    portable_backend: Literal["cpu", "portable_metal"] | None = None,
 ):
     m = _normalize_window_size(m)
     effective_max_tile_size = (
@@ -1695,6 +1816,8 @@ def _run_profile(
             raise ValueError(
                 f"mheight must be less than or equal to the number of subsequences in {height_series}"
             )
+
+    started_ns = time.perf_counter_ns() if verbose else None
 
     self_join = not has_b
     join_fits_tile = (
@@ -1759,9 +1882,19 @@ def _run_profile(
             and recurrence_b is not None
             and _metal_recurrence_is_safe(recurrence_a, recurrence_b, m)
         ):
-            if profile in {"1nn", "1nn_value"}:
-                if profile == "1nn_value":
-                    return _best_match_values(
+            def execute_custom() -> Any:
+                if profile in {"1nn", "1nn_value"}:
+                    if profile == "1nn_value":
+                        return _best_match_values(
+                            recurrence_a,
+                            recurrence_b,
+                            m,
+                            pearson,
+                            self_join,
+                            exclusion,
+                            True,
+                        )
+                    return _best_match_profile(
                         recurrence_a,
                         recurrence_b,
                         m,
@@ -1770,45 +1903,65 @@ def _run_profile(
                         exclusion,
                         True,
                     )
-                return _best_match_profile(
+                if profile == "1nn_bidirectional":
+                    return _bidirectional_best_match_profile(
+                        recurrence_a,
+                        recurrence_b,
+                        m,
+                        pearson,
+                        exclusion,
+                        True,
+                    )
+                if profile == "sum":
+                    return _sum_threshold_profile(
+                        recurrence_a,
+                        recurrence_b,
+                        m,
+                        threshold,
+                        self_join,
+                        exclusion,
+                        True,
+                    )
+                return _matrix_summary(
                     recurrence_a,
                     recurrence_b,
                     m,
                     pearson,
-                    self_join,
-                    exclusion,
-                    True,
-                )
-            if profile == "1nn_bidirectional":
-                return _bidirectional_best_match_profile(
-                    recurrence_a,
-                    recurrence_b,
-                    m,
-                    pearson,
-                    exclusion,
-                    True,
-                )
-            if profile == "sum":
-                return _sum_threshold_profile(
-                    recurrence_a,
-                    recurrence_b,
-                    m,
                     threshold,
+                    mheight,
+                    mwidth,
                     self_join,
                     exclusion,
-                    True,
+                    use_metal_kernel=True,
                 )
-            return _matrix_summary(
-                recurrence_a,
-                recurrence_b,
-                m,
-                pearson,
-                threshold,
-                mheight,
-                mwidth,
-                self_join,
-                exclusion,
-                use_metal_kernel=True,
+
+            if not verbose:
+                return execute_custom()
+            implementation = {
+                "1nn": "metal_1nn",
+                "1nn_value": "metal_1nn",
+                "1nn_bidirectional": "metal_bidirectional",
+                "sum": "metal_sum",
+                "matrix": "metal_matrix",
+            }[profile]
+            decision = _ExecutionDecision(
+                join="selfjoin" if self_join else "abjoin",
+                profile=profile,
+                subsequences_a=subsequences_a,
+                subsequences_b=subsequences_b,
+                window=m,
+                precision=precision,
+                compute_dtype=(
+                    "float32" if compute_dtype == mx.float32 else "float64"
+                ),
+                backend="custom_metal",
+                implementation=implementation,
+                max_tile_size=effective_max_tile_size,
+                geometry="full-diagonal",
+            )
+            assert started_ns is not None
+            return _execute_with_reporting(
+                decision, started_ns, execute_custom
             )
 
     # Portable reducers normalize only overlapping tile segments. The full
@@ -1827,82 +1980,109 @@ def _run_profile(
         prepared_a if self_join else _prepare_tiled_series(series_b, m)
     )
 
-    if profile == "1nn_value":
-        return _best_match_values(
-            prepared_a,
-            prepared_b,
-            m,
-            pearson,
-            self_join,
-            exclusion,
-            False,
-            tile_rows,
-            tile_columns,
+    def execute_portable() -> Any:
+        if profile == "1nn_value":
+            return _best_match_values(
+                prepared_a,
+                prepared_b,
+                m,
+                pearson,
+                self_join,
+                exclusion,
+                False,
+                tile_rows,
+                tile_columns,
+            )
+        if profile == "1nn":
+            return _best_match_profile(
+                prepared_a,
+                prepared_b,
+                m,
+                pearson,
+                self_join,
+                exclusion,
+                False,
+                tile_rows,
+                tile_columns,
+            )
+        if profile == "1nn_bidirectional":
+            return _bidirectional_best_match_profile(
+                prepared_a,
+                prepared_b,
+                m,
+                pearson,
+                exclusion,
+                False,
+                tile_rows,
+                tile_columns,
+            )
+        if profile == "sum":
+            return _sum_threshold_profile(
+                prepared_a,
+                prepared_b,
+                m,
+                threshold,
+                self_join,
+                exclusion,
+                False,
+                tile_rows,
+                tile_columns,
+            )
+        if profile == "matrix":
+            return _matrix_summary(
+                prepared_a,
+                prepared_b,
+                m,
+                pearson,
+                threshold,
+                mheight,
+                mwidth,
+                self_join,
+                exclusion,
+                tile_rows=tile_rows,
+                tile_columns=tile_columns,
+            )
+        if profile == "knn":
+            if k is None or k <= 0:
+                raise ValueError("k must be greater than 0")
+            return _knn_profile(
+                prepared_a,
+                prepared_b,
+                m,
+                k,
+                threshold,
+                pearson,
+                exclusion,
+                tile_rows,
+                tile_columns,
+            )
+        raise ValueError(f"Unknown profile type: {profile}")
+
+    if not verbose:
+        return execute_portable()
+    if portable_backend is None:
+        portable_backend = (
+            "cpu" if mx.default_device() == mx.cpu else "portable_metal"
         )
-    if profile == "1nn":
-        return _best_match_profile(
-            prepared_a,
-            prepared_b,
-            m,
-            pearson,
-            self_join,
-            exclusion,
-            False,
-            tile_rows,
-            tile_columns,
-        )
-    if profile == "1nn_bidirectional":
-        return _bidirectional_best_match_profile(
-            prepared_a,
-            prepared_b,
-            m,
-            pearson,
-            exclusion,
-            False,
-            tile_rows,
-            tile_columns,
-        )
-    if profile == "sum":
-        return _sum_threshold_profile(
-            prepared_a,
-            prepared_b,
-            m,
-            threshold,
-            self_join,
-            exclusion,
-            False,
-            tile_rows,
-            tile_columns,
-        )
-    if profile == "matrix":
-        return _matrix_summary(
-            prepared_a,
-            prepared_b,
-            m,
-            pearson,
-            threshold,
-            mheight,
-            mwidth,
-            self_join,
-            exclusion,
-            tile_rows=tile_rows,
-            tile_columns=tile_columns,
-        )
-    if profile == "knn":
-        if k is None or k <= 0:
-            raise ValueError("k must be greater than 0")
-        return _knn_profile(
-            prepared_a,
-            prepared_b,
-            m,
-            k,
-            threshold,
-            pearson,
-            exclusion,
-            tile_rows,
-            tile_columns,
-        )
-    raise ValueError(f"Unknown profile type: {profile}")
+    decision = _ExecutionDecision(
+        join="selfjoin" if self_join else "abjoin",
+        profile=profile,
+        subsequences_a=subsequences_a,
+        subsequences_b=subsequences_b,
+        window=m,
+        precision=precision,
+        compute_dtype=(
+            "float32" if compute_dtype == mx.float32 else "float64"
+        ),
+        backend=portable_backend,
+        implementation="portable",
+        max_tile_size=effective_max_tile_size,
+        geometry="portable",
+        tile_rows=tile_rows,
+        tile_columns=tile_columns,
+    )
+    assert started_ns is not None
+    return _execute_with_reporting(decision, started_ns, execute_portable)
 
 
 def _resolve_execution_stream(params: dict[str, Any]) -> Any | None:
@@ -2093,6 +2273,12 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
         if execution_stream is None
         else execution_stream.device
     )
+    verbose = params.get("verbose", False)
+    portable_backend: Literal["cpu", "portable_metal"] | None = (
+        ("cpu" if execution_device == mx.cpu else "portable_metal")
+        if verbose
+        else None
+    )
     custom_metal = tuning_strategy is None or tuning_strategy.route.startswith(
         "metal_"
     )
@@ -2122,6 +2308,8 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
             use_metal_sum=use_metal_1nn,
             portable_row_cap=portable_row_cap,
             sum_density=sum_density,
+            verbose=verbose,
+            portable_backend=portable_backend,
             **kwargs,
         )
 
