@@ -17,12 +17,32 @@ The package provides an MLX-native `pyscamp`-compatible import surface for the f
 The implementation is pure Python plus MLX and is meant to be called by other apps without requiring CUDA.
 All nine upstream `pyscamp` callables are implemented in the local MLX engine rather than delegated back to CUDA SCAMP.
 
-## Native C++ library
+## Native C++ library and CLI
 
 The repository also contains an initial native C++ API compatible with
 SCAMP's `SCAMPArgs`, `Profile`, and `do_SCAMP` concepts. It links directly to
 MLX's C++ library and executes indexed 1NN self/AB joins with a custom Metal
 diagonal-recurrence kernel; it does not launch or embed Python.
+
+Top-level CMake builds also produce `mlx-scamp-native`, a native executable
+linked to that library. Its distinct name avoids a case-insensitive APFS name
+collision with the Python `scamp` entry point. The current CLI intentionally
+accepts only the implemented indexed-1NN/single-precision capability:
+
+```bash
+mlx-scamp-native \
+  --window=128 \
+  --input_a_file_name=series.txt \
+  --single_precision \
+  --output_a_file_name=profile.txt \
+  --output_a_index_file_name=index.txt
+```
+
+It supports self joins, one- or two-sided AB joins (`--keep_rows`), Pearson or
+default z-normalized Euclidean output, and aligned distributed offsets. Input
+is whitespace-delimited text. Unsupported upstream reducers and execution
+modes fail before input is read or output is touched; output sets are fully
+staged, fsynced, and then committed with rollback protection.
 
 See [`cpp/README.md`](cpp/README.md) for build instructions, current coverage,
 and the remaining C++ parity work.
