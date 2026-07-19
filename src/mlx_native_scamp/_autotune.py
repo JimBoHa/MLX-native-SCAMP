@@ -50,7 +50,10 @@ class AutotuneWorkload:
         return cache.make_workload_key(
             self.profile,
             self.precision,
-            self.route,
+            # ``route`` constrains the candidates measured by a native custom
+            # plan. Winners still target implicit (auto) joins; explicit
+            # gpus/threads always bypass recommendations.
+            "auto",
             self.n_a,
             self.n_b,
             self.m,
@@ -138,48 +141,112 @@ def _workload(
 def _quick_workloads() -> tuple[AutotuneWorkload, ...]:
     workloads: list[AutotuneWorkload] = []
     representatives = (
-        ("1nn_index", dict(n_a=512, n_b=512, m=64, self_join=True)),
-        ("1nn_value", dict(n_a=384, n_b=512, m=48, self_join=False)),
+        (
+            "1nn_index",
+            (
+                ("self", dict(n_a=512, n_b=512, m=64, self_join=True)),
+                ("ab", dict(n_a=384, n_b=512, m=48, self_join=False)),
+            ),
+        ),
+        (
+            "1nn_value",
+            (
+                ("self", dict(n_a=384, n_b=384, m=48, self_join=True)),
+                ("ab", dict(n_a=384, n_b=512, m=48, self_join=False)),
+            ),
+        ),
         (
             "sum_thresh",
-            dict(
-                n_a=512,
-                n_b=512,
-                m=64,
-                self_join=True,
-                threshold_density=0.1,
+            (
+                (
+                    "self",
+                    dict(
+                        n_a=512,
+                        n_b=512,
+                        m=64,
+                        self_join=True,
+                        threshold_density=0.1,
+                    ),
+                ),
+                (
+                    "ab",
+                    dict(
+                        n_a=384,
+                        n_b=512,
+                        m=64,
+                        self_join=False,
+                        threshold_density=0.1,
+                    ),
+                ),
             ),
         ),
         (
             "matrix_summary",
-            dict(
-                n_a=512,
-                n_b=384,
-                m=64,
-                self_join=False,
-                matrix_shape=(16, 16),
+            (
+                (
+                    "self",
+                    dict(
+                        n_a=384,
+                        n_b=384,
+                        m=48,
+                        self_join=True,
+                        matrix_shape=(16, 16),
+                    ),
+                ),
+                (
+                    "ab",
+                    dict(
+                        n_a=512,
+                        n_b=384,
+                        m=64,
+                        self_join=False,
+                        matrix_shape=(16, 16),
+                    ),
+                ),
             ),
         ),
         (
             "knn",
-            dict(n_a=384, n_b=384, m=48, self_join=True, k=4),
+            (
+                (
+                    "self",
+                    dict(
+                        n_a=384,
+                        n_b=384,
+                        m=48,
+                        self_join=True,
+                        k=4,
+                    ),
+                ),
+                (
+                    "ab",
+                    dict(
+                        n_a=384,
+                        n_b=512,
+                        m=48,
+                        self_join=False,
+                        k=4,
+                    ),
+                ),
+            ),
         ),
     )
-    for profile, parameters in representatives:
-        for precision in ("single", "double"):
-            workloads.append(
-                _workload(
-                    f"quick-{profile}-{precision}",
-                    profile,
-                    precision,
-                    **parameters,
+    for profile, join_variants in representatives:
+        for join_name, parameters in join_variants:
+            for precision in ("single", "double"):
+                workloads.append(
+                    _workload(
+                        f"quick-{profile}-{join_name}-{precision}",
+                        profile,
+                        precision,
+                        **parameters,
+                    )
                 )
-            )
     return tuple(workloads)
 
 
 def _full_workloads() -> tuple[AutotuneWorkload, ...]:
-    return _quick_workloads() + (
+    extended = (
         _workload(
             "full-large-1nn-index-single",
             "1nn_index",
@@ -202,11 +269,11 @@ def _full_workloads() -> tuple[AutotuneWorkload, ...]:
             "full-sparse-sum-single",
             "sum_thresh",
             "single",
-            n_a=2048,
-            n_b=2048,
+            n_a=4096,
+            n_b=4096,
             m=96,
             self_join=True,
-            threshold_density=0.01,
+            threshold_density=0.03,
         ),
         _workload(
             "full-dense-sum-double",
@@ -257,6 +324,31 @@ def _full_workloads() -> tuple[AutotuneWorkload, ...]:
             self_join=False,
         ),
     )
+    aligned: list[AutotuneWorkload] = []
+    aligned_profiles = (
+        ("1nn_index", {}),
+        ("1nn_value", {}),
+        ("sum_thresh", {"threshold_density": 0.1}),
+        ("matrix_summary", {"matrix_shape": (16, 16)}),
+        ("knn", {"k": 4}),
+        ("bidirectional_ab", {}),
+    )
+    for profile, controls in aligned_profiles:
+        for precision in ("single", "double"):
+            aligned.append(
+                _workload(
+                    f"full-aligned-{profile}-{precision}",
+                    profile,
+                    precision,
+                    n_a=768,
+                    n_b=768,
+                    m=64,
+                    self_join=False,
+                    aligned=True,
+                    **controls,
+                )
+            )
+    return _quick_workloads() + extended + tuple(aligned)
 
 
 def autotune_plan(mode: AutotuneMode = "quick") -> AutotunePlan:
@@ -588,7 +680,12 @@ def run_autotune(
         )
 
         reference_strategy = min(
-            (strategy for strategy in strategies if strategy.route == "cpu"),
+            (
+                strategy
+                for strategy in cache.STRATEGIES
+                if strategy.profile == workload.profile
+                and strategy.route == "cpu"
+            ),
             key=lambda strategy: (
                 _describe_strategy(strategy).resource_rank,
                 strategy.name,

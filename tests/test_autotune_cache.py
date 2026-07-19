@@ -53,9 +53,11 @@ def _record(key, candidate, created_ns=1):
 
 class AutotuneCacheTests(unittest.TestCase):
     def setUp(self):
+        cache._sidecar_exists_once.cache_clear()
         cache._load_records_once.cache_clear()
 
     def tearDown(self):
+        cache._sidecar_exists_once.cache_clear()
         cache._load_records_once.cache_clear()
 
     def test_sidecar_never_reuses_upstream_cache_file(self):
@@ -159,6 +161,8 @@ class AutotuneCacheTests(unittest.TestCase):
         }
 
         with mock.patch.object(
+            cache, "_sidecar_exists_once", return_value=True
+        ), mock.patch.object(
             cache, "_read_payload", return_value=payload
         ) as read_payload:
             first = cache.lookup_record(current.key, "cache.txt")
@@ -167,6 +171,30 @@ class AutotuneCacheTests(unittest.TestCase):
         self.assertEqual(current, first)
         self.assertIs(first, second)
         read_payload.assert_called_once()
+
+    def test_missing_sidecar_skips_hardware_fingerprint_and_caches_stat(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            cache,
+            "environment_id",
+            side_effect=AssertionError("hardware fingerprinted"),
+        ):
+            upstream = str(Path(temp_dir) / "autotune.txt")
+            self.assertEqual((), cache.load_records(upstream))
+            self.assertEqual((), cache.load_records(upstream))
+
+        info = cache._sidecar_exists_once.cache_info()
+        self.assertEqual(1, info.misses)
+        self.assertEqual(1, info.hits)
+
+    def test_save_invalidates_a_cached_missing_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upstream = str(Path(temp_dir) / "autotune.txt")
+            self.assertEqual((), cache.load_records(upstream))
+            record = _record(_key(), "1nn_index:cpu:rows-64")
+
+            cache.save_record(record, upstream)
+
+            self.assertEqual(record, cache.lookup_record(record.key, upstream))
 
     def test_malformed_and_oversized_files_are_tolerated(self):
         with tempfile.TemporaryDirectory() as temp_dir:

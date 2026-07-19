@@ -82,8 +82,8 @@ profile, index = mp.selfjoin(series, 128, max_tile_size=4096)
 
 Autotuning is explicit: importing the package and running an untuned join do
 not launch benchmarks. The upstream-compatible entry point runs a bounded
-quick plan covering all five upstream profile families in single and double
-precision:
+quick plan covering self-joins and AB-joins for all five upstream profile
+families in single and double precision:
 
 ```python
 import pyscamp
@@ -91,8 +91,9 @@ import pyscamp
 pyscamp.autotune()
 ```
 
-Native integrations can inspect the plan, opt into the larger asymmetric
-plan, inspect cache status, or reset only the MLX records:
+Native integrations can inspect the plan, opt into the larger asymmetric plan
+with aligned AB and bidirectional coverage, inspect cache status, or reset only
+the MLX records:
 
 ```python
 import mlx_native_scamp as mlx_scamp

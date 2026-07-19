@@ -77,6 +77,20 @@ class ReducerScheduler:
             self.pending = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedTuningStrategy:
+    strategy: Any
+    sum_density: float | None = None
+
+    @property
+    def route(self) -> str:
+        return self.strategy.route
+
+    @property
+    def parameters(self) -> tuple[tuple[str, int], ...]:
+        return self.strategy.parameters
+
+
 def _schedule_reducer_state(*state: Any) -> None:
     """Schedule compact state so MLX can release its similarity block."""
     mx.async_eval(*state)
@@ -1331,14 +1345,14 @@ def _estimate_metal_sum_density(
     if sample_count < 32:
         return None
 
-    source_a = np.asarray(values_a, dtype=np.float32).astype(np.float64)
-    source_b = (
-        source_a
-        if self_join
-        else np.asarray(values_b, dtype=np.float32).astype(np.float64)
-    )
+    source_a = np.asarray(values_a)
+    source_b = source_a if self_join else np.asarray(values_b)
+    if source_a.ndim != 1 or source_b.ndim != 1:
+        return None
     n_a = source_a.size - m + 1
     n_b = source_b.size - m + 1
+    if min(n_a, n_b) <= 0:
+        return None
     seed = (
         n_a * 0x9E3779B1
         + n_b * 0x85EBCA6B
@@ -1366,24 +1380,25 @@ def _estimate_metal_sum_density(
         column_indices = generator.integers(0, n_a, size=sample_count)
         row_indices = generator.integers(0, n_b, size=sample_count)
 
-    finite_a = np.isfinite(source_a)
-    finite_b = finite_a if self_join else np.isfinite(source_b)
-    if np.any(finite_a):
-        source_a[finite_a] -= source_a[finite_a][0]
-    if not self_join and np.any(finite_b):
-        source_b[finite_b] -= source_b[finite_b][0]
-    source_a[~finite_a] = 0.0
-    if not self_join:
-        source_b[~finite_b] = 0.0
-
     offsets = np.arange(m)
     a_positions = column_indices[:, None] + offsets
     b_positions = row_indices[:, None] + offsets
-    windows_a = source_a[a_positions]
-    windows_b = source_b[b_positions]
-    valid = np.all(finite_a[a_positions], axis=1) & np.all(
-        finite_b[b_positions], axis=1
-    )
+    with np.errstate(over="ignore", invalid="ignore"):
+        windows_a = np.asarray(
+            source_a[a_positions], dtype=np.float32
+        ).astype(np.float64)
+        windows_b = np.asarray(
+            source_b[b_positions], dtype=np.float32
+        ).astype(np.float64)
+    finite_a = np.isfinite(windows_a)
+    finite_b = np.isfinite(windows_b)
+    valid = np.all(finite_a, axis=1) & np.all(finite_b, axis=1)
+    windows_a[~finite_a] = 0.0
+    windows_b[~finite_b] = 0.0
+    # Per-window translation is correlation-invariant and avoids cancellation
+    # without copying the complete input into a float64 sampling buffer.
+    windows_a -= windows_a[:, :1]
+    windows_b -= windows_b[:, :1]
     windows_a -= np.mean(windows_a, axis=1, keepdims=True)
     windows_b -= np.mean(windows_b, axis=1, keepdims=True)
     norm_a_sq = np.sum(windows_a * windows_a, axis=1)
@@ -1410,6 +1425,7 @@ def _metal_sum_is_worthwhile(
     m: int,
     threshold: float,
     self_join: bool,
+    qualifying_density: float | None = None,
 ) -> bool:
     """Estimate whether sparse Metal SUM should beat the portable reducer."""
 
@@ -1417,9 +1433,11 @@ def _metal_sum_is_worthwhile(
         column_subsequences, row_subsequences, m, 0.0, self_join
     ):
         return False
-    density = _estimate_metal_sum_density(
-        values_a, values_b, m, threshold, self_join
-    )
+    density = qualifying_density
+    if density is None:
+        density = _estimate_metal_sum_density(
+            values_a, values_b, m, threshold, self_join
+        )
     return density is not None and _metal_sum_workload_is_worthwhile(
         column_subsequences, row_subsequences, m, density, self_join
     )
@@ -1632,6 +1650,7 @@ def _run_profile(
     use_metal_matrix: bool = False,
     use_metal_sum: bool = False,
     portable_row_cap: int = BLOCK_ROWS,
+    sum_density: float | None = None,
 ):
     m = _normalize_window_size(m)
     effective_max_tile_size = (
@@ -1699,6 +1718,7 @@ def _run_profile(
             m,
             threshold,
             self_join,
+            sum_density,
         )
     )
     matrix_recurrence = (
@@ -1909,6 +1929,29 @@ def _sequence_length_for_tuning(values: Any) -> int | None:
         return None
 
 
+def _source_dtype_class_for_tuning(a: Any, b: Any | None) -> str:
+    def classify(values: Any) -> str:
+        if isinstance(values, mx.array):
+            if values.dtype == mx.float32:
+                return "float32"
+            if values.dtype == mx.float64:
+                return "float64"
+            return "other"
+        try:
+            dtype = np.asarray(values).dtype
+        except (TypeError, ValueError):
+            return "other"
+        if dtype == np.dtype(np.float32):
+            return "float32"
+        if dtype == np.dtype(np.float64):
+            return "float64"
+        return "other"
+
+    class_a = classify(a)
+    class_b = class_a if b is None else classify(b)
+    return class_a if class_a == class_b else "other"
+
+
 def _implicit_tuning_strategy(
     params: dict[str, Any], args: tuple[Any, ...], kwargs: dict[str, Any]
 ):
@@ -1941,10 +1984,24 @@ def _implicit_tuning_strategy(
 
     from ._autotune_cache import (
         STRATEGY_BY_NAME,
+        load_records,
         lookup_record,
         make_workload_key,
     )
 
+    key_arguments = {
+        "self_join": b is None,
+        "aligned": b is not None
+        and not params.get("allow_trivial_match", True),
+        "dtype_class": _source_dtype_class_for_tuning(a, b),
+        "max_tile_size": params["max_tile_size"],
+        "k": kwargs.get("k"),
+        "matrix_shape": (
+            (kwargs.get("mheight"), kwargs.get("mwidth"))
+            if family == "matrix_summary"
+            else None
+        ),
+    }
     key = make_workload_key(
         family,
         params["precision"],
@@ -1952,23 +2009,60 @@ def _implicit_tuning_strategy(
         n_a,
         n_b,
         m,
-        self_join=b is None,
-        aligned=b is not None
-        and not params.get("allow_trivial_match", True),
-        dtype_class=(
-            "float32"
-            if _is_float32_input(a)
-            and (b is None or _is_float32_input(b))
-            else "other"
-        ),
-        max_tile_size=params["max_tile_size"],
-        k=kwargs.get("k"),
-        matrix_shape=(kwargs.get("mheight"), kwargs.get("mwidth"))
-        if family == "matrix_summary"
-        else None,
+        **key_arguments,
     )
     record = lookup_record(key)
-    return None if record is None else STRATEGY_BY_NAME[record.candidate]
+    if record is not None:
+        return _ResolvedTuningStrategy(STRATEGY_BY_NAME[record.candidate])
+    if family != "sum_thresh":
+        return None
+
+    # Density sampling is bounded to the sampled windows and is performed only
+    # when this environment actually has a record for the otherwise-identical
+    # SUM workload. Cache misses retain the untuned path without input work.
+    comparable_fields = tuple(
+        name
+        for name in type(key).__dataclass_fields__
+        if name != "profile_bucket"
+    )
+    signature = tuple(getattr(key, name) for name in comparable_fields)
+    if not any(
+        tuple(getattr(candidate.key, name) for name in comparable_fields)
+        == signature
+        for candidate in load_records()
+    ):
+        return None
+    try:
+        if b is None and n_a <= self_join_exclusion(m):
+            threshold_density = 0.0
+        else:
+            threshold_density = _estimate_metal_sum_density(
+                a,
+                a if b is None else b,
+                m,
+                float(kwargs.get("threshold", 0.0)),
+                b is None,
+            )
+    except (TypeError, ValueError, OverflowError, MemoryError):
+        return None
+    if threshold_density is None:
+        return None
+    key = make_workload_key(
+        family,
+        params["precision"],
+        "auto",
+        n_a,
+        n_b,
+        m,
+        threshold_density=threshold_density,
+        **key_arguments,
+    )
+    record = lookup_record(key)
+    if record is None:
+        return None
+    return _ResolvedTuningStrategy(
+        STRATEGY_BY_NAME[record.candidate], threshold_density
+    )
 
 
 def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
@@ -2002,6 +2096,11 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
         portable_row_cap = dict(tuning_strategy.parameters).get(
             "portable_row_cap", BLOCK_ROWS
         )
+    sum_density = (
+        None
+        if tuning_strategy is None
+        else getattr(tuning_strategy, "sum_density", None)
+    )
     stream_context = (
         nullcontext()
         if execution_stream is None
@@ -2016,8 +2115,58 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
             use_metal_matrix=use_metal_1nn,
             use_metal_sum=use_metal_1nn,
             portable_row_cap=portable_row_cap,
+            sum_density=sum_density,
             **kwargs,
         )
+
+
+_AUTOTUNE_SUM_THRESHOLDS: dict[tuple[Any, ...], tuple[float, float]] = {}
+
+
+def _autotune_sum_threshold(
+    workload: Any, a: np.ndarray, b: np.ndarray | None
+) -> tuple[float, float]:
+    target = workload.threshold_density
+    if target is None:
+        raise ValueError("SUM autotune workloads require threshold density")
+    cache_key = (
+        workload.name,
+        workload.precision,
+        workload.n_a,
+        workload.n_b,
+        workload.m,
+        workload.self_join,
+        float(target),
+    )
+    cached = _AUTOTUNE_SUM_THRESHOLDS.get(cache_key)
+    if cached is not None:
+        return cached
+
+    values_b = a if b is None else b
+    lower = -1.0
+    upper = 1.0
+    selected_density = _estimate_metal_sum_density(
+        a, values_b, workload.m, upper, workload.self_join
+    )
+    if selected_density is None:
+        raise RuntimeError("SUM density sampling is unavailable")
+    for _ in range(16):
+        midpoint = (lower + upper) / 2.0
+        density = _estimate_metal_sum_density(
+            a, values_b, workload.m, midpoint, workload.self_join
+        )
+        if density is None:
+            raise RuntimeError("SUM density sampling is unavailable")
+        if density > target:
+            lower = midpoint
+        else:
+            upper = midpoint
+            selected_density = density
+    result = (upper, selected_density)
+    if len(_AUTOTUNE_SUM_THRESHOLDS) >= 64:
+        _AUTOTUNE_SUM_THRESHOLDS.pop(next(iter(_AUTOTUNE_SUM_THRESHOLDS)))
+    _AUTOTUNE_SUM_THRESHOLDS[cache_key] = result
+    return result
 
 
 def _autotune_execute_candidate(workload: Any, strategy: Any) -> Any:
@@ -2054,28 +2203,17 @@ def _autotune_execute_candidate(workload: Any, strategy: Any) -> Any:
         "bidirectional_ab": "1nn_bidirectional",
     }[workload.profile]
     threshold = 0.0
+    sum_density = None
     if workload.profile == "sum_thresh":
-        density = workload.threshold_density
-        if density is None:
-            raise ValueError("SUM autotune workloads require threshold density")
-        if density <= 0.02:
-            threshold = min(0.95, 2.33 / math.sqrt(workload.m))
-        elif density <= 0.2:
-            threshold = min(0.95, 1.28 / math.sqrt(workload.m))
-        elif density <= 0.5:
-            threshold = 0.0
-        else:
-            threshold = -0.25
+        threshold, sum_density = _autotune_sum_threshold(workload, a, b)
     elif workload.profile == "matrix_summary":
         threshold = -1.0
 
-    if route == "metal_sum" and not _metal_sum_is_worthwhile(
-        a,
-        a if b is None else b,
+    if route == "metal_sum" and not _metal_sum_workload_is_worthwhile(
         workload.n_a,
         workload.n_b,
         workload.m,
-        threshold,
+        0.0 if sum_density is None else sum_density,
         workload.self_join,
     ):
         raise RuntimeError("sparse Metal SUM is ineligible for this density")
@@ -2091,6 +2229,7 @@ def _autotune_execute_candidate(workload: Any, strategy: Any) -> Any:
         "use_metal_matrix": custom_metal,
         "use_metal_sum": custom_metal,
         "portable_row_cap": row_cap,
+        "sum_density": sum_density,
     }
     if workload.profile == "matrix_summary":
         if workload.matrix_shape is None:

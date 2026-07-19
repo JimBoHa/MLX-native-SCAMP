@@ -87,9 +87,19 @@ class AutotunePlanTests(unittest.TestCase):
             for precision in ("single", "double")
         }
         self.assertEqual(expected, observed)
-        self.assertEqual(10, len(plan.workloads))
+        self.assertEqual(20, len(plan.workloads))
         self.assertEqual(len(plan.workloads), len({row.key for row in plan.workloads}))
         self.assertLessEqual(max(row.n_a for row in plan.workloads), 512)
+        for profile in tuning.UPSTREAM_PROFILE_FAMILIES:
+            for precision in ("single", "double"):
+                self.assertEqual(
+                    {True, False},
+                    {
+                        row.self_join
+                        for row in plan.workloads
+                        if row.profile == profile and row.precision == precision
+                    },
+                )
 
     def test_full_plan_adds_large_asymmetric_profile_and_native_buckets(self):
         quick = tuning.autotune_plan("quick")
@@ -99,7 +109,7 @@ class AutotunePlanTests(unittest.TestCase):
         self.assertTrue(any(max(row.n_a, row.n_b) >= 4096 for row in added))
         self.assertTrue(any(row.n_a != row.n_b for row in added))
         self.assertTrue(
-            any(row.threshold_density in {0.01, 0.5} for row in added)
+            any(row.threshold_density in {0.03, 0.5} for row in added)
         )
         self.assertTrue(any(row.matrix_shape == (16, 64) for row in added))
         self.assertTrue(any(row.k == 32 for row in added))
@@ -111,6 +121,17 @@ class AutotunePlanTests(unittest.TestCase):
                 if row.profile == "bidirectional_ab"
             },
         )
+        for profile in (*tuning.UPSTREAM_PROFILE_FAMILIES, "bidirectional_ab"):
+            for precision in ("single", "double"):
+                self.assertTrue(
+                    any(
+                        row.profile == profile
+                        and row.precision == precision
+                        and row.aligned
+                        for row in added
+                    ),
+                    (profile, precision),
+                )
 
     def test_invalid_mode_is_rejected_without_running_work(self):
         with self.assertRaisesRegex(ValueError, "quick.*full"):
@@ -407,6 +428,69 @@ class AutotuneCoreIntegrationTests(unittest.TestCase):
         self.assertEqual("aligned", key.alignment)
         self.assertEqual("k:2^3", key.profile_bucket)
 
+    def test_built_double_and_sum_keys_are_reachable_at_runtime(self):
+        quick = tuning.autotune_plan("quick")
+        double_workload = next(
+            row
+            for row in quick.workloads
+            if row.profile == "1nn_index"
+            and row.precision == "double"
+            and row.self_join
+        )
+        double_series = np.arange(
+            double_workload.n_a + double_workload.m - 1,
+            dtype=np.float64,
+        )
+        with mock.patch.object(
+            tuning_cache, "lookup_record", return_value=None
+        ) as lookup:
+            scamp_core._implicit_tuning_strategy(
+                self._params(precision="double"),
+                (double_series, None, double_workload.m),
+                {"profile": "1nn"},
+            )
+        self.assertEqual(double_workload.key, lookup.call_args.args[0])
+
+        with mock.patch.object(
+            tuning_cache, "lookup_record", return_value=None
+        ) as lookup:
+            scamp_core._implicit_tuning_strategy(
+                self._params(precision="ultra"),
+                (double_series, None, double_workload.m),
+                {"profile": "1nn"},
+            )
+        self.assertEqual(double_workload.key, lookup.call_args.args[0])
+
+        sum_workload = next(
+            row
+            for row in quick.workloads
+            if row.profile == "sum_thresh"
+            and row.precision == "single"
+            and row.self_join
+        )
+        sum_series = np.arange(
+            sum_workload.n_a + sum_workload.m - 1,
+            dtype=np.float32,
+        )
+        with mock.patch.object(
+            scamp_core,
+            "_estimate_metal_sum_density",
+            return_value=sum_workload.threshold_density,
+        ) as estimate, mock.patch.object(
+            tuning_cache,
+            "load_records",
+            return_value=(mock.Mock(key=sum_workload.key),),
+        ), mock.patch.object(
+            tuning_cache, "lookup_record", return_value=None
+        ) as lookup:
+            scamp_core._implicit_tuning_strategy(
+                self._params(),
+                (sum_series, None, sum_workload.m),
+                {"profile": "sum", "threshold": 0.25},
+            )
+        self.assertEqual(sum_workload.key, lookup.call_args.args[0])
+        estimate.assert_called_once()
+
     def test_explicit_resources_never_consult_tuning_cache(self):
         series = np.arange(32, dtype=np.float32)
         with mock.patch.object(
@@ -453,6 +537,30 @@ class AutotuneCoreIntegrationTests(unittest.TestCase):
         self.assertFalse(options["use_metal_matrix"])
         self.assertFalse(options["use_metal_sum"])
 
+    def test_resolved_sum_density_is_reused_by_profile_gate(self):
+        strategy = tuning_cache.STRATEGY_BY_NAME[
+            "sum_thresh:cpu:rows-64"
+        ]
+        resolved = scamp_core._ResolvedTuningStrategy(strategy, 0.04)
+        series = np.arange(64, dtype=np.float32)
+        with mock.patch.object(
+            scamp_core, "_implicit_tuning_strategy", return_value=resolved
+        ), mock.patch.object(
+            scamp_core, "_run_profile", return_value="profile"
+        ) as run_profile:
+            result = scamp_core._run_profile_with_resources(
+                self._params(),
+                series,
+                None,
+                8,
+                profile="sum",
+                threshold=0.25,
+                pearson=True,
+            )
+
+        self.assertEqual("profile", result)
+        self.assertEqual(0.04, run_profile.call_args.kwargs["sum_density"])
+
     def test_portable_row_cap_remains_bounded_by_current_scheduler(self):
         rows, _ = scamp_core._portable_tile_shape(
             4096, 4096, 8, mx.float32, 8192, row_cap=64
@@ -493,6 +601,48 @@ class AutotuneCoreIntegrationTests(unittest.TestCase):
                     workload, strategy
                 )
                 tuning._snapshot_result(workload.profile, result)
+
+    def test_sum_executor_calibrates_runtime_key_and_custom_workload(self):
+        cpu = tuning_cache.STRATEGY_BY_NAME[
+            "sum_thresh:cpu:rows-64"
+        ]
+        sparse_workload = None
+        scamp_core._AUTOTUNE_SUM_THRESHOLDS.clear()
+        for workload in tuning.autotune_plan("full").workloads:
+            if workload.profile != "sum_thresh":
+                continue
+            with self.subTest(workload=workload.name), mock.patch.object(
+                scamp_core, "_run_profile", return_value="profile"
+            ) as run_profile:
+                result = scamp_core._autotune_execute_candidate(workload, cpu)
+                density = run_profile.call_args.kwargs["sum_density"]
+                actual_key = tuning_cache.make_workload_key(
+                    workload.profile,
+                    workload.precision,
+                    "auto",
+                    workload.n_a,
+                    workload.n_b,
+                    workload.m,
+                    self_join=workload.self_join,
+                    aligned=workload.aligned,
+                    dtype_class=workload.dtype_class,
+                    max_tile_size=workload.max_tile_size,
+                    threshold_density=density,
+                )
+                self.assertEqual("profile", result)
+                self.assertEqual(workload.key, actual_key)
+                if workload.name == "full-sparse-sum-single":
+                    sparse_workload = workload
+                    self.assertTrue(
+                        scamp_core._metal_sum_workload_is_worthwhile(
+                            workload.n_a,
+                            workload.n_b,
+                            workload.m,
+                            density,
+                            workload.self_join,
+                        )
+                    )
+        self.assertIsNotNone(sparse_workload)
 
     @unittest.skipUnless(mx.metal.is_available(), "Metal is unavailable")
     def test_default_executor_runs_real_portable_and_custom_candidates(self):
@@ -537,6 +687,33 @@ class AutotuneCoreIntegrationTests(unittest.TestCase):
         self.assertEqual(1, result)
         self.assertEqual(1, len(records))
         self.assertEqual(plan.workloads[0].key, records[0].key)
+
+    def test_metal_only_custom_plan_uses_cpu_reference(self):
+        workload = _small_workload(route="metal")
+        plan = tuning.AutotunePlan(
+            "quick", (workload,), warmups=0, trials=1
+        )
+        observed_routes = []
+        records = []
+        ticks = iter(range(0, 10_000, 10))
+
+        def executor(_workload, strategy):
+            observed_routes.append(strategy.route)
+            return _profile_result()
+
+        with redirect_stdout(StringIO()):
+            tuning.run_autotune(
+                plan=plan,
+                executor=executor,
+                synchronize=lambda: None,
+                clock=lambda: next(ticks),
+                record_writer=lambda record, _path: records.append(record),
+            )
+
+        self.assertEqual("cpu", observed_routes[0])
+        self.assertTrue(all(route != "cpu" for route in observed_routes[1:]))
+        self.assertEqual(1, len(records))
+        self.assertEqual("auto", records[0].key.route)
 
 
 if __name__ == "__main__":

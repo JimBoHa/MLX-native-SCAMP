@@ -193,6 +193,10 @@ def make_workload_key(
         raise ValueError(f"unknown autotune profile family {profile!r}")
     if precision not in PRECISIONS:
         raise ValueError(f"unknown precision {precision!r}")
+    if precision == "ultra":
+        # The current direct float64 implementation intentionally shares the
+        # same execution path for upstream double and ultra modes.
+        precision = "double"
     if route not in ROUTE_POLICIES:
         raise ValueError(f"unknown route policy {route!r}")
     if min(n_a, n_b, m) <= 0:
@@ -649,8 +653,17 @@ def save_record(record: TuningRecord, cache_path: str = "") -> Path:
             for identifier in allowed_environments
         }
         _write_payload(path, payload)
+    _sidecar_exists_once.cache_clear()
     _load_records_once.cache_clear()
     return path
+
+
+@lru_cache(maxsize=16)
+def _sidecar_exists_once(path_string: str) -> bool:
+    try:
+        return Path(path_string).is_file()
+    except OSError:
+        return False
 
 
 @lru_cache(maxsize=16)
@@ -672,8 +685,11 @@ def _load_records_once(
 
 
 def load_records(cache_path: str = "") -> tuple[TuningRecord, ...]:
+    path_string = str(sidecar_path(cache_path))
+    if not _sidecar_exists_once(path_string):
+        return ()
     return _load_records_once(
-        str(sidecar_path(cache_path)), environment_id(), candidate_manifest_id()
+        path_string, environment_id(), candidate_manifest_id()
     )
 
 
@@ -694,6 +710,7 @@ def reset_cache(cache_path: str = "") -> bool:
             removed = True
         except FileNotFoundError:
             pass
+    _sidecar_exists_once.cache_clear()
     _load_records_once.cache_clear()
     return removed
 
