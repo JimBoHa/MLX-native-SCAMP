@@ -47,6 +47,8 @@ class AutotuneWorkload:
 
     @property
     def key(self) -> cache.WorkloadKey:
+        if self.route not in cache.ROUTE_POLICIES:
+            raise ValueError("route must be 'auto', 'cpu', or 'metal'")
         return cache.make_workload_key(
             self.profile,
             self.precision,

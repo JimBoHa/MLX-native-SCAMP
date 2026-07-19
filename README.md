@@ -205,8 +205,8 @@ remain follow-up work.
   row choices remain clamped by the adaptive 8–64 MiB scheduler and the
   explicit/default `max_tile_size` ceiling.
 - `gpus=[]` or a positive `threads` value selects MLX CPU execution; `gpus=[0]`
-  selects the Metal GPU. With neither, the current MLX default device is
-  preserved.
+  selects the Metal GPU. With neither and no matching cached winner, the
+  current MLX default device is preserved.
 - MLX manages its own CPU scheduler, so `threads` selects CPU execution but cannot
   enforce an exact worker count.
 - Multi-GPU requests and GPU IDs other than `0` are unsupported and rejected.

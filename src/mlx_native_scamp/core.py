@@ -79,16 +79,8 @@ class ReducerScheduler:
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedTuningStrategy:
-    strategy: Any
+    strategy: Any | None
     sum_density: float | None = None
-
-    @property
-    def route(self) -> str:
-        return self.strategy.route
-
-    @property
-    def parameters(self) -> tuple[tuple[str, int], ...]:
-        return self.strategy.parameters
 
 
 def _schedule_reducer_state(*state: Any) -> None:
@@ -2059,14 +2051,22 @@ def _implicit_tuning_strategy(
     )
     record = lookup_record(key)
     if record is None:
-        return None
+        return _ResolvedTuningStrategy(None, threshold_density)
     return _ResolvedTuningStrategy(
         STRATEGY_BY_NAME[record.candidate], threshold_density
     )
 
 
 def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
-    tuning_strategy = _implicit_tuning_strategy(params, args, kwargs)
+    resolved_tuning = _implicit_tuning_strategy(params, args, kwargs)
+    if isinstance(resolved_tuning, _ResolvedTuningStrategy):
+        tuning_strategy = resolved_tuning.strategy
+        sum_density = resolved_tuning.sum_density
+    else:
+        # Preserve raw strategy values supplied by internal tests and callers
+        # written against the transitional hook.
+        tuning_strategy = resolved_tuning
+        sum_density = None
     if tuning_strategy is None:
         execution_stream = _resolve_execution_stream(params)
     elif tuning_strategy.route == "cpu":
@@ -2096,11 +2096,6 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
         portable_row_cap = dict(tuning_strategy.parameters).get(
             "portable_row_cap", BLOCK_ROWS
         )
-    sum_density = (
-        None
-        if tuning_strategy is None
-        else getattr(tuning_strategy, "sum_density", None)
-    )
     stream_context = (
         nullcontext()
         if execution_stream is None
@@ -2142,6 +2137,13 @@ def _autotune_sum_threshold(
     if cached is not None:
         return cached
 
+    from ._autotune_cache import (
+        _density_bucket,
+        _density_bucket_representative,
+    )
+
+    target_bucket = _density_bucket(float(target))
+    calibration_target = _density_bucket_representative(float(target))
     values_b = a if b is None else b
     lower = -1.0
     upper = 1.0
@@ -2157,11 +2159,15 @@ def _autotune_sum_threshold(
         )
         if density is None:
             raise RuntimeError("SUM density sampling is unavailable")
-        if density > target:
+        if density > calibration_target:
             lower = midpoint
         else:
             upper = midpoint
             selected_density = density
+    if _density_bucket(selected_density) != target_bucket:
+        raise RuntimeError(
+            "SUM density bucket cannot be sampled reliably for this window"
+        )
     result = (upper, selected_density)
     if len(_AUTOTUNE_SUM_THRESHOLDS) >= 64:
         _AUTOTUNE_SUM_THRESHOLDS.pop(next(iter(_AUTOTUNE_SUM_THRESHOLDS)))

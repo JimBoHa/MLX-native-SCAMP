@@ -137,6 +137,20 @@ class AutotunePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "quick.*full"):
             tuning.autotune_plan("slow")
 
+    def test_custom_plan_rejects_invalid_route_and_self_shape(self):
+        invalid_workloads = (
+            _small_workload(route="banana"),
+            _small_workload(n_a=32, n_b=64),
+            _small_workload(aligned=True),
+            _small_workload("bidirectional_ab"),
+        )
+        for workload in invalid_workloads:
+            with self.subTest(workload=workload), self.assertRaises(ValueError):
+                tuning.run_autotune(
+                    plan=tuning.AutotunePlan("quick", (workload,), 0, 1),
+                    executor=lambda *_: _profile_result(),
+                )
+
     def test_strategy_descriptions_are_typed_and_complete(self):
         descriptions = tuning.strategy_descriptions()
         self.assertEqual(len(tuning.cache.STRATEGIES), len(descriptions))
@@ -561,6 +575,42 @@ class AutotuneCoreIntegrationTests(unittest.TestCase):
         self.assertEqual("profile", result)
         self.assertEqual(0.04, run_profile.call_args.kwargs["sum_density"])
 
+    def test_sum_bucket_miss_does_not_resample_in_profile_gate(self):
+        workload = next(
+            row
+            for row in tuning.autotune_plan("quick").workloads
+            if row.profile == "sum_thresh"
+            and row.precision == "single"
+            and row.self_join
+        )
+        series = np.arange(
+            workload.n_a + workload.m - 1, dtype=np.float32
+        )
+        with mock.patch.object(
+            tuning_cache,
+            "load_records",
+            return_value=(mock.Mock(key=workload.key),),
+        ), mock.patch.object(
+            tuning_cache, "lookup_record", return_value=None
+        ), mock.patch.object(
+            scamp_core, "_estimate_metal_sum_density", return_value=0.5
+        ) as estimate, mock.patch.object(
+            scamp_core, "_run_profile", return_value="profile"
+        ) as run_profile:
+            result = scamp_core._run_profile_with_resources(
+                self._params(),
+                series,
+                None,
+                workload.m,
+                profile="sum",
+                threshold=0.25,
+                pearson=True,
+            )
+
+        self.assertEqual("profile", result)
+        estimate.assert_called_once()
+        self.assertEqual(0.5, run_profile.call_args.kwargs["sum_density"])
+
     def test_portable_row_cap_remains_bounded_by_current_scheduler(self):
         rows, _ = scamp_core._portable_tile_shape(
             4096, 4096, 8, mx.float32, 8192, row_cap=64
@@ -608,9 +658,20 @@ class AutotuneCoreIntegrationTests(unittest.TestCase):
         ]
         sparse_workload = None
         scamp_core._AUTOTUNE_SUM_THRESHOLDS.clear()
-        for workload in tuning.autotune_plan("full").workloads:
-            if workload.profile != "sum_thresh":
-                continue
+        custom_boundaries = tuple(
+            _small_workload(
+                "sum_thresh",
+                name=f"custom-density-{density}",
+                threshold_density=density,
+            )
+            for density in (0.0, 0.021, 0.051, 0.201, 0.501, 1.0)
+        )
+        sum_workloads = tuple(
+            workload
+            for workload in tuning.autotune_plan("full").workloads
+            if workload.profile == "sum_thresh"
+        ) + custom_boundaries
+        for workload in sum_workloads:
             with self.subTest(workload=workload.name), mock.patch.object(
                 scamp_core, "_run_profile", return_value="profile"
             ) as run_profile:

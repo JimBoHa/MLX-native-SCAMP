@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - macOS and Linux provide fcntl
 CACHE_FORMAT = "MLX_SCAMP_AUTOTUNE_V2"
 SCHEMA_VERSION = 2
 CORE_ALGORITHM_REVISION = "tiled-v2-metal-profiles-v1"
-CANDIDATE_MANIFEST_VERSION = "2026-07-19-1"
+CANDIDATE_MANIFEST_VERSION = "2026-07-19-2"
 MAX_CACHE_BYTES = 4 * 1024 * 1024
 MAX_RECORDS = 1024
 MAX_ENVIRONMENTS = 32
@@ -47,6 +47,7 @@ PROFILE_FAMILIES = frozenset(
 )
 PRECISIONS = frozenset({"single", "double", "ultra"})
 ROUTE_POLICIES = frozenset({"auto", "cpu", "metal"})
+DENSITY_BUCKET_UPPERS = (0.02, 0.05, 0.2, 0.5, 1.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,9 +168,24 @@ def _density_bucket(density: float | None) -> str:
         return "density:unknown"
     if not math.isfinite(density) or density < 0.0 or density > 1.0:
         raise ValueError("threshold density must be between zero and one")
-    for upper in (0.01, 0.05, 0.2, 0.5, 1.0):
+    for upper in DENSITY_BUCKET_UPPERS:
         if density <= upper:
             return f"density:<={upper:g}"
+    raise AssertionError("unreachable density bucket")
+
+
+def _density_bucket_representative(density: float) -> float:
+    """Return a stable interior target for a requested density bucket."""
+
+    _density_bucket(density)
+    lower = 0.0
+    for upper in DENSITY_BUCKET_UPPERS:
+        if density <= upper:
+            # Five conservative pseudo-successes make 5/256 the smallest
+            # normal sample. Target the top of the first bucket so it remains
+            # reachable; use the midpoint elsewhere to avoid edge jitter.
+            return upper if lower == 0.0 else (lower + upper) / 2.0
+        lower = upper
     raise AssertionError("unreachable density bucket")
 
 
@@ -201,6 +217,12 @@ def make_workload_key(
         raise ValueError(f"unknown route policy {route!r}")
     if min(n_a, n_b, m) <= 0:
         raise ValueError("subsequence counts and window must be positive")
+    if self_join and n_a != n_b:
+        raise ValueError("self-join subsequence counts must match")
+    if self_join and aligned:
+        raise ValueError("aligned exclusion applies only to AB-joins")
+    if profile == "bidirectional_ab" and self_join:
+        raise ValueError("bidirectional profiles require an AB-join")
     if not isinstance(dtype_class, str) or not dtype_class:
         raise ValueError("dtype_class must be a non-empty string")
     if max_tile_size is not None and max_tile_size <= 0:

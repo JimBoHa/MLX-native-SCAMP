@@ -442,6 +442,7 @@ class AutotuneCacheTests(unittest.TestCase):
                 cache.new_record(
                     _key(
                         strategy.profile,
+                        self_join=strategy.profile != "bidirectional_ab",
                         threshold_density=(
                             0.1 if strategy.profile == "sum_thresh" else None
                         ),
