@@ -164,23 +164,20 @@ def _decode_ordered_keys(keys: np.ndarray) -> np.ndarray:
     return bits.view(np.float32)
 
 
-def best_match(
+def _profile_state(
     prepared_a: Any,
     prepared_b: Any,
     m: int,
     self_join: bool,
     exclusion: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute a float32 1NN profile with SCAMP's diagonal recurrence."""
+) -> tuple[Any, list[Any], int, int, int]:
+    """Launch the correlation pass and return its reusable device state."""
 
     n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
     diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
     if diagonal_count <= 0:
-        return (
-            np.full((n_a,), -2.0, dtype=np.float32),
-            np.full((n_a,), -1, dtype=np.int32),
-        )
+        return None, [], n_a, 0, 1
 
     config = mx.array(
         [m, exclusion, int(self_join), int(exclusion > 0)],
@@ -209,6 +206,43 @@ def best_match(
         init_value=_ordered_key(-2.0),
         stream=mx.gpu,
     )[0]
+    return best, inputs, n_a, diagonal_count, threadgroup_width
+
+
+def best_profile(
+    prepared_a: Any,
+    prepared_b: Any,
+    m: int,
+    self_join: bool,
+    exclusion: int,
+) -> np.ndarray:
+    """Compute an index-free float32 1NN profile on Metal."""
+
+    best, _, n_a, _, _ = _profile_state(
+        prepared_a, prepared_b, m, self_join, exclusion
+    )
+    if best is None:
+        return np.full((n_a,), -2.0, dtype=np.float32)
+    return _decode_ordered_keys(np.asarray(best, dtype=np.uint32)).copy()
+
+
+def best_match(
+    prepared_a: Any,
+    prepared_b: Any,
+    m: int,
+    self_join: bool,
+    exclusion: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute an indexed float32 1NN profile on Metal."""
+
+    best, inputs, n_a, diagonal_count, threadgroup_width = _profile_state(
+        prepared_a, prepared_b, m, self_join, exclusion
+    )
+    if best is None:
+        return (
+            np.full((n_a,), -2.0, dtype=np.float32),
+            np.full((n_a,), -1, dtype=np.int32),
+        )
     index = _INDEX_KERNEL(
         inputs=[*inputs, best],
         output_shapes=[(n_a,)],
