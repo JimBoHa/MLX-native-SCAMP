@@ -165,11 +165,14 @@ def _portable_tile_shape(
     m: int,
     dtype: Any,
     max_tile_size: int,
+    row_cap: int = BLOCK_ROWS,
 ) -> tuple[int, int]:
     """Choose bounded row/column spans within SCAMP's tile-size ceiling."""
 
+    if row_cap <= 0 or row_cap > BLOCK_ROWS:
+        raise ValueError(f"portable row cap must be between 1 and {BLOCK_ROWS}")
     max_subsequences = _tile_subsequence_count(max_tile_size, m)
-    row_limit = min(row_subsequences, max_subsequences, BLOCK_ROWS)
+    row_limit = min(row_subsequences, max_subsequences, row_cap)
     column_limit = min(column_subsequences, max_subsequences)
     if row_limit <= 0 or column_limit <= 0:
         raise ValueError("portable tile dimensions must be positive")
@@ -1628,6 +1631,7 @@ def _run_profile(
     use_metal_1nn: bool = False,
     use_metal_matrix: bool = False,
     use_metal_sum: bool = False,
+    portable_row_cap: int = BLOCK_ROWS,
 ):
     m = _normalize_window_size(m)
     effective_max_tile_size = (
@@ -1793,6 +1797,7 @@ def _run_profile(
         m,
         compute_dtype,
         effective_max_tile_size,
+        portable_row_cap,
     )
     prepared_a = _prepare_tiled_series(series_a, m)
     prepared_b = (
@@ -1890,18 +1895,113 @@ def _resolve_execution_stream(params: dict[str, Any]) -> Any | None:
     return mx.default_stream(mx.cpu)
 
 
+def _sequence_length_for_tuning(values: Any) -> int | None:
+    shape = getattr(values, "shape", None)
+    if shape is not None:
+        try:
+            if len(shape) == 1:
+                return int(shape[0])
+        except (TypeError, ValueError, OverflowError):
+            return None
+    try:
+        return len(values)
+    except (TypeError, OverflowError):
+        return None
+
+
+def _implicit_tuning_strategy(
+    params: dict[str, Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+):
+    if params["gpus"] is not None or params["threads"] > 0:
+        return None
+    try:
+        a, b, raw_m = args[:3]
+        m = operator.index(raw_m)
+    except (TypeError, ValueError):
+        return None
+    length_a = _sequence_length_for_tuning(a)
+    length_b = length_a if b is None else _sequence_length_for_tuning(b)
+    if length_a is None or length_b is None:
+        return None
+    n_a = length_a - m + 1
+    n_b = length_b - m + 1
+    if min(n_a, n_b, m) <= 0:
+        return None
+
+    family = {
+        "1nn": "1nn_index",
+        "1nn_value": "1nn_value",
+        "1nn_bidirectional": "bidirectional_ab",
+        "sum": "sum_thresh",
+        "matrix": "matrix_summary",
+        "knn": "knn",
+    }.get(kwargs.get("profile"))
+    if family is None:
+        return None
+
+    from ._autotune_cache import (
+        STRATEGY_BY_NAME,
+        lookup_record,
+        make_workload_key,
+    )
+
+    key = make_workload_key(
+        family,
+        params["precision"],
+        "auto",
+        n_a,
+        n_b,
+        m,
+        self_join=b is None,
+        aligned=b is not None
+        and not params.get("allow_trivial_match", True),
+        dtype_class=(
+            "float32"
+            if _is_float32_input(a)
+            and (b is None or _is_float32_input(b))
+            else "other"
+        ),
+        max_tile_size=params["max_tile_size"],
+        k=kwargs.get("k"),
+        matrix_shape=(kwargs.get("mheight"), kwargs.get("mwidth"))
+        if family == "matrix_summary"
+        else None,
+    )
+    record = lookup_record(key)
+    return None if record is None else STRATEGY_BY_NAME[record.candidate]
+
+
 def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
-    execution_stream = _resolve_execution_stream(params)
+    tuning_strategy = _implicit_tuning_strategy(params, args, kwargs)
+    if tuning_strategy is None:
+        execution_stream = _resolve_execution_stream(params)
+    elif tuning_strategy.route == "cpu":
+        execution_stream = mx.default_stream(mx.cpu)
+    else:
+        execution_stream = (
+            mx.default_stream(mx.gpu)
+            if params["precision"] == "single" and mx.metal.is_available()
+            else _resolve_execution_stream(params)
+        )
     execution_device = (
         mx.default_device()
         if execution_stream is None
         else execution_stream.device
     )
+    custom_metal = tuning_strategy is None or tuning_strategy.route.startswith(
+        "metal_"
+    )
     use_metal_1nn = (
         params["precision"] == "single"
         and execution_device == mx.gpu
         and mx.metal.is_available()
+        and custom_metal
     )
+    portable_row_cap = BLOCK_ROWS
+    if tuning_strategy is not None:
+        portable_row_cap = dict(tuning_strategy.parameters).get(
+            "portable_row_cap", BLOCK_ROWS
+        )
     stream_context = (
         nullcontext()
         if execution_stream is None
@@ -1915,8 +2015,92 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
             use_metal_1nn=use_metal_1nn,
             use_metal_matrix=use_metal_1nn,
             use_metal_sum=use_metal_1nn,
+            portable_row_cap=portable_row_cap,
             **kwargs,
         )
+
+
+def _autotune_execute_candidate(workload: Any, strategy: Any) -> Any:
+    """Execute one explicit, deterministic autotune candidate."""
+
+    dtype = np.float32 if workload.precision == "single" else np.float64
+    length_a = workload.n_a + workload.m - 1
+    length_b = workload.n_b + workload.m - 1
+    seed = sum((index + 1) * ord(char) for index, char in enumerate(workload.name))
+    rng = np.random.default_rng(seed % (2**32))
+    a = rng.standard_normal(length_a).astype(dtype)
+    a += np.sin(np.arange(length_a, dtype=dtype) / dtype(17.0))
+    b = None
+    if not workload.self_join:
+        b = rng.standard_normal(length_b).astype(dtype)
+        b += np.cos(np.arange(length_b, dtype=dtype) / dtype(19.0))
+
+    route = strategy.route
+    if route == "cpu":
+        execution_stream = mx.default_stream(mx.cpu)
+    else:
+        if workload.precision != "single" or not mx.metal.is_available():
+            raise RuntimeError("Metal candidate is not eligible for this workload")
+        execution_stream = mx.default_stream(mx.gpu)
+    custom_metal = route.startswith("metal_")
+    row_cap = dict(strategy.parameters).get("portable_row_cap", BLOCK_ROWS)
+
+    profile = {
+        "1nn_index": "1nn",
+        "1nn_value": "1nn_value",
+        "sum_thresh": "sum",
+        "matrix_summary": "matrix",
+        "knn": "knn",
+        "bidirectional_ab": "1nn_bidirectional",
+    }[workload.profile]
+    threshold = 0.0
+    if workload.profile == "sum_thresh":
+        density = workload.threshold_density
+        if density is None:
+            raise ValueError("SUM autotune workloads require threshold density")
+        if density <= 0.02:
+            threshold = min(0.95, 2.33 / math.sqrt(workload.m))
+        elif density <= 0.2:
+            threshold = min(0.95, 1.28 / math.sqrt(workload.m))
+        elif density <= 0.5:
+            threshold = 0.0
+        else:
+            threshold = -0.25
+    elif workload.profile == "matrix_summary":
+        threshold = -1.0
+
+    if route == "metal_sum" and not _metal_sum_is_worthwhile(
+        a,
+        a if b is None else b,
+        workload.n_a,
+        workload.n_b,
+        workload.m,
+        threshold,
+        workload.self_join,
+    ):
+        raise RuntimeError("sparse Metal SUM is ineligible for this density")
+
+    run_kwargs: dict[str, Any] = {
+        "pearson": True,
+        "precision": workload.precision,
+        "threshold": threshold,
+        "allow_trivial_match": not workload.aligned,
+        "profile": profile,
+        "max_tile_size": workload.max_tile_size,
+        "use_metal_1nn": custom_metal,
+        "use_metal_matrix": custom_metal,
+        "use_metal_sum": custom_metal,
+        "portable_row_cap": row_cap,
+    }
+    if workload.profile == "matrix_summary":
+        if workload.matrix_shape is None:
+            raise ValueError("matrix autotune workloads require a shape")
+        run_kwargs["mheight"], run_kwargs["mwidth"] = workload.matrix_shape
+    if workload.profile == "knn":
+        run_kwargs["k"] = workload.k
+
+    with mx.stream(execution_stream):
+        return _run_profile(a, b, workload.m, **run_kwargs)
 
 
 def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:

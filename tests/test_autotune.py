@@ -4,10 +4,13 @@ from contextlib import redirect_stdout
 from io import StringIO
 from unittest import mock
 
+import mlx.core as mx
 import numpy as np
 
 import mlx_native_scamp
 import mlx_native_scamp._autotune as tuning
+from mlx_native_scamp import _autotune_cache as tuning_cache
+from mlx_native_scamp import core as scamp_core
 import pyscamp
 
 
@@ -369,6 +372,171 @@ class AutotuneRunnerTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 tuning.run_autotune(executor=lambda *_: None, plan=invalid)
+
+
+class AutotuneCoreIntegrationTests(unittest.TestCase):
+    def _params(self, **overrides):
+        values = {
+            "gpus": None,
+            "threads": 0,
+            "precision": "single",
+            "max_tile_size": None,
+        }
+        values.update(overrides)
+        return values
+
+    def test_runtime_key_includes_alignment_and_profile_controls(self):
+        params = self._params()
+        params["allow_trivial_match"] = False
+        a = np.arange(64, dtype=np.float32)
+        b = np.arange(48, dtype=np.float32)
+
+        with mock.patch.object(
+            tuning_cache, "lookup_record", return_value=None
+        ) as lookup:
+            strategy = scamp_core._implicit_tuning_strategy(
+                params,
+                (a, b, 8),
+                {"profile": "knn", "k": 7},
+            )
+
+        self.assertIsNone(strategy)
+        key = lookup.call_args.args[0]
+        self.assertEqual("knn", key.profile)
+        self.assertEqual("ab", key.join)
+        self.assertEqual("aligned", key.alignment)
+        self.assertEqual("k:2^3", key.profile_bucket)
+
+    def test_explicit_resources_never_consult_tuning_cache(self):
+        series = np.arange(32, dtype=np.float32)
+        with mock.patch.object(
+            tuning_cache,
+            "lookup_record",
+            side_effect=AssertionError("cache was consulted"),
+        ):
+            for params in (
+                self._params(gpus=[]),
+                self._params(threads=1),
+            ):
+                self.assertIsNone(
+                    scamp_core._implicit_tuning_strategy(
+                        params,
+                        (series, None, 8),
+                        {"profile": "1nn"},
+                    )
+                )
+
+    def test_cpu_recommendation_preserves_tile_ceiling_and_disables_custom_metal(self):
+        strategy = tuning_cache.STRATEGY_BY_NAME[
+            "1nn_index:cpu:rows-64"
+        ]
+        series = np.arange(32, dtype=np.float32)
+        with mock.patch.object(
+            scamp_core, "_implicit_tuning_strategy", return_value=strategy
+        ), mock.patch.object(
+            scamp_core, "_run_profile", return_value="profile"
+        ) as run_profile:
+            result = scamp_core._run_profile_with_resources(
+                self._params(max_tile_size=1024),
+                series,
+                None,
+                8,
+                profile="1nn",
+                pearson=True,
+            )
+
+        self.assertEqual("profile", result)
+        options = run_profile.call_args.kwargs
+        self.assertEqual(1024, options["max_tile_size"])
+        self.assertEqual(64, options["portable_row_cap"])
+        self.assertFalse(options["use_metal_1nn"])
+        self.assertFalse(options["use_metal_matrix"])
+        self.assertFalse(options["use_metal_sum"])
+
+    def test_portable_row_cap_remains_bounded_by_current_scheduler(self):
+        rows, _ = scamp_core._portable_tile_shape(
+            4096, 4096, 8, mx.float32, 8192, row_cap=64
+        )
+        self.assertLessEqual(rows, 64)
+        with self.assertRaisesRegex(ValueError, "row cap"):
+            scamp_core._portable_tile_shape(
+                4096,
+                4096,
+                8,
+                mx.float32,
+                8192,
+                row_cap=scamp_core.BLOCK_ROWS + 1,
+            )
+
+    def test_cpu_executor_covers_every_result_family(self):
+        workloads = (
+            _small_workload(),
+            _small_workload("1nn_value"),
+            _small_workload("sum_thresh"),
+            _small_workload(
+                "matrix_summary",
+                n_b=48,
+                self_join=False,
+                matrix_shape=(4, 5),
+            ),
+            _small_workload("knn"),
+            _small_workload(
+                "bidirectional_ab", n_b=48, self_join=False
+            ),
+        )
+        for workload in workloads:
+            with self.subTest(profile=workload.profile):
+                strategy = tuning_cache.STRATEGY_BY_NAME[
+                    f"{workload.profile}:cpu:rows-64"
+                ]
+                result = scamp_core._autotune_execute_candidate(
+                    workload, strategy
+                )
+                tuning._snapshot_result(workload.profile, result)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal is unavailable")
+    def test_default_executor_runs_real_portable_and_custom_candidates(self):
+        workload = _small_workload(n_a=32, n_b=32, m=8)
+        cpu = tuning_cache.STRATEGY_BY_NAME[
+            "1nn_index:cpu:rows-64"
+        ]
+        portable = tuning_cache.STRATEGY_BY_NAME[
+            "1nn_index:portable_metal:rows-64"
+        ]
+        custom = tuning_cache.STRATEGY_BY_NAME[
+            "1nn_index:metal-diagonal"
+        ]
+        reference = scamp_core._autotune_execute_candidate(workload, cpu)
+        for strategy in (portable, custom):
+            with self.subTest(strategy=strategy.name):
+                candidate = scamp_core._autotune_execute_candidate(
+                    workload, strategy
+                )
+                tuning._assert_result_equivalent(
+                    workload.profile,
+                    workload.precision,
+                    candidate,
+                    tuning._snapshot_result(workload.profile, reference),
+                )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal is unavailable")
+    def test_explicit_runner_uses_lazy_real_core_executor(self):
+        plan = tuning.AutotunePlan(
+            "quick",
+            (_small_workload(n_a=32, n_b=32, m=8),),
+            warmups=0,
+            trials=1,
+        )
+        records = []
+        with redirect_stdout(StringIO()):
+            result = tuning.run_autotune(
+                plan=plan,
+                record_writer=lambda record, _path: records.append(record),
+            )
+
+        self.assertEqual(1, result)
+        self.assertEqual(1, len(records))
+        self.assertEqual(plan.workloads[0].key, records[0].key)
 
 
 if __name__ == "__main__":
