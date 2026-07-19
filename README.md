@@ -39,9 +39,10 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 ## Notes
 
 - The compute-heavy matrix profile kernels are MLX-native on Apple Silicon.
-- Single-precision `selfjoin` and `abjoin` use a custom Metal kernel that
-  follows SCAMP's rolling-covariance diagonal algorithm. Other profiles and
-  execution modes use the portable MLX implementation.
+- Single-precision `selfjoin`, `abjoin`, `selfjoin_sum`, and `abjoin_sum` use
+  custom Metal kernels that follow SCAMP's rolling-covariance diagonal
+  algorithm. Other profiles and execution modes use the portable MLX
+  implementation.
 - Eligible native float32 joins are translated by a finite per-series origin
   after quantization, then prepared with compensated float64 CPU statistics.
   Only five linear-sized float32 recurrence arrays are sent to Metal; an
@@ -53,6 +54,18 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
   currently walks each diagonal in one Metal dispatch. Checkpointed/tiled
   dispatch—and integration with the separate `max_tile_size` work—remains a
   follow-up for exceptionally long joins.
+- For nonnegative thresholds, sufficiently large SUM workloads use a sparse
+  Metal reducer. It refreshes covariance directly every 64 diagonal steps,
+  bounds float32 atomic accumulation to 2,048 diagonals at a time, and merges
+  partial profiles in float64 on CPU. A bounded correlation sample estimates
+  atomic-update density; density, window size, pair count, join shape, and join
+  type select conservative benchmarked crossovers. Smaller, short-window,
+  dense, highly rectangular, and negative-threshold joins retain the portable
+  reducer because atomics or short diagonals can be slower than MLX matrix
+  multiplication. Correlations within float32
+  roundoff of a strict threshold can fall on either side; use double precision
+  on CPU when that boundary must be stable. Double and ultra precision remain
+  entirely on MLX CPU.
 - Inputs can be NumPy arrays, Python sequences, or MLX arrays.
 - `gpus=[]` or a positive `threads` value selects MLX CPU execution; `gpus=[0]`
   selects the Metal GPU. With neither, the current MLX default device is
