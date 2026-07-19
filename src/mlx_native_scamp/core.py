@@ -837,7 +837,7 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
         for rank in range(k):
             corr = corr_np[rank, col]
             row = int(idx_np[rank, col])
-            if corr < threshold or corr < -1.0 or row < 0 or row in seen_rows:
+            if corr <= threshold or corr < -1.0 or row < 0 or row in seen_rows:
                 continue
             seen_rows.add(row)
             results.append((col, row, _convert_match_value(corr, m, pearson)))
