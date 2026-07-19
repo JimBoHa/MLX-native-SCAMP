@@ -57,6 +57,44 @@ class MetalDiagonal1NNTests(unittest.TestCase):
         np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5, equal_nan=True)
         np.testing.assert_array_equal(actual_index, expected_index)
 
+    def test_aligned_abjoin_exclusion_matches_reference(self):
+        rng = np.random.default_rng(2112)
+        a = rng.normal(size=89).astype(np.float32)
+        b = rng.normal(size=89).astype(np.float32)
+        m = 9
+        source_start = 12
+        exclusion = (m + 3) // 4
+        target_start = source_start + exclusion - 1
+        b[target_start : target_start + m] = a[
+            source_start : source_start + m
+        ]
+        matrix = distance_matrix(a, b, m)
+        positions = np.arange(matrix.shape[0])
+        matrix[
+            np.abs(positions[:, None] - positions[None, :]) < exclusion
+        ] = -2.0
+        expected, expected_index = reduce_1nn_index(matrix)
+
+        with mock.patch.object(
+            _metal_1nn, "best_match", wraps=_metal_1nn.best_match
+        ) as kernel:
+            actual, actual_index = mp.abjoin(
+                a,
+                b,
+                m,
+                pearson=True,
+                allow_trivial_match=False,
+                precision="single",
+                gpus=[0],
+            )
+
+        kernel.assert_called_once()
+        self.assertEqual(exclusion, kernel.call_args.args[-1])
+        np.testing.assert_allclose(
+            actual, expected, rtol=2e-5, atol=2e-5, equal_nan=True
+        )
+        np.testing.assert_array_equal(actual_index, expected_index)
+
     def test_high_offset_float32_variation_matches_reference(self):
         rng = np.random.default_rng(701)
         a = (1e7 + rng.integers(-32, 33, size=173)).astype(np.float32)

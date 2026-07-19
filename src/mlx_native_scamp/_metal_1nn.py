@@ -5,9 +5,6 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from ._exclusion import self_join_exclusion
-
-
 _INPUT_NAMES = [
     "clean_a",
     "clean_b",
@@ -29,6 +26,7 @@ _PROFILE_SOURCE = r"""
     uint m = config[0];
     uint exclusion = config[1];
     bool self_join = config[2] != 0;
+    bool apply_exclusion = config[3] != 0;
 
     int diagonal;
     if (self_join) {
@@ -52,8 +50,10 @@ _PROFILE_SOURCE = r"""
     }
 
     for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
+        bool excluded = apply_exclusion &&
+            metal::abs(int(col) - int(row)) < int(exclusion);
         float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
+        if (!excluded && norm_product > 0.0f) {
             float corr = covariance * norm_product;
             if (metal::isfinite(corr)) {
                 corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
@@ -82,6 +82,7 @@ _INDEX_SOURCE = r"""
     uint m = config[0];
     uint exclusion = config[1];
     bool self_join = config[2] != 0;
+    bool apply_exclusion = config[3] != 0;
 
     int diagonal;
     if (self_join) {
@@ -105,8 +106,10 @@ _INDEX_SOURCE = r"""
     }
 
     for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
+        bool excluded = apply_exclusion &&
+            metal::abs(int(col) - int(row)) < int(exclusion);
         float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
+        if (!excluded && norm_product > 0.0f) {
             float corr = covariance * norm_product;
             if (metal::isfinite(corr)) {
                 corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
@@ -166,12 +169,12 @@ def best_match(
     prepared_b: Any,
     m: int,
     self_join: bool,
+    exclusion: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute a float32 1NN profile with SCAMP's diagonal recurrence."""
 
     n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
-    exclusion = self_join_exclusion(m) if self_join else 0
     diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
     if diagonal_count <= 0:
         return (
@@ -179,7 +182,10 @@ def best_match(
             np.full((n_a,), -1, dtype=np.int32),
         )
 
-    config = mx.array([m, exclusion, int(self_join)], dtype=mx.uint32)
+    config = mx.array(
+        [m, exclusion, int(self_join), int(exclusion > 0)],
+        dtype=mx.uint32,
+    )
     inputs = [
         prepared_a.recurrence_clean,
         prepared_b.recurrence_clean,

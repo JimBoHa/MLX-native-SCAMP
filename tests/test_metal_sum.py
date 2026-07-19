@@ -186,6 +186,47 @@ class MetalSumThresholdTests(unittest.TestCase):
         kernel.assert_called_once()
         np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-5)
 
+    def test_aligned_abjoin_exclusion_matches_reference(self):
+        rng = np.random.default_rng(2113)
+        a = rng.normal(size=97).astype(np.float32)
+        b = rng.normal(size=97).astype(np.float32)
+        m = 9
+        source_start = 16
+        exclusion = (m + 3) // 4
+        target_start = source_start + exclusion - 1
+        b[target_start : target_start + m] = a[
+            source_start : source_start + m
+        ]
+        matrix = distance_matrix(a, b, m)
+        positions = np.arange(matrix.shape[0])
+        matrix[
+            np.abs(positions[:, None] - positions[None, :]) < exclusion
+        ] = -2.0
+        threshold = 0.15
+        expected = reduce_sum_thresh(matrix, threshold)
+
+        with (
+            mock.patch.object(
+                core, "_metal_sum_is_worthwhile", return_value=True
+            ),
+            mock.patch.object(
+                _metal_sum, "sum_threshold", wraps=_metal_sum.sum_threshold
+            ) as kernel,
+        ):
+            actual = mp.abjoin_sum(
+                a,
+                b,
+                m,
+                threshold=threshold,
+                allow_trivial_match=False,
+                precision="single",
+                gpus=[0],
+            )
+
+        kernel.assert_called_once()
+        self.assertEqual(exclusion, kernel.call_args.args[-1])
+        np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-5)
+
     def test_threshold_comparison_is_strict(self):
         series = np.arange(32, dtype=np.float32)
         with mock.patch.object(
