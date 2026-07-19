@@ -119,6 +119,8 @@ remain follow-up work.
   tile, materialize reducer state with bounded MLX backpressure, and never
   construct the full normalized-window or pairwise-similarity matrix.
   Explicit values retain upstream's 1024-sample and `2 * window` minimums.
+- KNN results order equal-correlation matches by the smallest global row index,
+  keeping the selected rows deterministic when tile geometry changes.
 - With no explicit limit, the upstream CPU/Metal defaults (128K/512K) remain
   upper ceilings while an 8–64 MiB transient target is selected from Apple's
   recommended unified-memory working set. The byte target is advisory because

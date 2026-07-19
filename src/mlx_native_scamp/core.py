@@ -866,12 +866,30 @@ def _metal_recurrence_is_safe(
     )
 
 
-def _topk_desc_axis0(values: Any, k: int) -> Any:
+def _topk_corr_then_smallest_index(
+    values: Any,
+    indices: Any,
+    k: int,
+    *,
+    indices_are_sorted: bool = False,
+) -> tuple[Any, Any]:
+    """Select correlations descending with the smallest row breaking ties."""
+
     rows = int(values.shape[0])
     k = max(1, min(int(k), rows))
-    order = mx.argsort(values, axis=0)
-    positions = mx.arange(rows - 1, rows - k - 1, -1)
-    return mx.take(order, positions, axis=0)
+    if not indices_are_sorted:
+        index_order = mx.argsort(indices, axis=0)
+        values = mx.take_along_axis(values, index_order, axis=0)
+        indices = mx.take_along_axis(indices, index_order, axis=0)
+
+    # MLX argsort is stable. Sorting rows first and then sorting negative
+    # correlations preserves ascending row order within every equal-value run.
+    correlation_order = mx.argsort(-values, axis=0)
+    top_order = mx.take(correlation_order, mx.arange(k), axis=0)
+    return (
+        mx.take_along_axis(values, top_order, axis=0),
+        mx.take_along_axis(indices, top_order, axis=0),
+    )
 
 
 def _convert_profile_output(corr: np.ndarray, m: int, pearson: bool) -> np.ndarray:
@@ -890,33 +908,6 @@ def _convert_match_value(corr: float, m: int, pearson: bool) -> float:
     if pearson:
         return float(corr)
     return float(np.sqrt(max(2.0 * m * (1.0 - corr), 0.0)))
-
-
-def _iterate_blocks(
-    prepared_a: PreparedSeries,
-    prepared_b: PreparedSeries,
-    exclusion: int,
-    block_rows: int,
-):
-    n_cols = prepared_a.subsequences
-    col_indices = mx.arange(n_cols, dtype=mx.int32)
-    for row_start in range(0, prepared_b.subsequences, block_rows):
-        row_end = min(prepared_b.subsequences, row_start + block_rows)
-        row_indices = mx.arange(row_start, row_end, dtype=mx.int32)
-        block_b = mx.take(prepared_b.windows, row_indices, axis=0)
-        row_valid = mx.take(prepared_b.valid, row_indices, axis=0)
-        block = block_b @ prepared_a.windows.T
-        valid_mask = row_valid[:, None] & prepared_a.valid[None, :]
-        sentinel_block = mx.full(block.shape, SENTINEL, dtype=block.dtype)
-        block = mx.where(
-            valid_mask,
-            mx.clip(block, -1.0, 1.0),
-            sentinel_block,
-        )
-        if exclusion > 0:
-            diag_mask = mx.abs(row_indices[:, None] - col_indices[None, :]) < exclusion
-            block = mx.where(diag_mask, sentinel_block, block)
-        yield row_start, row_end, row_indices, block
 
 
 def _best_match_profile(
@@ -1322,23 +1313,28 @@ def _knn_profile(
         tile_rows,
         tile_columns,
     ):
-        local_order = _topk_desc_axis0(
-            tile.values, min(k, int(tile.values.shape[0]))
+        local_indices = mx.broadcast_to(
+            tile.row_indices[:, None], tile.values.shape
         )
-        local_corr = mx.take_along_axis(tile.values, local_order, axis=0)
-        local_idx = local_order + tile.row_start
+        local_corr, local_idx = _topk_corr_then_smallest_index(
+            tile.values,
+            local_indices,
+            k,
+            indices_are_sorted=True,
+        )
         merged_corr = mx.concatenate(
             [best_corr[tile.col_start], local_corr], axis=0
         )
         merged_idx = mx.concatenate(
             [best_idx[tile.col_start], local_idx], axis=0
         )
-        merged_order = _topk_desc_axis0(merged_corr, k)
-        best_corr[tile.col_start] = mx.take_along_axis(
-            merged_corr, merged_order, axis=0
-        )
-        best_idx[tile.col_start] = mx.take_along_axis(
-            merged_idx, merged_order, axis=0
+        (
+            best_corr[tile.col_start],
+            best_idx[tile.col_start],
+        ) = _topk_corr_then_smallest_index(
+            merged_corr,
+            merged_idx,
+            k,
         )
         scheduler.schedule(
             best_corr[tile.col_start], best_idx[tile.col_start]

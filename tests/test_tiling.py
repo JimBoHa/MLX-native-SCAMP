@@ -160,6 +160,40 @@ class MaxTileSizeTests(unittest.TestCase):
                     actual = call(max_tile_size=1024)
                 self._assert_profile_equal(expected, actual)
 
+    def test_knn_equal_correlations_prefer_smallest_rows_for_every_tile_shape(self):
+        pattern = np.array([0.0, 1.0, 0.0, -1.0], dtype=np.float64)
+        a = np.tile(pattern, 12)
+        b = np.tile(pattern, 16)
+        results = []
+
+        for budget in (64 * scamp_core.MIB, 8 * 1024):
+            with patch.object(
+                scamp_core,
+                "_similarity_tile_budget_bytes",
+                return_value=budget,
+            ):
+                results.append(
+                    mp.abjoin_knn(
+                        a,
+                        b,
+                        4,
+                        5,
+                        threshold=0.99,
+                        pearson=True,
+                        precision="double",
+                        gpus=[],
+                        max_tile_size=1024,
+                    )
+                )
+
+        self._assert_profile_equal(results[0], results[1])
+        first_column = [row for col, row, _ in results[0] if col == 0]
+        self.assertEqual([0, 4, 8, 12, 16], first_column)
+        np.testing.assert_allclose(
+            [value for col, _, value in results[0] if col == 0],
+            np.ones(5),
+        )
+
     def test_normalization_and_lazy_execution_stay_tile_bounded(self):
         rng = np.random.default_rng(2301)
         a = rng.normal(size=120).astype(np.float32)

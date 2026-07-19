@@ -383,18 +383,20 @@ class PyScampCompatTests(unittest.TestCase):
         series = np.arange(8, dtype=np.float32)
 
         with mx.stream(mx.cpu):
-            prepared = scamp_core._prepare_series(mx.array(series), 4)
+            prepared = scamp_core._prepare_tiled_series(mx.array(series), 4)
             blocks = list(
-                scamp_core._iterate_blocks(
+                scamp_core._iterate_tiled_blocks(
                     prepared,
                     prepared,
+                    4,
                     (4 + 3) // 4,
-                    block_rows=prepared.subsequences,
+                    tile_rows=prepared.subsequences,
+                    tile_columns=prepared.subsequences,
                 )
             )
 
         self.assertEqual(1, len(blocks))
-        block = np.asarray(blocks[0][3])
+        block = np.asarray(blocks[0].values)
         np.testing.assert_array_equal(
             np.diag(block),
             np.full((prepared.subsequences,), scamp_core.SENTINEL),
