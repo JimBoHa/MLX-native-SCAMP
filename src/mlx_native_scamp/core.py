@@ -1,38 +1,84 @@
 from __future__ import annotations
 
+import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
 import numpy as np
 
+from ._exclusion import self_join_exclusion
+
 SENTINEL = -2.0
 FLATNESS_EPSILON = 1e-13
-VALID_PRECISIONS = {"single", "mixed", "double", "ultra"}
+VALID_PRECISIONS = {"single", "double", "ultra"}
 BLOCK_ROWS = 256
+ROLLING_STATISTICS_BLOCK = 4096
+ROLLING_STATISTICS_SAFETY_FACTOR = 262144.0
 
 
 @dataclass(slots=True)
 class PreparedSeries:
-    windows: Any
-    valid: Any
+    windows: Any | None
+    valid: Any | None
     subsequences: int
+    recurrence_clean: Any | None = None
+    recurrence_means: Any | None = None
+    recurrence_inv_norm: Any | None = None
+    recurrence_df: Any | None = None
+    recurrence_dg: Any | None = None
+
+
+def _schedule_reducer_state(*state: Any) -> None:
+    """Schedule compact state so MLX can release its similarity block."""
+    mx.async_eval(*state)
 
 
 def gpu_supported() -> bool:
     try:
-        return mx.default_device() == mx.gpu
+        return bool(mx.metal.is_available())
     except Exception:
         return False
 
 
-def _ensure_1d_array(values: Any, name: str) -> Any:
+def _select_execution_stream(gpus: Any, threads: int) -> Any | None:
+    if gpus is None:
+        if threads > 0:
+            return mx.default_stream(mx.cpu)
+        return None
+
+    try:
+        gpu_ids = list(gpus)
+    except TypeError as exc:
+        raise ValueError("gpus must be a sequence of GPU device IDs") from exc
+
+    if not gpu_ids:
+        return mx.default_stream(mx.cpu)
+    if threads > 0:
+        raise ValueError(
+            "Concurrent CPU and Metal execution is not supported; "
+            "specify either gpus=[0] or a positive threads value"
+        )
+    if len(gpu_ids) > 1:
+        raise ValueError(
+            "MLX/Metal supports only one GPU; multi-GPU requests are not supported"
+        )
+    if gpu_ids[0] != 0:
+        raise ValueError(
+            f"Unsupported GPU device ID {gpu_ids[0]!r}; "
+            "MLX/Metal exposes only GPU device 0"
+        )
+    return mx.default_stream(mx.gpu)
+
+
+def _ensure_1d_array(values: Any, name: str, dtype: Any) -> Any:
     if isinstance(values, mx.array):
         array = values
-        if array.dtype != mx.float32:
-            array = array.astype(mx.float32)
+        if array.dtype != dtype:
+            array = array.astype(dtype)
     else:
-        array = mx.array(values, dtype=mx.float32)
+        array = mx.array(values, dtype=dtype)
     if array.ndim != 1:
         raise ValueError(f"{name} must be a 1D array")
     return array
@@ -51,11 +97,11 @@ def _parse_common_kwargs(kwargs: dict[str, Any], allow_matrix: bool = False, all
 
     precision = kwargs.get("precision", "double")
     if precision not in VALID_PRECISIONS:
-        raise ValueError("Invalid precision type specified: valid options are single, mixed, double, ultra")
+        raise ValueError("Invalid precision type specified: valid options are single, double, ultra")
 
     threshold = float(kwargs.get("threshold", 0.0))
-    if allow_threshold and (threshold < -1.0 or threshold > 1.0):
-        raise ValueError("Invalid threshold specified: value must be between -1 and 1")
+    if allow_threshold and (not np.isfinite(threshold) or threshold < -1.0 or threshold > 1.0):
+        raise ValueError("Invalid threshold specified: value must be finite and between -1 and 1")
 
     threads = int(kwargs.get("threads", 0))
     if threads < 0:
@@ -96,13 +142,404 @@ def _prepare_series(values: Any, m: int) -> PreparedSeries:
     finite = mx.isfinite(x)
     clean = mx.where(finite, x, mx.zeros_like(x))
     windows = _window_view(clean, m)
-    means = mx.mean(windows, axis=1, keepdims=True)
-    centered = windows - means
+    # Pearson correlation is invariant to an independent positive scale for
+    # each window.  Scaling per window prevents overflow without allowing one
+    # extreme value elsewhere in the series to underflow ordinary windows.
+    scales = mx.max(mx.abs(windows), axis=1, keepdims=True)
+    safe_scales = mx.where(scales > 0.0, scales, mx.ones_like(scales))
+    scaled_windows = windows / safe_scales
+    means = mx.mean(scaled_windows, axis=1, keepdims=True)
+    centered = scaled_windows - means
     norms_sq = mx.sum(centered * centered, axis=1)
-    valid = _sliding_valid_mask(finite, m) & (norms_sq > FLATNESS_EPSILON)
-    inv_norm = mx.where(valid, 1.0 / mx.sqrt(mx.maximum(norms_sq, FLATNESS_EPSILON)), 0.0)
+    scaled_flatness_limit = np.sqrt(FLATNESS_EPSILON) / safe_scales[:, 0]
+    valid = _sliding_valid_mask(finite, m) & (mx.sqrt(norms_sq) > scaled_flatness_limit)
+    safe_norms_sq = mx.where(valid, norms_sq, mx.ones_like(norms_sq))
+    inv_norm = mx.where(valid, 1.0 / mx.sqrt(safe_norms_sq), 0.0)
     normalized = centered * inv_norm[:, None]
-    return PreparedSeries(windows=normalized, valid=valid, subsequences=int(normalized.shape[0]))
+    means = means[:, 0]
+    df = mx.concatenate(
+        [(clean[m:] - clean[:-m]) * 0.5, mx.zeros((1,), dtype=clean.dtype)]
+    )
+    dg = mx.concatenate(
+        [
+            (clean[m:] - means[1:]) + (clean[:-m] - means[:-1]),
+            mx.zeros((1,), dtype=clean.dtype),
+        ]
+    )
+    return PreparedSeries(
+        windows=normalized,
+        valid=valid,
+        subsequences=int(normalized.shape[0]),
+        recurrence_clean=clean,
+        recurrence_means=means,
+        recurrence_inv_norm=inv_norm,
+        recurrence_df=df,
+        recurrence_dg=dg,
+    )
+
+
+def _rolling_mean_and_norm_sq_scalar(
+    clean: np.ndarray, m: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Compute sliding statistics with SCAMP's compensated scalar recurrence.
+
+    The compensated moving sum follows SCAMP's Ogita-style CPU precompute.  A
+    remove/add variance recurrence then retains linear time and memory without
+    subtracting two large rolling sums of squares.
+    """
+
+    subsequences = clean.size - m + 1
+    means = np.empty((subsequences,), dtype=np.float64)
+    norms_sq = np.empty((subsequences,), dtype=np.float64)
+
+    primary_sum = clean[0]
+    correction = 0.0
+    for value in clean[1:m]:
+        combined = primary_sum + value
+        displacement = combined - primary_sum
+        correction += (primary_sum - (combined - displacement)) + (
+            value - displacement
+        )
+        primary_sum = combined
+
+    mean = (primary_sum + correction) / m
+    differences = clean[:m] - mean
+    norm_sq = float(np.sum(differences * differences, dtype=np.float64))
+    if not np.isfinite(mean) or not np.isfinite(norm_sq):
+        return None
+    means[0] = mean
+    norms_sq[0] = max(norm_sq, 0.0)
+
+    for start in range(1, subsequences):
+        outgoing = clean[start - 1]
+        incoming = clean[start + m - 1]
+        previous_mean = mean
+
+        combined = primary_sum - outgoing
+        displacement = combined - primary_sum
+        correction += (primary_sum - (combined - displacement)) - (
+            outgoing + displacement
+        )
+        primary_sum = combined
+
+        combined = primary_sum + incoming
+        displacement = combined - primary_sum
+        correction += (primary_sum - (combined - displacement)) + (
+            incoming - displacement
+        )
+        primary_sum = combined
+        mean = (primary_sum + correction) / m
+        update = (incoming - outgoing) * (
+            incoming - mean + outgoing - previous_mean
+        )
+        next_norm_sq = norm_sq + update
+        if not np.isfinite(mean) or not np.isfinite(next_norm_sq):
+            return None
+
+        # Roundoff can put an exactly flat window infinitesimally below zero.
+        # A materially negative value means the recurrence has lost stability;
+        # let the caller use the portable normalized-window implementation.
+        error_scale = max(abs(norm_sq), abs(update), 1.0)
+        error_bound = (
+            256.0 * m * np.finfo(np.float64).eps * error_scale
+        )
+        if next_norm_sq < -error_bound:
+            return None
+        norm_sq = max(next_norm_sq, 0.0)
+        means[start] = mean
+        norms_sq[start] = norm_sq
+
+    return means, norms_sq
+
+
+def _rolling_mean_and_norm_sq_vectorized(
+    clean: np.ndarray, m: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Vectorize stable rolling statistics in bounded, checked blocks.
+
+    Each block starts from a high-accuracy window sum and a directly
+    centered norm. NumPy then evaluates the same remove/add mean and variance
+    recurrences as the scalar implementation. Blocks span at least one window,
+    so checkpoint work remains O(n) even when ``m`` is large. Conservative
+    forward-error bounds reject cancellation-sensitive blocks rather than
+    letting a fast approximation change the normalized profile.
+    """
+
+    subsequences = clean.size - m + 1
+    means = np.empty((subsequences,), dtype=np.float64)
+    norms_sq = np.empty((subsequences,), dtype=np.float64)
+    epsilon = np.finfo(np.float64).eps
+    block_span = max(ROLLING_STATISTICS_BLOCK, m)
+
+    for block_start in range(0, subsequences, block_span):
+        block_end = min(block_start + block_span, subsequences)
+        block_size = block_end - block_start
+        window = clean[block_start : block_start + m]
+
+        try:
+            primary_sum = math.fsum(window)
+            absolute_sum = math.fsum(np.abs(window))
+        except (OverflowError, ValueError):
+            return None
+        mean = primary_sum / m
+        differences = window - mean
+        squared_differences = differences * differences
+        norm_sq = float(np.sum(squared_differences, dtype=np.float64))
+        if not np.isfinite(mean) or not np.isfinite(norm_sq):
+            return None
+
+        means[block_start] = mean
+        norms_sq[block_start] = max(norm_sq, 0.0)
+        if block_size == 1:
+            continue
+
+        outgoing = clean[block_start : block_end - 1]
+        incoming = clean[block_start + m : block_end + m - 1]
+        delta = incoming - outgoing
+        absolute_incoming = np.abs(incoming)
+        absolute_outgoing = np.abs(outgoing)
+        delta_round_error = epsilon * (
+            absolute_incoming + absolute_outgoing
+        )
+        cumulative_delta = np.cumsum(delta, dtype=np.float64)
+        block_means = means[block_start:block_end]
+        block_means[1:] = (primary_sum + cumulative_delta) / m
+
+        second_factor = (
+            incoming
+            - block_means[1:]
+            + outgoing
+            - block_means[:-1]
+        )
+        updates = delta * second_factor
+        cumulative_update = np.cumsum(updates, dtype=np.float64)
+        block_norms = norms_sq[block_start:block_end]
+        block_norms[1:] = norm_sq + cumulative_update
+
+        recurrence_arrays = (
+            cumulative_delta,
+            block_means,
+            updates,
+            block_norms,
+        )
+        if any(not np.all(np.isfinite(array)) for array in recurrence_arrays):
+            return None
+
+        steps_epsilon = (block_size - 1) * epsilon
+        window_epsilon = m * epsilon
+        if steps_epsilon >= 1.0 or window_epsilon >= 1.0:
+            return None
+        steps_gamma = steps_epsilon / (1.0 - steps_epsilon)
+        window_gamma = window_epsilon / (1.0 - window_epsilon)
+
+        cumulative_delta_scale = float(np.sum(np.abs(delta), dtype=np.float64))
+        maximum_delta_sum = float(np.max(np.abs(cumulative_delta)))
+        sum_error = (
+            epsilon * absolute_sum
+            + float(np.sum(delta_round_error, dtype=np.float64))
+            + steps_gamma * cumulative_delta_scale
+            + epsilon * (abs(primary_sum) + maximum_delta_sum)
+        )
+        mean_error = sum_error / m
+
+        checkpoint_mean_error = (
+            epsilon * (absolute_sum + abs(primary_sum)) / m
+        )
+        difference_error = (
+            epsilon * (np.abs(window) + abs(mean))
+            + checkpoint_mean_error
+        )
+        initial_norm_error = (
+            (window_gamma + epsilon)
+            * float(np.sum(squared_differences, dtype=np.float64))
+            + 2.0
+            * float(
+                np.sum(
+                    np.abs(differences) * difference_error,
+                    dtype=np.float64,
+                )
+            )
+            + float(np.sum(difference_error * difference_error, dtype=np.float64))
+        )
+        second_factor_error = (
+            2.0 * mean_error
+            + 4.0
+            * epsilon
+            * (
+                absolute_incoming
+                + absolute_outgoing
+                + np.abs(block_means[1:])
+                + np.abs(block_means[:-1])
+            )
+        )
+        update_error = (
+            np.abs(delta) * second_factor_error
+            + delta_round_error * np.abs(second_factor)
+            + 2.0 * epsilon * np.abs(updates)
+        )
+        norm_error = (
+            initial_norm_error
+            + float(np.sum(update_error, dtype=np.float64))
+            + steps_gamma * float(np.sum(np.abs(updates), dtype=np.float64))
+            + epsilon
+            * (abs(norm_sq) + float(np.max(np.abs(cumulative_update))))
+        )
+        if not np.isfinite(mean_error) or not np.isfinite(norm_error):
+            return None
+
+        # The scalar path clamps tiny negative recurrence noise after every
+        # update. Re-run it when vectorized accumulation could cross zero, or
+        # when its forward error exceeds the accepted ~3.8e-6 fraction of the
+        # window's norm or centering scale.
+        if np.any(block_norms < 0.0):
+            return None
+        positive_norms = block_norms[block_norms > 0.0]
+        if positive_norms.size:
+            minimum_norm = float(np.min(positive_norms))
+            minimum_scale = math.sqrt(minimum_norm / m)
+            if (
+                ROLLING_STATISTICS_SAFETY_FACTOR * norm_error >= minimum_norm
+                or ROLLING_STATISTICS_SAFETY_FACTOR * mean_error
+                >= minimum_scale
+                or np.any(
+                    np.abs(block_norms - FLATNESS_EPSILON)
+                    <= ROLLING_STATISTICS_SAFETY_FACTOR * norm_error
+                )
+            ):
+                return None
+        if np.any(block_norms == 0.0):
+            covered = clean[block_start : block_end + m - 1]
+            if not np.all(covered == covered[0]):
+                return None
+
+    return means, norms_sq
+
+
+def _rolling_mean_and_norm_sq(
+    clean: np.ndarray, m: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Use vectorized rolling statistics with an exact scalar fallback."""
+
+    statistics = _rolling_mean_and_norm_sq_vectorized(clean, m)
+    if statistics is not None:
+        return statistics
+    return _rolling_mean_and_norm_sq_scalar(clean, m)
+
+
+def _prepare_metal_recurrence(values: Any, m: int) -> PreparedSeries | None:
+    """Prepare the arrays consumed by the float32 diagonal Metal kernel.
+
+    Input values have already been quantized to float32.  Converting those
+    values to float64 *before* subtracting a finite per-series origin preserves
+    their remaining variation at large offsets.  Statistics are then computed
+    on the CPU in float64 and transferred as five linear-sized float32 arrays.
+    """
+
+    source = np.asarray(values, dtype=np.float32)
+    finite = np.isfinite(source)
+    clean = np.zeros(source.shape, dtype=np.float64)
+    if np.any(finite):
+        finite_values = source[finite].astype(np.float64)
+        clean[finite] = finite_values - finite_values[0]
+    if not np.all(np.isfinite(clean)):
+        return None
+
+    statistics = _rolling_mean_and_norm_sq(clean, m)
+    if statistics is None:
+        return None
+    means, norms_sq = statistics
+
+    invalid_prefix = np.concatenate(
+        [np.zeros((1,), dtype=np.int64), np.cumsum(~finite, dtype=np.int64)]
+    )
+    if m == 1:
+        nonflat = np.zeros(norms_sq.shape, dtype=bool)
+    else:
+        changes = clean[1:] != clean[:-1]
+        change_prefix = np.concatenate(
+            [
+                np.zeros((1,), dtype=np.int64),
+                np.cumsum(changes, dtype=np.int64),
+            ]
+        )
+        nonflat = change_prefix[m - 1 :] - change_prefix[: -(m - 1)] > 0
+    # Centering translates values but never scales them, so SCAMP's flatness
+    # threshold remains expressed in the original input units.
+    valid = (invalid_prefix[m:] - invalid_prefix[:-m] == 0) & (
+        norms_sq > FLATNESS_EPSILON
+    ) & nonflat
+    inv_norm = np.zeros(norms_sq.shape, dtype=np.float64)
+    inv_norm[valid] = 1.0 / np.sqrt(norms_sq[valid])
+
+    df = np.zeros(means.shape, dtype=np.float64)
+    dg = np.zeros(means.shape, dtype=np.float64)
+    if means.size > 1:
+        df[:-1] = (clean[m:] - clean[:-m]) * 0.5
+        dg[:-1] = (clean[m:] - means[1:]) + (clean[:-m] - means[:-1])
+
+    recurrence = (clean, means, inv_norm, df, dg)
+    float32_limit = float(np.finfo(np.float32).max)
+    if any(
+        not np.all(np.isfinite(array))
+        or (array.size and float(np.max(np.abs(array))) > float32_limit)
+        for array in recurrence
+    ):
+        return None
+
+    clean32, means32, inv_norm32, df32, dg32 = (
+        mx.array(array.astype(np.float32, copy=False), dtype=mx.float32)
+        for array in recurrence
+    )
+    return PreparedSeries(
+        windows=None,
+        valid=None,
+        subsequences=int(means.size),
+        recurrence_clean=clean32,
+        recurrence_means=means32,
+        recurrence_inv_norm=inv_norm32,
+        recurrence_df=df32,
+        recurrence_dg=dg32,
+    )
+
+
+def _is_float32_input(values: Any) -> bool:
+    if isinstance(values, mx.array):
+        return values.dtype == mx.float32
+    try:
+        return np.asarray(values).dtype == np.dtype(np.float32)
+    except (TypeError, ValueError):
+        return False
+
+
+def _metal_recurrence_is_safe(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+) -> bool:
+    recurrence_arrays = (
+        prepared_a.recurrence_clean,
+        prepared_a.recurrence_means,
+        prepared_a.recurrence_inv_norm,
+        prepared_a.recurrence_df,
+        prepared_a.recurrence_dg,
+        prepared_b.recurrence_clean,
+        prepared_b.recurrence_means,
+        prepared_b.recurrence_inv_norm,
+        prepared_b.recurrence_df,
+        prepared_b.recurrence_dg,
+    )
+    if any(value is None or value.dtype != mx.float32 for value in recurrence_arrays):
+        return False
+
+    max_a = float(np.asarray(mx.max(mx.abs(prepared_a.recurrence_clean))))
+    max_b = float(np.asarray(mx.max(mx.abs(prepared_b.recurrence_clean))))
+    longest_diagonal = max(prepared_a.subsequences, prepared_b.subsequences)
+    conservative_bound = (
+        8.0 * (m + 2 * longest_diagonal) * max_a * max_b
+    )
+    return np.isfinite(conservative_bound) and (
+        conservative_bound <= float(np.finfo(np.float32).max)
+    )
 
 
 def _topk_desc_axis0(values: Any, k: int) -> Any:
@@ -133,7 +570,7 @@ def _convert_match_value(corr: float, m: int, pearson: bool) -> float:
 
 def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, self_join: bool, block_rows: int):
     n_cols = prepared_a.subsequences
-    exclusion = m // 4
+    exclusion = self_join_exclusion(m)
     col_indices = mx.arange(n_cols, dtype=mx.int32)
     for row_start in range(0, prepared_b.subsequences, block_rows):
         row_end = min(prepared_b.subsequences, row_start + block_rows)
@@ -142,16 +579,35 @@ def _iterate_blocks(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
         row_valid = mx.take(prepared_b.valid, row_indices, axis=0)
         block = block_b @ prepared_a.windows.T
         valid_mask = row_valid[:, None] & prepared_a.valid[None, :]
-        sentinel_block = mx.full(block.shape, SENTINEL, dtype=mx.float32)
-        block = mx.where(valid_mask, mx.clip(block, -1.0, 1.0), sentinel_block)
+        sentinel_block = mx.full(block.shape, SENTINEL, dtype=block.dtype)
+        block = mx.where(
+            valid_mask,
+            mx.clip(block, -1.0, 1.0),
+            sentinel_block,
+        )
         if self_join and exclusion > 0:
             diag_mask = mx.abs(row_indices[:, None] - col_indices[None, :]) < exclusion
             block = mx.where(diag_mask, sentinel_block, block)
         yield row_start, row_end, row_indices, block
 
 
-def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, self_join: bool) -> tuple[np.ndarray, np.ndarray]:
-    best_corr = mx.full((prepared_a.subsequences,), SENTINEL, dtype=mx.float32)
+def _best_match_profile(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    pearson: bool,
+    self_join: bool,
+    use_metal_kernel: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    if use_metal_kernel:
+        from ._metal_1nn import best_match
+
+        corr_np, idx_np = best_match(prepared_a, prepared_b, m, self_join)
+        return _convert_profile_output(corr_np, m, pearson), idx_np
+
+    best_corr = mx.full(
+        (prepared_a.subsequences,), SENTINEL, dtype=prepared_a.windows.dtype
+    )
     best_idx = mx.full((prepared_a.subsequences,), -1, dtype=mx.int32)
     for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         block_best_corr = mx.max(block, axis=0)
@@ -159,18 +615,182 @@ def _best_match_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, 
         update = block_best_corr > best_corr
         best_corr = mx.where(update, block_best_corr, best_corr)
         best_idx = mx.where(update, block_best_idx, best_idx)
+        _schedule_reducer_state(best_corr, best_idx)
     corr_np = np.asarray(best_corr).astype(np.float32)
     idx_np = np.asarray(best_idx).astype(np.int32)
     idx_np[corr_np < -1.0] = -1
     return _convert_profile_output(corr_np, m, pearson), idx_np
 
 
-def _sum_threshold_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, threshold: float, self_join: bool) -> np.ndarray:
-    accum = mx.zeros((prepared_a.subsequences,), dtype=mx.float32)
+def _sum_threshold_profile(
+    prepared_a: PreparedSeries,
+    prepared_b: PreparedSeries,
+    m: int,
+    threshold: float,
+    self_join: bool,
+    use_metal_kernel: bool,
+) -> np.ndarray:
+    if use_metal_kernel:
+        from ._metal_sum import sum_threshold
+
+        return sum_threshold(prepared_a, prepared_b, m, threshold, self_join)
+
+    accum = mx.zeros((prepared_a.subsequences,), dtype=prepared_a.windows.dtype)
     for _, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         filtered = mx.where(block > threshold, block, mx.zeros_like(block))
         accum = accum + mx.sum(filtered, axis=0)
+        _schedule_reducer_state(accum)
     return np.asarray(accum, dtype=np.float64)
+
+
+def _metal_sum_workload_is_worthwhile(
+    column_subsequences: int,
+    row_subsequences: int,
+    m: int,
+    qualifying_density: float,
+    self_join: bool,
+) -> bool:
+    """Apply the benchmarked pair floor for a sampled SUM workload."""
+
+    if self_join:
+        active_diagonals = max(
+            column_subsequences - self_join_exclusion(m), 0
+        )
+        comparisons = active_diagonals * (active_diagonals + 1) // 2
+    else:
+        shorter = min(column_subsequences, row_subsequences)
+        longer = max(column_subsequences, row_subsequences)
+        if shorter <= 0 or longer > 2 * shorter:
+            return False
+        comparisons = column_subsequences * row_subsequences
+
+    if self_join and qualifying_density <= 0.05:
+        minimum_comparisons = 8_000_000
+    elif self_join and qualifying_density <= 0.18:
+        minimum_comparisons = 12_000_000
+    elif self_join and qualifying_density <= 0.35:
+        minimum_comparisons = 40_000_000
+    elif not self_join and qualifying_density <= 0.05:
+        minimum_comparisons = 144_000_000
+    elif not self_join and qualifying_density <= 0.18:
+        minimum_comparisons = 625_000_000
+    else:
+        return False
+
+    # Short windows make the portable matrix multiply cheap relative to Metal
+    # dispatch and atomic overhead.  Keep those crossovers farther out.
+    if m < 32:
+        minimum_comparisons *= 2
+    elif m < 64:
+        minimum_comparisons = minimum_comparisons * 3 // 2
+    return comparisons >= minimum_comparisons
+
+
+def _estimate_metal_sum_density(
+    values_a: Any,
+    values_b: Any,
+    m: int,
+    threshold: float,
+    self_join: bool,
+) -> float | None:
+    """Sample the fraction of pairs that would require a Metal atomic add."""
+
+    sample_count = min(256, 262_144 // m)
+    if sample_count < 32:
+        return None
+
+    source_a = np.asarray(values_a, dtype=np.float32).astype(np.float64)
+    source_b = (
+        source_a
+        if self_join
+        else np.asarray(values_b, dtype=np.float32).astype(np.float64)
+    )
+    n_a = source_a.size - m + 1
+    n_b = source_b.size - m + 1
+    seed = (
+        n_a * 0x9E3779B1
+        + n_b * 0x85EBCA6B
+        + m * 0xC2B2AE35
+        + int(self_join)
+    ) & ((1 << 64) - 1)
+    generator = np.random.default_rng(seed)
+
+    if self_join:
+        exclusion = self_join_exclusion(m)
+        sampled_rows: list[int] = []
+        sampled_columns: list[int] = []
+        while len(sampled_rows) < sample_count:
+            candidates = sample_count * 2
+            first = generator.integers(0, n_a, size=candidates)
+            second = generator.integers(0, n_a, size=candidates)
+            rows = np.minimum(first, second)
+            columns = np.maximum(first, second)
+            eligible = columns - rows >= exclusion
+            sampled_rows.extend(rows[eligible].tolist())
+            sampled_columns.extend(columns[eligible].tolist())
+        row_indices = np.asarray(sampled_rows[:sample_count])
+        column_indices = np.asarray(sampled_columns[:sample_count])
+    else:
+        column_indices = generator.integers(0, n_a, size=sample_count)
+        row_indices = generator.integers(0, n_b, size=sample_count)
+
+    finite_a = np.isfinite(source_a)
+    finite_b = finite_a if self_join else np.isfinite(source_b)
+    if np.any(finite_a):
+        source_a[finite_a] -= source_a[finite_a][0]
+    if not self_join and np.any(finite_b):
+        source_b[finite_b] -= source_b[finite_b][0]
+    source_a[~finite_a] = 0.0
+    if not self_join:
+        source_b[~finite_b] = 0.0
+
+    offsets = np.arange(m)
+    a_positions = column_indices[:, None] + offsets
+    b_positions = row_indices[:, None] + offsets
+    windows_a = source_a[a_positions]
+    windows_b = source_b[b_positions]
+    valid = np.all(finite_a[a_positions], axis=1) & np.all(
+        finite_b[b_positions], axis=1
+    )
+    windows_a -= np.mean(windows_a, axis=1, keepdims=True)
+    windows_b -= np.mean(windows_b, axis=1, keepdims=True)
+    norm_a_sq = np.sum(windows_a * windows_a, axis=1)
+    norm_b_sq = np.sum(windows_b * windows_b, axis=1)
+    valid &= (norm_a_sq > FLATNESS_EPSILON) & (
+        norm_b_sq > FLATNESS_EPSILON
+    )
+    correlations = np.full((sample_count,), SENTINEL, dtype=np.float64)
+    correlations[valid] = np.sum(
+        windows_a[valid] * windows_b[valid], axis=1
+    ) / np.sqrt(norm_a_sq[valid] * norm_b_sq[valid])
+    qualifying = int(np.count_nonzero(correlations > threshold))
+
+    # Five synthetic successes add a small upper margin so sampling near a
+    # bucket boundary chooses the more conservative crossover.
+    return min(1.0, (qualifying + 5) / sample_count)
+
+
+def _metal_sum_is_worthwhile(
+    values_a: Any,
+    values_b: Any,
+    column_subsequences: int,
+    row_subsequences: int,
+    m: int,
+    threshold: float,
+    self_join: bool,
+) -> bool:
+    """Estimate whether sparse Metal SUM should beat the portable reducer."""
+
+    if not _metal_sum_workload_is_worthwhile(
+        column_subsequences, row_subsequences, m, 0.0, self_join
+    ):
+        return False
+    density = _estimate_metal_sum_density(
+        values_a, values_b, m, threshold, self_join
+    )
+    return density is not None and _metal_sum_workload_is_worthwhile(
+        column_subsequences, row_subsequences, m, density, self_join
+    )
 
 
 def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, pearson: bool, threshold: float, rows: int, cols: int, self_join: bool) -> np.ndarray:
@@ -178,29 +798,30 @@ def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
     col_edges = np.ceil(np.arange(cols + 1) * prepared_a.subsequences / cols).astype(int)
     col_ranges = [(int(col_edges[c]), int(col_edges[c + 1])) for c in range(cols)]
     col_indices = mx.arange(prepared_a.subsequences, dtype=mx.int32)
-    summary = mx.full((rows, cols), SENTINEL, dtype=mx.float32)
+    summary = mx.full((rows, cols), SENTINEL, dtype=prepared_a.windows.dtype)
 
     for row_start, row_end, row_indices, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
         if self_join:
             upper_mask = row_indices[:, None] <= col_indices[None, :]
-            block = mx.where(upper_mask, block, mx.full(block.shape, SENTINEL, dtype=mx.float32))
+            block = mx.where(upper_mask, block, mx.full(block.shape, SENTINEL, dtype=block.dtype))
         block_rows_summary: list[Any] = []
         for r in range(rows):
             rs = int(max(row_start, row_edges[r]))
             re = int(min(row_end, row_edges[r + 1]))
             if rs >= re:
-                block_rows_summary.append(mx.full((cols,), SENTINEL, dtype=mx.float32))
+                block_rows_summary.append(mx.full((cols,), SENTINEL, dtype=summary.dtype))
                 continue
             row_slice = block[rs - row_start : re - row_start]
             block_cols_summary: list[Any] = []
             for c in range(cols):
                 cs, ce = col_ranges[c]
                 if cs >= ce:
-                    block_cols_summary.append(mx.array(SENTINEL, dtype=mx.float32))
+                    block_cols_summary.append(mx.array(SENTINEL, dtype=summary.dtype))
                     continue
                 block_cols_summary.append(mx.max(row_slice[:, cs:ce]))
             block_rows_summary.append(mx.stack(block_cols_summary, axis=0))
         summary = mx.maximum(summary, mx.stack(block_rows_summary, axis=0))
+        _schedule_reducer_state(summary)
 
     summary = np.asarray(summary, dtype=np.float32)
     summary[summary < -1.0] = np.nan
@@ -215,7 +836,7 @@ def _matrix_summary(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: i
 
 def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int, k: int, threshold: float, pearson: bool, self_join: bool) -> list[tuple[int, int, float]]:
     n_cols = prepared_a.subsequences
-    best_corr = mx.full((k, n_cols), SENTINEL, dtype=mx.float32)
+    best_corr = mx.full((k, n_cols), SENTINEL, dtype=prepared_a.windows.dtype)
     best_idx = mx.full((k, n_cols), -1, dtype=mx.int32)
 
     for row_start, _, _, block in _iterate_blocks(prepared_a, prepared_b, m, self_join, block_rows=BLOCK_ROWS):
@@ -227,6 +848,7 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
         merged_order = _topk_desc_axis0(merged_corr, k)
         best_corr = mx.take_along_axis(merged_corr, merged_order, axis=0)
         best_idx = mx.take_along_axis(merged_idx, merged_order, axis=0)
+        _schedule_reducer_state(best_corr, best_idx)
 
     corr_np = np.asarray(best_corr).astype(np.float32)
     idx_np = np.asarray(best_idx).astype(np.int32)
@@ -236,65 +858,234 @@ def _knn_profile(prepared_a: PreparedSeries, prepared_b: PreparedSeries, m: int,
         for rank in range(k):
             corr = corr_np[rank, col]
             row = int(idx_np[rank, col])
-            if corr < threshold or corr < -1.0 or row < 0 or row in seen_rows:
+            if corr <= threshold or corr < -1.0 or row < 0 or row in seen_rows:
                 continue
             seen_rows.add(row)
             results.append((col, row, _convert_match_value(corr, m, pearson)))
     return results
 
 
-def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: float = 0.0, mheight: int = 50, mwidth: int = 50, profile: str, k: int | None = None):
-    series_a = _ensure_1d_array(a, "a")
+def _run_profile(
+    a: Any,
+    b: Any | None,
+    m: int,
+    *,
+    pearson: bool,
+    precision: str,
+    threshold: float = 0.0,
+    mheight: int = 50,
+    mwidth: int = 50,
+    profile: str,
+    k: int | None = None,
+    use_metal_1nn: bool = False,
+    use_metal_sum: bool = False,
+):
+    has_b = b is not None
+    float32_sources = _is_float32_input(a) and (
+        not has_b or _is_float32_input(b)
+    )
+    compute_dtype = mx.float32 if precision == "single" else mx.float64
+    # Metal does not provide native float64. The execution resolver places
+    # double and ultra on MLX CPU; single can stay on the selected Metal GPU.
+    # Upstream's ultra mode changes its sliding recurrence, while this direct
+    # normalized-window implementation uses the same float64 path for both.
+    series_a = _ensure_1d_array(a, "a", compute_dtype)
     if m <= 0:
         raise ValueError("m must be greater than 0")
     if int(series_a.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(a)")
 
-    has_b = b is not None
-    series_b = _ensure_1d_array(b, "b") if has_b else series_a
+    series_b = _ensure_1d_array(b, "b", compute_dtype) if has_b else series_a
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
 
-    prepared_a = _prepare_series(series_a, m)
-    prepared_b = _prepare_series(series_b, m)
     self_join = not has_b
 
+    sum_recurrence = (
+        profile == "sum"
+        and use_metal_sum
+        and float32_sources
+        and threshold >= 0.0
+        and _metal_sum_is_worthwhile(
+            a,
+            a if self_join else b,
+            int(series_a.shape[0]) - m + 1,
+            int(series_b.shape[0]) - m + 1,
+            m,
+            threshold,
+            self_join,
+        )
+    )
+    if (
+        profile == "1nn" and use_metal_1nn and float32_sources
+    ) or sum_recurrence:
+        recurrence_a = _prepare_metal_recurrence(series_a, m)
+        recurrence_b = (
+            recurrence_a
+            if self_join
+            else _prepare_metal_recurrence(series_b, m)
+        )
+        if (
+            recurrence_a is not None
+            and recurrence_b is not None
+            and _metal_recurrence_is_safe(recurrence_a, recurrence_b, m)
+        ):
+            if profile == "1nn":
+                return _best_match_profile(
+                    recurrence_a,
+                    recurrence_b,
+                    m,
+                    pearson,
+                    self_join,
+                    True,
+                )
+            return _sum_threshold_profile(
+                recurrence_a,
+                recurrence_b,
+                m,
+                threshold,
+                self_join,
+                True,
+            )
+
+    # Portable reducers intentionally retain their normalized-window path.
+    # It is only materialized after the custom recurrence is ineligible or has
+    # conservatively rejected the input.
+    prepared_a = _prepare_series(series_a, m)
+    prepared_b = _prepare_series(series_b, m)
+
     if profile == "1nn":
-        return _best_match_profile(prepared_a, prepared_b, m, pearson, self_join)
+        return _best_match_profile(
+            prepared_a,
+            prepared_b,
+            m,
+            pearson,
+            self_join,
+            False,
+        )
     if profile == "sum":
-        return _sum_threshold_profile(prepared_a, prepared_b, m, threshold, self_join)
+        return _sum_threshold_profile(
+            prepared_a,
+            prepared_b,
+            m,
+            threshold,
+            self_join,
+            False,
+        )
     if profile == "matrix":
-        return _matrix_summary(prepared_a, prepared_b, m, pearson, threshold, mheight, mwidth, self_join)
+        return _matrix_summary(
+            prepared_a,
+            prepared_b,
+            m,
+            pearson,
+            threshold,
+            mheight,
+            mwidth,
+            self_join,
+        )
     if profile == "knn":
         if k is None or k <= 0:
             raise ValueError("k must be greater than 0")
-        return _knn_profile(prepared_a, prepared_b, m, k, threshold, pearson, self_join)
+        return _knn_profile(
+            prepared_a, prepared_b, m, k, threshold, pearson, self_join
+        )
     raise ValueError(f"Unknown profile type: {profile}")
+
+
+def _resolve_execution_stream(params: dict[str, Any]) -> Any | None:
+    execution_stream = _select_execution_stream(params["gpus"], params["threads"])
+    if params["precision"] == "single":
+        return execution_stream
+
+    if execution_stream is not None and execution_stream.device == mx.gpu:
+        raise ValueError(
+            "Metal does not support float64; use precision='single' with "
+            "gpus=[0], or select CPU execution for double/ultra precision"
+        )
+    return mx.default_stream(mx.cpu)
+
+
+def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
+    execution_stream = _resolve_execution_stream(params)
+    execution_device = (
+        mx.default_device()
+        if execution_stream is None
+        else execution_stream.device
+    )
+    use_metal_1nn = (
+        params["precision"] == "single"
+        and execution_device == mx.gpu
+        and mx.metal.is_available()
+    )
+    stream_context = (
+        nullcontext()
+        if execution_stream is None
+        else mx.stream(execution_stream)
+    )
+    with stream_context:
+        return _run_profile(
+            *args,
+            precision=params["precision"],
+            use_metal_1nn=use_metal_1nn,
+            use_metal_sum=use_metal_1nn,
+            **kwargs,
+        )
 
 
 def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
     params = _parse_common_kwargs(kwargs)
-    return _run_profile(a, None, m, pearson=params["pearson"], profile="1nn")
+    return _run_profile_with_resources(
+        params,
+        a,
+        None,
+        m,
+        pearson=params["pearson"],
+        profile="1nn",
+    )
 
 
 def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
     params = _parse_common_kwargs(kwargs)
-    return _run_profile(a, b, m, pearson=params["pearson"], profile="1nn")
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        profile="1nn",
+    )
 
 
 def selfjoin_sum(a: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, None, m, pearson=True, threshold=params["threshold"], profile="sum")
+    return _run_profile_with_resources(
+        params,
+        a,
+        None,
+        m,
+        pearson=True,
+        threshold=params["threshold"],
+        profile="sum",
+    )
 
 
 def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, b, m, pearson=True, threshold=params["threshold"], profile="sum")
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=True,
+        threshold=params["threshold"],
+        profile="sum",
+    )
 
 
 def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True, allow_matrix=True)
-    return _run_profile(
+    return _run_profile_with_resources(
+        params,
         a,
         None,
         m,
@@ -308,7 +1099,8 @@ def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True, allow_matrix=True)
-    return _run_profile(
+    return _run_profile_with_resources(
+        params,
         a,
         b,
         m,
@@ -322,9 +1114,27 @@ def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, None, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
+    return _run_profile_with_resources(
+        params,
+        a,
+        None,
+        m,
+        pearson=params["pearson"],
+        threshold=params["threshold"],
+        profile="knn",
+        k=k,
+    )
 
 
 def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, b, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        threshold=params["threshold"],
+        profile="knn",
+        k=k,
+    )
