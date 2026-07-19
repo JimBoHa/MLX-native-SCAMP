@@ -5,7 +5,6 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-
 _INPUT_NAMES = [
     "clean_a",
     "clean_b",
@@ -27,6 +26,7 @@ _PROFILE_SOURCE = r"""
     uint m = config[0];
     uint exclusion = config[1];
     bool self_join = config[2] != 0;
+    bool apply_exclusion = config[3] != 0;
 
     int diagonal;
     if (self_join) {
@@ -50,8 +50,10 @@ _PROFILE_SOURCE = r"""
     }
 
     for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
+        bool excluded = apply_exclusion &&
+            metal::abs(int(col) - int(row)) < int(exclusion);
         float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
+        if (!excluded && norm_product > 0.0f) {
             float corr = covariance * norm_product;
             if (metal::isfinite(corr)) {
                 corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
@@ -80,6 +82,7 @@ _INDEX_SOURCE = r"""
     uint m = config[0];
     uint exclusion = config[1];
     bool self_join = config[2] != 0;
+    bool apply_exclusion = config[3] != 0;
 
     int diagonal;
     if (self_join) {
@@ -103,8 +106,10 @@ _INDEX_SOURCE = r"""
     }
 
     for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
+        bool excluded = apply_exclusion &&
+            metal::abs(int(col) - int(row)) < int(exclusion);
         float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
+        if (!excluded && norm_product > 0.0f) {
             float corr = covariance * norm_product;
             if (metal::isfinite(corr)) {
                 corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
@@ -164,17 +169,20 @@ def _profile_state(
     prepared_b: Any,
     m: int,
     self_join: bool,
+    exclusion: int,
 ) -> tuple[Any, list[Any], int, int, int]:
     """Launch the correlation pass and return its reusable device state."""
 
     n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
-    exclusion = (m + 3) // 4 if self_join else 0
     diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
     if diagonal_count <= 0:
         return None, [], n_a, 0, 1
 
-    config = mx.array([m, exclusion, int(self_join)], dtype=mx.uint32)
+    config = mx.array(
+        [m, exclusion, int(self_join), int(exclusion > 0)],
+        dtype=mx.uint32,
+    )
     inputs = [
         prepared_a.recurrence_clean,
         prepared_b.recurrence_clean,
@@ -206,10 +214,13 @@ def best_profile(
     prepared_b: Any,
     m: int,
     self_join: bool,
+    exclusion: int,
 ) -> np.ndarray:
     """Compute an index-free float32 1NN profile on Metal."""
 
-    best, _, n_a, _, _ = _profile_state(prepared_a, prepared_b, m, self_join)
+    best, _, n_a, _, _ = _profile_state(
+        prepared_a, prepared_b, m, self_join, exclusion
+    )
     if best is None:
         return np.full((n_a,), -2.0, dtype=np.float32)
     return _decode_ordered_keys(np.asarray(best, dtype=np.uint32)).copy()
@@ -220,11 +231,12 @@ def best_match(
     prepared_b: Any,
     m: int,
     self_join: bool,
+    exclusion: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute an indexed float32 1NN profile on Metal."""
 
     best, inputs, n_a, diagonal_count, threadgroup_width = _profile_state(
-        prepared_a, prepared_b, m, self_join
+        prepared_a, prepared_b, m, self_join, exclusion
     )
     if best is None:
         return (
