@@ -131,8 +131,9 @@ def execute_1nn_tile(
                 expression_min = base_delta - (column_count - 1)
                 expression_max = base_delta + (row_count - 1)
                 if (
-                    int32.min <= expression_min
+                    int32.min < expression_min
                     and expression_max <= int32.max
+                    and exclusion_zone <= int32.max
                 ):
                     row_indices = mx.arange(row_count, dtype=mx.int32)
                     column_indices = mx.arange(column_count, dtype=mx.int32)

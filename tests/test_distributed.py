@@ -286,6 +286,53 @@ class DistributedWorkerTests(unittest.TestCase):
         self.assertTrue(np.all(output.row_values[1:] >= -1.0))
         np.testing.assert_array_equal(output.row_indices[1:], np.zeros(2, dtype=np.int64))
 
+    def test_uint64_exclusion_uses_the_safe_mask_path(self):
+        values = np.array([0.0, 1.0, 0.0, -1.0], dtype=np.float32)
+        output = execute_1nn_tile(
+            values,
+            None,
+            3,
+            row_start=0,
+            row_stop=2,
+            column_start=0,
+            column_stop=2,
+            exclusion_zone=2**31,
+            compute_rows=True,
+            compute_columns=True,
+            device=self.server.service.device,
+        )
+        np.testing.assert_array_equal(output.column_values, np.full(2, -2.0))
+        np.testing.assert_array_equal(output.column_indices, np.full(2, -1))
+        np.testing.assert_array_equal(output.row_values, np.full(2, -2.0))
+        np.testing.assert_array_equal(output.row_indices, np.full(2, -1))
+
+    def test_int32_min_absolute_value_cannot_wrap(self):
+        window = 3
+        a = np.array([0.0, 1.0, 0.0, -1.0, 0.5], dtype=np.float32)
+        b = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        column_start = int(np.iinfo(np.int32).max) - 1
+        output = execute_1nn_tile(
+            a,
+            b,
+            window,
+            row_start=0,
+            row_stop=1,
+            column_start=column_start,
+            column_stop=column_start + 3,
+            exclusion_zone=int(np.iinfo(np.int32).max),
+            compute_rows=True,
+            compute_columns=True,
+            device=self.server.service.device,
+            series_a_offset=column_start,
+            series_b_offset=0,
+        )
+        self.assertEqual(-2.0, output.column_values[0])
+        self.assertEqual(-1, output.column_indices[0])
+        self.assertTrue(np.all(output.column_values[1:] >= -1.0))
+        np.testing.assert_array_equal(
+            output.column_indices[1:], np.zeros(2, dtype=np.int64)
+        )
+
     def test_client_rejects_mismatched_response_identity(self):
         request = make_tile_request(self.a, self.b, window=self.window)
         bad_result = messages.ProfileTileResult(
