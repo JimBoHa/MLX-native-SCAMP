@@ -57,7 +57,7 @@ def distance_matrix(a, b, m):
     na = len(a) - m + 1
     nb = len(b) - m + 1
     out = np.ones((nb, na), dtype=np.float64) * -2.0
-    minlag = m // 4 if not has_b else 0
+    minlag = (m + 3) // 4 if not has_b else 0
 
     for row in range(nb):
         y = b[row : row + m]
