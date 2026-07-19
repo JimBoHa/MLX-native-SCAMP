@@ -1123,6 +1123,67 @@ def _bidirectional_best_match_profile(
     )
 
 
+def _best_match_values(
+    prepared_a: PreparedSeries | TiledSeries,
+    prepared_b: PreparedSeries | TiledSeries,
+    m: int,
+    pearson: bool,
+    self_join: bool,
+    exclusion: int,
+    use_metal_kernel: bool,
+    tile_rows: int | None = None,
+    tile_columns: int | None = None,
+) -> np.ndarray:
+    if use_metal_kernel:
+        from ._metal_1nn import best_profile
+
+        corr_np = best_profile(
+            prepared_a, prepared_b, m, self_join, exclusion
+        )
+        return _convert_profile_output(corr_np, m, pearson)
+
+    if not isinstance(prepared_a, TiledSeries) or not isinstance(
+        prepared_b, TiledSeries
+    ):
+        raise TypeError("portable reducers require tiled series inputs")
+    if tile_rows is None or tile_columns is None:
+        raise TypeError("portable reducers require explicit tile dimensions")
+
+    column_ranges = list(
+        _tile_ranges(prepared_a.subsequences, tile_columns)
+    )
+    best_corr = {
+        start: mx.full(
+            (end - start,), SENTINEL, dtype=prepared_a.values.dtype
+        )
+        for start, end in column_ranges
+    }
+    scheduler = ReducerScheduler()
+    for tile in _iterate_tiled_blocks(
+        prepared_a,
+        prepared_b,
+        m,
+        exclusion,
+        tile_rows,
+        tile_columns,
+    ):
+        block_best_corr = mx.max(tile.values, axis=0)
+        current_corr = best_corr[tile.col_start]
+        update = block_best_corr > current_corr
+        best_corr[tile.col_start] = mx.where(
+            update, block_best_corr, current_corr
+        )
+        scheduler.schedule(best_corr[tile.col_start])
+    scheduler.finish()
+    corr_np = np.concatenate(
+        [
+            np.asarray(best_corr[start]).astype(np.float32)
+            for start, _ in column_ranges
+        ]
+    )
+    return _convert_profile_output(corr_np, m, pearson)
+
+
 def _sum_threshold_profile(
     prepared_a: PreparedSeries | TiledSeries,
     prepared_b: PreparedSeries | TiledSeries,
@@ -1587,13 +1648,12 @@ def _run_profile(
             self_join,
         )
     )
-    one_nn_recurrence = (
-        profile in {"1nn", "1nn_bidirectional"}
+    if (
+        profile in {"1nn", "1nn_value", "1nn_bidirectional"}
         and use_metal_1nn
         and float32_sources
         and join_fits_tile
-    )
-    if one_nn_recurrence or sum_recurrence:
+    ) or sum_recurrence:
         recurrence_a = _prepare_metal_recurrence(series_a, m)
         recurrence_b = (
             recurrence_a
@@ -1605,7 +1665,17 @@ def _run_profile(
             and recurrence_b is not None
             and _metal_recurrence_is_safe(recurrence_a, recurrence_b, m)
         ):
-            if profile == "1nn":
+            if profile in {"1nn", "1nn_value"}:
+                if profile == "1nn_value":
+                    return _best_match_values(
+                        recurrence_a,
+                        recurrence_b,
+                        m,
+                        pearson,
+                        self_join,
+                        exclusion,
+                        True,
+                    )
                 return _best_match_profile(
                     recurrence_a,
                     recurrence_b,
@@ -1649,6 +1719,18 @@ def _run_profile(
         prepared_a if self_join else _prepare_tiled_series(series_b, m)
     )
 
+    if profile == "1nn_value":
+        return _best_match_values(
+            prepared_a,
+            prepared_b,
+            m,
+            pearson,
+            self_join,
+            exclusion,
+            False,
+            tile_rows,
+            tile_columns,
+        )
     if profile == "1nn":
         return _best_match_profile(
             prepared_a,
@@ -1804,6 +1886,35 @@ def abjoin_bidirectional(
         pearson=params["pearson"],
         allow_trivial_match=params["allow_trivial_match"],
         profile="1nn_bidirectional",
+    )
+
+
+def selfjoin_1nn(a: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Compute SCAMP's index-free 1NN profile for a self-join."""
+
+    params = _parse_common_kwargs(kwargs)
+    return _run_profile_with_resources(
+        params,
+        a,
+        None,
+        m,
+        pearson=params["pearson"],
+        profile="1nn_value",
+    )
+
+
+def abjoin_1nn(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Compute SCAMP's index-free 1NN profile for an AB-join."""
+
+    params = _parse_common_kwargs(kwargs, is_ab_join=True)
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        allow_trivial_match=params["allow_trivial_match"],
+        profile="1nn_value",
     )
 
 

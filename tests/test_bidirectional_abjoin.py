@@ -225,6 +225,11 @@ class MetalBidirectionalABJoinTests(
             ) as profile_kernel,
             mock.patch.object(
                 _metal_1nn,
+                "_profile_state",
+                wraps=_metal_1nn._profile_state,
+            ) as profile_state,
+            mock.patch.object(
+                _metal_1nn,
                 "_BIDIRECTIONAL_INDEX_KERNEL",
                 wraps=_metal_1nn._BIDIRECTIONAL_INDEX_KERNEL,
             ) as index_kernel,
@@ -242,6 +247,8 @@ class MetalBidirectionalABJoinTests(
             actual = mp.abjoin_bidirectional(a, b, 9, **options)
 
         profile_kernel.assert_called_once()
+        profile_state.assert_called_once()
+        self.assertTrue(profile_state.call_args.kwargs["keep_rows"])
         index_kernel.assert_called_once()
         one_way_profile.assert_not_called()
         one_way_index.assert_not_called()

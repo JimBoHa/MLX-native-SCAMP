@@ -270,18 +270,28 @@ def _decode_ordered_keys(keys: np.ndarray) -> np.ndarray:
     return bits.view(np.float32)
 
 
-def _recurrence_inputs(
+def _profile_state(
     prepared_a: Any,
     prepared_b: Any,
     m: int,
-    exclusion: int,
     self_join: bool,
-) -> list[Any]:
+    exclusion: int,
+    *,
+    keep_rows: bool = False,
+) -> tuple[Any, list[Any], int, int, int]:
+    """Launch the correlation pass and return its reusable device state."""
+
+    n_a = prepared_a.subsequences
+    n_b = prepared_b.subsequences
+    diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
+    if diagonal_count <= 0:
+        return None, [], n_a, 0, 1
+
     config = mx.array(
         [m, exclusion, int(self_join), int(exclusion > 0)],
         dtype=mx.uint32,
     )
-    return [
+    inputs = [
         prepared_a.recurrence_clean,
         prepared_b.recurrence_clean,
         prepared_a.recurrence_means,
@@ -294,6 +304,37 @@ def _recurrence_inputs(
         prepared_b.recurrence_dg,
         config,
     ]
+    threadgroup_width = min(256, diagonal_count)
+    kernel = _BIDIRECTIONAL_PROFILE_KERNEL if keep_rows else _PROFILE_KERNEL
+    output_shapes = [(n_a,), (n_b,)] if keep_rows else [(n_a,)]
+    best_state = kernel(
+        inputs=inputs,
+        output_shapes=output_shapes,
+        output_dtypes=[mx.uint32] * len(output_shapes),
+        grid=(diagonal_count, 1, 1),
+        threadgroup=(threadgroup_width, 1, 1),
+        init_value=_ordered_key(-2.0),
+        stream=mx.gpu,
+    )
+    best = best_state if keep_rows else best_state[0]
+    return best, inputs, n_a, diagonal_count, threadgroup_width
+
+
+def best_profile(
+    prepared_a: Any,
+    prepared_b: Any,
+    m: int,
+    self_join: bool,
+    exclusion: int,
+) -> np.ndarray:
+    """Compute an index-free float32 1NN profile on Metal."""
+
+    best, _, n_a, _, _ = _profile_state(
+        prepared_a, prepared_b, m, self_join, exclusion
+    )
+    if best is None:
+        return np.full((n_a,), -2.0, dtype=np.float32)
+    return _decode_ordered_keys(np.asarray(best, dtype=np.uint32)).copy()
 
 
 def best_match(
@@ -303,30 +344,16 @@ def best_match(
     self_join: bool,
     exclusion: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute a float32 1NN profile with SCAMP's diagonal recurrence."""
+    """Compute an indexed float32 1NN profile on Metal."""
 
-    n_a = prepared_a.subsequences
-    n_b = prepared_b.subsequences
-    diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
-    if diagonal_count <= 0:
+    best, inputs, n_a, diagonal_count, threadgroup_width = _profile_state(
+        prepared_a, prepared_b, m, self_join, exclusion
+    )
+    if best is None:
         return (
             np.full((n_a,), -2.0, dtype=np.float32),
             np.full((n_a,), -1, dtype=np.int32),
         )
-
-    inputs = _recurrence_inputs(
-        prepared_a, prepared_b, m, exclusion, self_join
-    )
-    threadgroup_width = min(256, diagonal_count)
-    best = _PROFILE_KERNEL(
-        inputs=inputs,
-        output_shapes=[(n_a,)],
-        output_dtypes=[mx.uint32],
-        grid=(diagonal_count, 1, 1),
-        threadgroup=(threadgroup_width, 1, 1),
-        init_value=_ordered_key(-2.0),
-        stream=mx.gpu,
-    )[0]
     index = _INDEX_KERNEL(
         inputs=[*inputs, best],
         output_shapes=[(n_a,)],
@@ -353,22 +380,24 @@ def bidirectional_best_match(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute both indexed axes of one float32 AB-join on Metal."""
 
-    n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
-    diagonal_count = n_a + n_b - 1
-    inputs = _recurrence_inputs(
-        prepared_a, prepared_b, m, exclusion, False
+    best, inputs, n_a, diagonal_count, threadgroup_width = _profile_state(
+        prepared_a,
+        prepared_b,
+        m,
+        False,
+        exclusion,
+        keep_rows=True,
     )
-    threadgroup_width = min(256, diagonal_count)
-    best_a, best_b = _BIDIRECTIONAL_PROFILE_KERNEL(
-        inputs=inputs,
-        output_shapes=[(n_a,), (n_b,)],
-        output_dtypes=[mx.uint32, mx.uint32],
-        grid=(diagonal_count, 1, 1),
-        threadgroup=(threadgroup_width, 1, 1),
-        init_value=_ordered_key(-2.0),
-        stream=mx.gpu,
-    )
+    if best is None:
+        return (
+            np.full((n_a,), -2.0, dtype=np.float32),
+            np.full((n_a,), -1, dtype=np.int32),
+            np.full((n_b,), -2.0, dtype=np.float32),
+            np.full((n_b,), -1, dtype=np.int32),
+        )
+
+    best_a, best_b = best
     index_a, index_b = _BIDIRECTIONAL_INDEX_KERNEL(
         inputs=[*inputs, best_a, best_b],
         output_shapes=[(n_a,), (n_b,)],
