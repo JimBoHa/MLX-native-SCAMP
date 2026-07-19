@@ -103,6 +103,13 @@ def _index_kwarg(value: Any, name: str) -> int:
         raise TypeError(f"{name} must be an integer") from None
 
 
+def _normalize_window_size(m: Any) -> int:
+    normalized = _index_kwarg(m, "m")
+    if normalized < 3:
+        raise ValueError("m must be at least 3")
+    return normalized
+
+
 def _bool_kwarg(value: Any, name: str) -> bool:
     if value is None:
         return False
@@ -922,6 +929,7 @@ def _run_profile(
     use_metal_1nn: bool = False,
     use_metal_sum: bool = False,
 ):
+    m = _normalize_window_size(m)
     has_b = b is not None
     float32_sources = _is_float32_input(a) and (
         not has_b or _is_float32_input(b)
@@ -932,14 +940,25 @@ def _run_profile(
     # Upstream's ultra mode changes its sliding recurrence, while this direct
     # normalized-window implementation uses the same float64 path for both.
     series_a = _ensure_1d_array(a, "a", compute_dtype)
-    if m <= 0:
-        raise ValueError("m must be greater than 0")
     if int(series_a.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(a)")
 
     series_b = _ensure_1d_array(b, "b", compute_dtype) if has_b else series_a
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
+
+    if profile == "matrix":
+        subsequences_a = int(series_a.shape[0]) - m + 1
+        subsequences_b = int(series_b.shape[0]) - m + 1
+        if mwidth > subsequences_a:
+            raise ValueError(
+                "mwidth must be less than or equal to the number of subsequences in a"
+            )
+        if mheight > subsequences_b:
+            height_series = "b" if has_b else "a"
+            raise ValueError(
+                f"mheight must be less than or equal to the number of subsequences in {height_series}"
+            )
 
     self_join = not has_b
 
