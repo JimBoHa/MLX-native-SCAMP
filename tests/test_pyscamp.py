@@ -463,6 +463,98 @@ class PyScampCompatTests(unittest.TestCase):
         )
         self.assertEqual(out_dist.shape, out_idx.shape)
 
+    def test_common_kwarg_types_match_upstream_for_every_profile(self):
+        calls = {
+            "selfjoin": lambda **kwargs: mp.selfjoin(self.a, self.m, **kwargs),
+            "abjoin": lambda **kwargs: mp.abjoin(self.a, self.b, self.m, **kwargs),
+            "selfjoin_sum": lambda **kwargs: mp.selfjoin_sum(self.a, self.m, **kwargs),
+            "abjoin_sum": lambda **kwargs: mp.abjoin_sum(self.a, self.b, self.m, **kwargs),
+            "selfjoin_matrix": lambda **kwargs: mp.selfjoin_matrix(self.a, self.m, **kwargs),
+            "abjoin_matrix": lambda **kwargs: mp.abjoin_matrix(self.a, self.b, self.m, **kwargs),
+            "selfjoin_knn": lambda **kwargs: mp.selfjoin_knn(self.a, self.m, 2, **kwargs),
+            "abjoin_knn": lambda **kwargs: mp.abjoin_knn(self.a, self.b, self.m, 2, **kwargs),
+        }
+        invalid_kwargs = {
+            "precision": 1,
+            "pearson": "false",
+            "verbose": [],
+            "threads": 1.5,
+            "gpus": None,
+        }
+
+        for profile, call in calls.items():
+            for keyword, value in invalid_kwargs.items():
+                with self.subTest(profile=profile, keyword=keyword):
+                    with self.assertRaises(TypeError):
+                        call(**{keyword: value})
+            with self.subTest(profile=profile, keyword="GPU device ID"):
+                with self.assertRaisesRegex(TypeError, "GPU device ID"):
+                    call(gpus=[0.0])
+
+    def test_profile_specific_kwarg_types_match_upstream(self):
+        threshold_calls = {
+            "selfjoin_sum": lambda **kwargs: mp.selfjoin_sum(self.a, self.m, **kwargs),
+            "abjoin_sum": lambda **kwargs: mp.abjoin_sum(self.a, self.b, self.m, **kwargs),
+            "selfjoin_matrix": lambda **kwargs: mp.selfjoin_matrix(self.a, self.m, **kwargs),
+            "abjoin_matrix": lambda **kwargs: mp.abjoin_matrix(self.a, self.b, self.m, **kwargs),
+            "selfjoin_knn": lambda **kwargs: mp.selfjoin_knn(self.a, self.m, 2, **kwargs),
+            "abjoin_knn": lambda **kwargs: mp.abjoin_knn(self.a, self.b, self.m, 2, **kwargs),
+        }
+        for profile, call in threshold_calls.items():
+            with self.subTest(profile=profile, keyword="threshold"):
+                with self.assertRaisesRegex(TypeError, "real number"):
+                    call(threshold="0.2")
+
+        matrix_calls = {
+            "selfjoin_matrix": lambda **kwargs: mp.selfjoin_matrix(self.a, self.m, **kwargs),
+            "abjoin_matrix": lambda **kwargs: mp.abjoin_matrix(self.a, self.b, self.m, **kwargs),
+        }
+        for profile, call in matrix_calls.items():
+            for keyword, value in (("mheight", 2.5), ("mwidth", "2")):
+                with self.subTest(profile=profile, keyword=keyword):
+                    with self.assertRaisesRegex(TypeError, "integer"):
+                        call(**{keyword: value})
+
+    def test_numpy_scalar_compatibility_kwargs_are_accepted(self):
+        common = {
+            "pearson": np.bool_(True),
+            "verbose": None,
+            "threads": np.int64(1),
+            "gpus": (),
+            "precision": "double",
+        }
+        a = self.a[:64]
+        b = self.b[:64]
+        m = 16
+        calls = (
+            lambda: mp.selfjoin(a, m, **common),
+            lambda: mp.abjoin(a, b, m, **common),
+            lambda: mp.selfjoin_sum(a, m, threshold=np.float32(0.2), **common),
+            lambda: mp.abjoin_sum(a, b, m, threshold=np.float32(0.2), **common),
+            lambda: mp.selfjoin_matrix(
+                a,
+                m,
+                threshold=np.float32(0.2),
+                mheight=np.int64(2),
+                mwidth=np.int64(3),
+                **common,
+            ),
+            lambda: mp.abjoin_matrix(
+                a,
+                b,
+                m,
+                threshold=np.float32(0.2),
+                mheight=np.int64(2),
+                mwidth=np.int64(3),
+                **common,
+            ),
+            lambda: mp.selfjoin_knn(a, m, 2, threshold=np.float32(0.2), **common),
+            lambda: mp.abjoin_knn(a, b, m, 2, threshold=np.float32(0.2), **common),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                call()
+
     def test_resource_kwargs_select_expected_stream(self):
         cases = [
             (None, 0, None),
@@ -480,10 +572,13 @@ class PyScampCompatTests(unittest.TestCase):
                     self.assertEqual(expected_device, stream.device)
 
     def test_resource_kwargs_reject_unsupported_gpu_requests(self):
-        for gpus in ([1], [-1], ["0"]):
+        for gpus in ([1], [-1]):
             with self.subTest(gpus=gpus):
                 with self.assertRaisesRegex(ValueError, "GPU device ID"):
                     mp.selfjoin(self.a, self.m, gpus=gpus)
+
+        with self.assertRaisesRegex(TypeError, "GPU device ID"):
+            mp.selfjoin(self.a, self.m, gpus=["0"])
 
         for gpus in ([0, 1], [0, 0]):
             with self.subTest(gpus=gpus):
