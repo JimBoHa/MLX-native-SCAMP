@@ -1,3 +1,10 @@
+"""Apple-MLX SCAMP compatibility API and native extensions.
+
+The standard SCAMP Python surface is also available through ``pyscamp``.
+This namespace additionally exports index-free and bidirectional 1NN joins,
+plus inspectable MLX autotuning types and controls.
+"""
+
 from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 

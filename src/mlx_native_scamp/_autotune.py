@@ -1,3 +1,5 @@
+"""Explicit, correctness-checked tuning plans for MLX SCAMP strategies."""
+
 from __future__ import annotations
 
 import operator
@@ -25,7 +27,43 @@ UPSTREAM_PROFILE_FAMILIES = (
 
 @dataclass(frozen=True, slots=True)
 class AutotuneWorkload:
-    """One reproducible workload bucket in an explicit autotune plan."""
+    """Describe one reproducible workload bucket in an autotune plan.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable unique workload name.
+    profile : str
+        Profile family, such as ``1nn_index``, ``sum_thresh``, ``knn``, or
+        the native ``bidirectional_ab`` family.
+    precision : {"single", "double", "ultra"}
+        Compute precision to benchmark.
+    n_a, n_b : int
+        Subsequence counts on the column and row axes.
+    m : int
+        Subsequence window length.
+    self_join : bool
+        Whether both axes refer to the same time series.
+    aligned : bool, default False
+        Whether an AB workload applies the self-join exclusion zone.
+    route : {"auto", "cpu", "metal"}, default "auto"
+        Optional candidate-route constraint for a custom plan.
+    max_tile_size : int, optional
+        Explicit time-series tile ceiling represented by the bucket.
+    threshold_density : float, optional
+        Expected fraction of qualifying pairs; required for ``sum_thresh``.
+    k : int, optional
+        Neighbor count; required for a ``knn`` workload.
+    matrix_shape : tuple of int, optional
+        ``(height, width)``; required for a ``matrix_summary`` workload.
+
+    Attributes
+    ----------
+    dtype_class : str
+        Cache dtype bucket derived from ``precision``.
+    key : WorkloadKey
+        Validated, versioned cache key represented by this workload.
+    """
 
     name: str
     profile: str
@@ -71,7 +109,19 @@ class AutotuneWorkload:
 
 @dataclass(frozen=True, slots=True)
 class AutotunePlan:
-    """Immutable, inspectable work scheduled by :func:`run_autotune`."""
+    """Immutable work scheduled by :func:`run_autotune`.
+
+    Parameters
+    ----------
+    mode : {"quick", "full"}
+        Plan label recorded in progress output.
+    workloads : tuple of AutotuneWorkload
+        Ordered, uniquely keyed workloads to benchmark.
+    warmups : int
+        Untimed executions per candidate.
+    trials : int
+        Timed, synchronized executions per candidate.
+    """
 
     mode: AutotuneMode
     workloads: tuple[AutotuneWorkload, ...]
@@ -81,7 +131,19 @@ class AutotunePlan:
 
 @dataclass(frozen=True, slots=True)
 class StrategyDescription:
-    """Typed presentation and tie-break metadata for a cached strategy."""
+    """Presentation and deterministic tie-break metadata for one strategy.
+
+    Parameters
+    ----------
+    strategy : Strategy
+        Versioned cache strategy being described.
+    backend : {"cpu", "portable_metal", "custom_metal"}
+        Execution family selected by the strategy.
+    resource_rank : tuple of int
+        Stable lower-is-better rank used after equal benchmark durations.
+    summary : str
+        Human-readable profile, backend, and parameter description.
+    """
 
     strategy: cache.Strategy
     backend: Literal["cpu", "portable_metal", "custom_metal"]
@@ -91,7 +153,19 @@ class StrategyDescription:
 
 @dataclass(frozen=True, slots=True)
 class CandidateMeasurement:
-    """The synchronized duration samples accepted for one candidate."""
+    """Accepted synchronized timing samples for one candidate.
+
+    Parameters
+    ----------
+    strategy : Strategy
+        Candidate that produced the samples.
+    samples_ns : tuple of int
+        Individual correct trial durations in nanoseconds.
+    duration_ns : int
+        Median duration used to select the winner.
+    resource_rank : tuple of int
+        Deterministic tie-break rank copied from the strategy description.
+    """
 
     strategy: cache.Strategy
     samples_ns: tuple[int, ...]
@@ -354,7 +428,25 @@ def _full_workloads() -> tuple[AutotuneWorkload, ...]:
 
 
 def autotune_plan(mode: AutotuneMode = "quick") -> AutotunePlan:
-    """Return the deterministic work plan without running any benchmark."""
+    """Return a deterministic tuning plan without running benchmarks.
+
+    Parameters
+    ----------
+    mode : {"quick", "full"}, default "quick"
+        ``quick`` is bounded for a laptop and covers every upstream profile
+        family in self- and AB-join shapes. ``full`` adds larger, asymmetric,
+        aligned, and native bidirectional workloads with more trials.
+
+    Returns
+    -------
+    AutotunePlan
+        Immutable workloads, warmup count, and trial count.
+
+    Raises
+    ------
+    ValueError
+        If ``mode`` is not ``quick`` or ``full``.
+    """
 
     if mode == "quick":
         plan = AutotunePlan(mode, _quick_workloads(), warmups=1, trials=3)
@@ -396,7 +488,14 @@ def _describe_strategy(strategy: cache.Strategy) -> StrategyDescription:
 
 
 def strategy_descriptions() -> tuple[StrategyDescription, ...]:
-    """Describe every versioned cache strategy with typed metadata."""
+    """Describe every strategy in the current versioned candidate manifest.
+
+    Returns
+    -------
+    tuple of StrategyDescription
+        Stable manifest order with backend classification, selection rank,
+        and human-readable summaries. This function performs no benchmarks.
+    """
 
     return tuple(_describe_strategy(strategy) for strategy in cache.STRATEGIES)
 
@@ -638,10 +737,39 @@ def run_autotune(
     record_writer: RecordWriter | None = None,
     plan: AutotunePlan | None = None,
 ) -> int:
-    """Run an explicit MLX tuning plan and cache one winner per workload.
+    """Benchmark an explicit MLX plan and cache one winner per workload.
 
-    The injectable executor, synchronizer, clock, and writer keep selection
-    logic deterministic and testable without importing the core runtime.
+    Parameters
+    ----------
+    devices : sequence of int, optional
+        Metal device IDs to tune. MLX exposes only device ``0``; ``None`` or
+        an empty sequence selects it, and repeated zeroes are deduplicated.
+    cache_path : str, default ""
+        Upstream cache filename used as the base for the separate
+        ``.mlx.json`` sidecar. An empty string uses SCAMP's user cache path.
+
+    Other Parameters
+    ----------------
+    mode : {"quick", "full"}, default "quick"
+        Built-in plan to run when ``plan`` is not supplied.
+    plan : AutotunePlan, optional
+        Custom validated plan. When supplied, its contents take precedence
+        over ``mode``.
+    executor, synchronize, clock, record_writer : callable, optional
+        Advanced dependency-injection hooks for deterministic integrations and
+        tests. Normal callers should leave these unset.
+
+    Returns
+    -------
+    int
+        Number of selected Metal devices.
+
+    Notes
+    -----
+    Tuning is synchronous and is never triggered by import or an untuned join.
+    Each candidate is synchronized and compared with a CPU reference before
+    its median duration can win. Progress is printed to stdout. The default
+    executor requires an available Apple Metal device.
     """
 
     targets = _validate_devices(devices)
@@ -759,6 +887,28 @@ def run_autotune(
 
 
 def autotune(devices: Sequence[int] | None = None, cache_path: str = "") -> int:
-    """Run the laptop-safe explicit plan with upstream's API signature."""
+    """Run the laptop-safe MLX tuner using upstream's Python signature.
+
+    Parameters
+    ----------
+    devices : sequence of int, optional
+        Metal device IDs. MLX exposes only ``0``; ``None`` or an empty
+        sequence selects it, and repeated zeroes are deduplicated.
+    cache_path : str, default ""
+        Upstream cache filename used to locate the independent MLX JSON
+        sidecar. The default follows SCAMP's platform cache resolution.
+
+    Returns
+    -------
+    int
+        Number of tuned devices.
+
+    Notes
+    -----
+    This synchronously calls :func:`run_autotune` with the bounded ``quick``
+    plan, prints progress, validates every candidate against a CPU reference,
+    and requires Apple Metal. It never overwrites upstream SCAMP's cache
+    contents.
+    """
 
     return run_autotune(devices, cache_path, mode="quick")
