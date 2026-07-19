@@ -78,7 +78,17 @@ def _ensure_1d_array(values: Any, name: str, dtype: Any) -> Any:
         if array.dtype != dtype:
             array = array.astype(dtype)
     else:
-        array = mx.array(values, dtype=dtype)
+        numpy_array = np.asarray(values)
+        if numpy_array.ndim != 1:
+            raise ValueError(f"{name} must be a 1D array")
+        if dtype == mx.float32:
+            numpy_dtype = np.float32
+        elif dtype == mx.float64:
+            numpy_dtype = np.float64
+        else:
+            raise TypeError(f"Unsupported MLX input dtype: {dtype}")
+        contiguous = np.ascontiguousarray(numpy_array, dtype=numpy_dtype)
+        array = mx.array(contiguous, dtype=dtype)
     if array.ndim != 1:
         raise ValueError(f"{name} must be a 1D array")
     return array
