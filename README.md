@@ -43,9 +43,12 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
   follows SCAMP's rolling-covariance diagonal algorithm. Other profiles and
   execution modes use the portable MLX implementation.
 - Eligible native float32 joins are translated by a finite per-series origin
-  after quantization, then prepared with compensated float64 CPU statistics.
-  Only five linear-sized float32 recurrence arrays are sent to Metal; an
-  `(subsequences, window)` normalized-window matrix is not constructed.
+  after quantization, then prepared with stable float64 CPU statistics. The
+  rolling recurrence is vectorized in bounded NumPy blocks with high-accuracy
+  checkpoints; cancellation-sensitive blocks automatically rerun the
+  compensated scalar path. Only five linear-sized float32 recurrence arrays
+  are sent to Metal; an `(subsequences, window)` normalized-window matrix is
+  not constructed.
 - The recurrence path is selected only when its conservative float32 bound is
   safe. Non-float32, unstable-precompute, and extreme-range inputs retain the
   existing portable normalized-window path.
