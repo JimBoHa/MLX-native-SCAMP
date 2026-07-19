@@ -5,7 +5,6 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-
 _INPUT_NAMES = [
     "clean_a",
     "clean_b",
@@ -27,6 +26,7 @@ _PROFILE_SOURCE = r"""
     uint m = config[0];
     uint exclusion = config[1];
     bool self_join = config[2] != 0;
+    bool apply_exclusion = config[3] != 0;
 
     int diagonal;
     if (self_join) {
@@ -50,8 +50,10 @@ _PROFILE_SOURCE = r"""
     }
 
     for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
+        bool excluded = apply_exclusion &&
+            metal::abs(int(col) - int(row)) < int(exclusion);
         float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
+        if (!excluded && norm_product > 0.0f) {
             float corr = covariance * norm_product;
             if (metal::isfinite(corr)) {
                 corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
@@ -80,6 +82,7 @@ _INDEX_SOURCE = r"""
     uint m = config[0];
     uint exclusion = config[1];
     bool self_join = config[2] != 0;
+    bool apply_exclusion = config[3] != 0;
 
     int diagonal;
     if (self_join) {
@@ -103,8 +106,10 @@ _INDEX_SOURCE = r"""
     }
 
     for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
+        bool excluded = apply_exclusion &&
+            metal::abs(int(col) - int(row)) < int(exclusion);
         float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
+        if (!excluded && norm_product > 0.0f) {
             float corr = covariance * norm_product;
             if (metal::isfinite(corr)) {
                 corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
@@ -118,88 +123,6 @@ _INDEX_SOURCE = r"""
                 if (self_join && best[row] == key) {
                     atomic_fetch_min_explicit(
                         &index[row], col, memory_order_relaxed);
-                }
-            }
-        }
-        if (step + 1 < diagonal_length) {
-            covariance += df_a[col] * dg_b[row] +
-                          dg_a[col] * df_b[row];
-        }
-    }
-"""
-
-_BIDIRECTIONAL_PROFILE_SOURCE = r"""
-    uint diag_slot = thread_position_in_grid.x;
-    uint n_a = means_a_shape[0];
-    uint n_b = means_b_shape[0];
-    uint m = config[0];
-
-    int diagonal = int(diag_slot) - int(n_a - 1);
-    uint col = diagonal < 0 ? uint(-diagonal) : 0;
-    uint row = diagonal > 0 ? uint(diagonal) : 0;
-    uint diagonal_length = metal::min(n_a - col, n_b - row);
-
-    float covariance = 0.0f;
-    for (uint k = 0; k < m; ++k) {
-        covariance += (clean_a[col + k] - means_a[col]) *
-                      (clean_b[row + k] - means_b[row]);
-    }
-
-    for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
-        float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
-            float corr = covariance * norm_product;
-            if (metal::isfinite(corr)) {
-                corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
-                uint bits = as_type<uint>(corr);
-                uint key = (bits & 0x80000000u) ? ~bits :
-                                                     (bits ^ 0x80000000u);
-                atomic_fetch_max_explicit(
-                    &best_a[col], key, memory_order_relaxed);
-                atomic_fetch_max_explicit(
-                    &best_b[row], key, memory_order_relaxed);
-            }
-        }
-        if (step + 1 < diagonal_length) {
-            covariance += df_a[col] * dg_b[row] +
-                          dg_a[col] * df_b[row];
-        }
-    }
-"""
-
-_BIDIRECTIONAL_INDEX_SOURCE = r"""
-    uint diag_slot = thread_position_in_grid.x;
-    uint n_a = means_a_shape[0];
-    uint n_b = means_b_shape[0];
-    uint m = config[0];
-
-    int diagonal = int(diag_slot) - int(n_a - 1);
-    uint col = diagonal < 0 ? uint(-diagonal) : 0;
-    uint row = diagonal > 0 ? uint(diagonal) : 0;
-    uint diagonal_length = metal::min(n_a - col, n_b - row);
-
-    float covariance = 0.0f;
-    for (uint k = 0; k < m; ++k) {
-        covariance += (clean_a[col + k] - means_a[col]) *
-                      (clean_b[row + k] - means_b[row]);
-    }
-
-    for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
-        float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
-            float corr = covariance * norm_product;
-            if (metal::isfinite(corr)) {
-                corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
-                uint bits = as_type<uint>(corr);
-                uint key = (bits & 0x80000000u) ? ~bits :
-                                                     (bits ^ 0x80000000u);
-                if (best_a[col] == key) {
-                    atomic_fetch_min_explicit(
-                        &index_a[col], row, memory_order_relaxed);
-                }
-                if (best_b[row] == key) {
-                    atomic_fetch_min_explicit(
-                        &index_b[row], col, memory_order_relaxed);
                 }
             }
         }
@@ -227,22 +150,6 @@ _INDEX_KERNEL = mx.fast.metal_kernel(
     atomic_outputs=True,
 )
 
-_BIDIRECTIONAL_PROFILE_KERNEL = mx.fast.metal_kernel(
-    name="scamp_1nn_bidirectional_profile",
-    input_names=_INPUT_NAMES,
-    output_names=["best_a", "best_b"],
-    source=_BIDIRECTIONAL_PROFILE_SOURCE,
-    atomic_outputs=True,
-)
-
-_BIDIRECTIONAL_INDEX_KERNEL = mx.fast.metal_kernel(
-    name="scamp_1nn_bidirectional_index",
-    input_names=[*_INPUT_NAMES, "best_a", "best_b"],
-    output_names=["index_a", "index_b"],
-    source=_BIDIRECTIONAL_INDEX_SOURCE,
-    atomic_outputs=True,
-)
-
 
 def _ordered_key(value: float) -> int:
     bits = np.asarray(value, dtype=np.float32).view(np.uint32).item()
@@ -257,15 +164,29 @@ def _decode_ordered_keys(keys: np.ndarray) -> np.ndarray:
     return bits.view(np.float32)
 
 
-def _recurrence_inputs(
+def best_match(
     prepared_a: Any,
     prepared_b: Any,
     m: int,
-    exclusion: int,
     self_join: bool,
-) -> list[Any]:
-    config = mx.array([m, exclusion, int(self_join)], dtype=mx.uint32)
-    return [
+    exclusion: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute a float32 1NN profile with SCAMP's diagonal recurrence."""
+
+    n_a = prepared_a.subsequences
+    n_b = prepared_b.subsequences
+    diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
+    if diagonal_count <= 0:
+        return (
+            np.full((n_a,), -2.0, dtype=np.float32),
+            np.full((n_a,), -1, dtype=np.int32),
+        )
+
+    config = mx.array(
+        [m, exclusion, int(self_join), int(exclusion > 0)],
+        dtype=mx.uint32,
+    )
+    inputs = [
         prepared_a.recurrence_clean,
         prepared_b.recurrence_clean,
         prepared_a.recurrence_means,
@@ -278,27 +199,6 @@ def _recurrence_inputs(
         prepared_b.recurrence_dg,
         config,
     ]
-
-
-def best_match(
-    prepared_a: Any,
-    prepared_b: Any,
-    m: int,
-    self_join: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute a float32 1NN profile with SCAMP's diagonal recurrence."""
-
-    n_a = prepared_a.subsequences
-    n_b = prepared_b.subsequences
-    exclusion = (m + 3) // 4 if self_join else 0
-    diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
-    if diagonal_count <= 0:
-        return (
-            np.full((n_a,), -2.0, dtype=np.float32),
-            np.full((n_a,), -1, dtype=np.int32),
-        )
-
-    inputs = _recurrence_inputs(prepared_a, prepared_b, m, exclusion, self_join)
     threadgroup_width = min(256, diagonal_count)
     best = _PROFILE_KERNEL(
         inputs=inputs,
@@ -325,43 +225,3 @@ def best_match(
     idx = index_np.view(np.int32).copy()
     idx[corr < -1.0] = -1
     return corr, idx
-
-
-def bidirectional_best_match(
-    prepared_a: Any,
-    prepared_b: Any,
-    m: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute both axes of an indexed float32 AB-join on Metal."""
-
-    n_a = prepared_a.subsequences
-    n_b = prepared_b.subsequences
-    diagonal_count = n_a + n_b - 1
-    inputs = _recurrence_inputs(prepared_a, prepared_b, m, 0, False)
-    threadgroup_width = min(256, diagonal_count)
-    best_a, best_b = _BIDIRECTIONAL_PROFILE_KERNEL(
-        inputs=inputs,
-        output_shapes=[(n_a,), (n_b,)],
-        output_dtypes=[mx.uint32, mx.uint32],
-        grid=(diagonal_count, 1, 1),
-        threadgroup=(threadgroup_width, 1, 1),
-        init_value=_ordered_key(-2.0),
-        stream=mx.gpu,
-    )
-    index_a, index_b = _BIDIRECTIONAL_INDEX_KERNEL(
-        inputs=[*inputs, best_a, best_b],
-        output_shapes=[(n_a,), (n_b,)],
-        output_dtypes=[mx.uint32, mx.uint32],
-        grid=(diagonal_count, 1, 1),
-        threadgroup=(threadgroup_width, 1, 1),
-        init_value=0xFFFFFFFF,
-        stream=mx.gpu,
-    )
-
-    corr_a = _decode_ordered_keys(np.asarray(best_a, dtype=np.uint32)).copy()
-    corr_b = _decode_ordered_keys(np.asarray(best_b, dtype=np.uint32)).copy()
-    idx_a = np.asarray(index_a, dtype=np.uint32).view(np.int32).copy()
-    idx_b = np.asarray(index_b, dtype=np.uint32).view(np.int32).copy()
-    idx_a[corr_a < -1.0] = -1
-    idx_b[corr_b < -1.0] = -1
-    return corr_a, idx_a, corr_b, idx_b
