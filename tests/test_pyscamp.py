@@ -85,6 +85,125 @@ class PyScampCompatTests(unittest.TestCase):
         np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
         np.testing.assert_array_equal(valid_idx, out_idx)
 
+    def test_portable_reducers_clamp_perfect_correlations(self):
+        series_by_precision = {
+            "single": np.array(
+                [-0.5038742, -1.1873481, -0.28324285],
+                dtype=np.float32,
+            ),
+            "double": np.array(
+                [-0.7908847696275746, 0.2369731299165827, 0.05437949611686499],
+                dtype=np.float64,
+            ),
+        }
+
+        for precision, series in series_by_precision.items():
+            window = len(series)
+            expected_distance = {
+                1.0: np.array([0.0], dtype=np.float32),
+                -1.0: np.array(
+                    [2.0 * np.sqrt(window)],
+                    dtype=np.float32,
+                ),
+            }
+            options = {"gpus": [], "precision": precision}
+            for correlation, other in ((1.0, series), (-1.0, -series)):
+                with self.subTest(precision=precision, correlation=correlation):
+                    out_corr, out_idx = mp.abjoin(
+                        series,
+                        other,
+                        window,
+                        pearson=True,
+                        **options,
+                    )
+                    out_dist, dist_idx = mp.abjoin(
+                        series,
+                        other,
+                        window,
+                        pearson=False,
+                        **options,
+                    )
+                    summed = mp.abjoin_sum(
+                        series,
+                        other,
+                        window,
+                        threshold=-1.0 if correlation < 0.0 else 0.0,
+                        **options,
+                    )
+                    matrix = mp.abjoin_matrix(
+                        series,
+                        other,
+                        window,
+                        threshold=-1.0 if correlation < 0.0 else 0.0,
+                        mheight=1,
+                        mwidth=1,
+                        pearson=True,
+                        **options,
+                    )
+                    matches = mp.abjoin_knn(
+                        series,
+                        other,
+                        window,
+                        1,
+                        threshold=-1.0 if correlation < 0.0 else 0.0,
+                        pearson=True,
+                        **options,
+                    )
+
+                    np.testing.assert_array_equal(
+                        out_corr,
+                        np.array([correlation], dtype=np.float32),
+                    )
+                    np.testing.assert_array_equal(
+                        out_idx,
+                        np.array([0], dtype=np.int32),
+                    )
+                    np.testing.assert_array_equal(
+                        out_dist,
+                        expected_distance[correlation],
+                    )
+                    np.testing.assert_array_equal(dist_idx, out_idx)
+                    np.testing.assert_array_equal(
+                        summed,
+                        np.array(
+                            [1.0 if correlation > 0.0 else 0.0],
+                            dtype=np.float64,
+                        ),
+                    )
+                    np.testing.assert_array_equal(
+                        matrix,
+                        np.array([[correlation]], dtype=np.float32),
+                    )
+                    self.assertEqual(
+                        [(0, 0, 1.0)] if correlation > 0.0 else [],
+                        matches,
+                    )
+
+    def test_portable_clamping_preserves_exclusion_sentinel(self):
+        series = np.arange(8, dtype=np.float32)
+
+        with mx.stream(mx.cpu):
+            prepared = scamp_core._prepare_series(mx.array(series), 4)
+            blocks = list(
+                scamp_core._iterate_blocks(
+                    prepared,
+                    prepared,
+                    4,
+                    True,
+                    block_rows=prepared.subsequences,
+                )
+            )
+
+        self.assertEqual(1, len(blocks))
+        block = np.asarray(blocks[0][3])
+        np.testing.assert_array_equal(
+            np.diag(block),
+            np.full((prepared.subsequences,), scamp_core.SENTINEL),
+        )
+        valid = block != scamp_core.SENTINEL
+        self.assertTrue(np.all(block[valid] >= -1.0))
+        self.assertTrue(np.all(block[valid] <= 1.0))
+
     def test_selfjoin_euclidean_matches_reference_conversion(self):
         valid_corr, valid_idx = reduce_1nn_index(self.dm_self)
         valid_dist = corr_to_euclidean(valid_corr, self.m)
@@ -256,6 +375,82 @@ class PyScampCompatTests(unittest.TestCase):
         np.testing.assert_allclose(valid_dist, out_dist, equal_nan=True, rtol=1e-4, atol=1e-4)
         np.testing.assert_array_equal(valid_idx, out_idx)
 
+    def test_numpy_compatible_inputs_are_forcecast_and_contiguous(self):
+        inputs = (
+            range(16),
+            np.arange(16, dtype=np.float64),
+            np.ascontiguousarray(np.arange(16, dtype=np.float64)[::-1])[::-1],
+            np.array([str(value) for value in range(16)]),
+            np.array(range(16), dtype=object),
+        )
+        for precision in ("single", "double"):
+            expected_dist, expected_idx = mp.selfjoin(
+                np.arange(16, dtype=np.float64),
+                4,
+                pearson=True,
+                precision=precision,
+            )
+            for values in inputs:
+                with self.subTest(
+                    precision=precision,
+                    input_type=type(values),
+                    dtype=getattr(values, "dtype", None),
+                ):
+                    out_dist, out_idx = mp.selfjoin(
+                        values,
+                        4,
+                        pearson=True,
+                        precision=precision,
+                    )
+                    np.testing.assert_allclose(
+                        expected_dist,
+                        out_dist,
+                        equal_nan=True,
+                        rtol=1e-4,
+                        atol=1e-4,
+                    )
+                    np.testing.assert_array_equal(expected_idx, out_idx)
+
+    def test_numpy_coercion_preserves_selected_precision(self):
+        numeric_strings = np.array(["100000000", "100000001", "100000002"])
+
+        with mx.stream(mx.cpu):
+            single = scamp_core._ensure_1d_array(
+                numeric_strings, "a", mx.float32
+            )
+            double = scamp_core._ensure_1d_array(
+                numeric_strings, "a", mx.float64
+            )
+            mx.eval(single, double)
+            single_value = float(np.asarray(single)[1])
+            double_value = float(np.asarray(double)[1])
+
+        self.assertEqual(mx.float32, single.dtype)
+        self.assertEqual(mx.float64, double.dtype)
+        self.assertEqual(100000000.0, single_value)
+        self.assertEqual(100000001.0, double_value)
+
+    def test_mlx_inputs_stay_on_the_device_native_conversion_path(self):
+        source = mx.array([0.0, 1.0, 2.0], dtype=mx.float32)
+
+        with patch.object(
+            scamp_core.np,
+            "asarray",
+            side_effect=AssertionError("unexpected host conversion"),
+        ):
+            with mx.stream(mx.cpu):
+                converted = scamp_core._ensure_1d_array(source, "a", mx.float64)
+                mx.eval(converted)
+
+        self.assertEqual(mx.float64, converted.dtype)
+        np.testing.assert_array_equal(np.asarray(converted), np.arange(3))
+
+    def test_non_1d_numpy_compatible_inputs_are_rejected_clearly(self):
+        for values in (42, [[0, 1], [2, 3]], np.zeros((2, 2))):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, "a must be a 1D array"):
+                    mp.selfjoin(values, 3)
+
     def test_compatibility_kwargs_are_accepted(self):
         out_dist, out_idx = mp.selfjoin(
             self.a,
@@ -267,6 +462,98 @@ class PyScampCompatTests(unittest.TestCase):
             verbose=True,
         )
         self.assertEqual(out_dist.shape, out_idx.shape)
+
+    def test_common_kwarg_types_match_upstream_for_every_profile(self):
+        calls = {
+            "selfjoin": lambda **kwargs: mp.selfjoin(self.a, self.m, **kwargs),
+            "abjoin": lambda **kwargs: mp.abjoin(self.a, self.b, self.m, **kwargs),
+            "selfjoin_sum": lambda **kwargs: mp.selfjoin_sum(self.a, self.m, **kwargs),
+            "abjoin_sum": lambda **kwargs: mp.abjoin_sum(self.a, self.b, self.m, **kwargs),
+            "selfjoin_matrix": lambda **kwargs: mp.selfjoin_matrix(self.a, self.m, **kwargs),
+            "abjoin_matrix": lambda **kwargs: mp.abjoin_matrix(self.a, self.b, self.m, **kwargs),
+            "selfjoin_knn": lambda **kwargs: mp.selfjoin_knn(self.a, self.m, 2, **kwargs),
+            "abjoin_knn": lambda **kwargs: mp.abjoin_knn(self.a, self.b, self.m, 2, **kwargs),
+        }
+        invalid_kwargs = {
+            "precision": 1,
+            "pearson": "false",
+            "verbose": [],
+            "threads": 1.5,
+            "gpus": None,
+        }
+
+        for profile, call in calls.items():
+            for keyword, value in invalid_kwargs.items():
+                with self.subTest(profile=profile, keyword=keyword):
+                    with self.assertRaises(TypeError):
+                        call(**{keyword: value})
+            with self.subTest(profile=profile, keyword="GPU device ID"):
+                with self.assertRaisesRegex(TypeError, "GPU device ID"):
+                    call(gpus=[0.0])
+
+    def test_profile_specific_kwarg_types_match_upstream(self):
+        threshold_calls = {
+            "selfjoin_sum": lambda **kwargs: mp.selfjoin_sum(self.a, self.m, **kwargs),
+            "abjoin_sum": lambda **kwargs: mp.abjoin_sum(self.a, self.b, self.m, **kwargs),
+            "selfjoin_matrix": lambda **kwargs: mp.selfjoin_matrix(self.a, self.m, **kwargs),
+            "abjoin_matrix": lambda **kwargs: mp.abjoin_matrix(self.a, self.b, self.m, **kwargs),
+            "selfjoin_knn": lambda **kwargs: mp.selfjoin_knn(self.a, self.m, 2, **kwargs),
+            "abjoin_knn": lambda **kwargs: mp.abjoin_knn(self.a, self.b, self.m, 2, **kwargs),
+        }
+        for profile, call in threshold_calls.items():
+            with self.subTest(profile=profile, keyword="threshold"):
+                with self.assertRaisesRegex(TypeError, "real number"):
+                    call(threshold="0.2")
+
+        matrix_calls = {
+            "selfjoin_matrix": lambda **kwargs: mp.selfjoin_matrix(self.a, self.m, **kwargs),
+            "abjoin_matrix": lambda **kwargs: mp.abjoin_matrix(self.a, self.b, self.m, **kwargs),
+        }
+        for profile, call in matrix_calls.items():
+            for keyword, value in (("mheight", 2.5), ("mwidth", "2")):
+                with self.subTest(profile=profile, keyword=keyword):
+                    with self.assertRaisesRegex(TypeError, "integer"):
+                        call(**{keyword: value})
+
+    def test_numpy_scalar_compatibility_kwargs_are_accepted(self):
+        common = {
+            "pearson": np.bool_(True),
+            "verbose": None,
+            "threads": np.int64(1),
+            "gpus": (),
+            "precision": "double",
+        }
+        a = self.a[:64]
+        b = self.b[:64]
+        m = 16
+        calls = (
+            lambda: mp.selfjoin(a, m, **common),
+            lambda: mp.abjoin(a, b, m, **common),
+            lambda: mp.selfjoin_sum(a, m, threshold=np.float32(0.2), **common),
+            lambda: mp.abjoin_sum(a, b, m, threshold=np.float32(0.2), **common),
+            lambda: mp.selfjoin_matrix(
+                a,
+                m,
+                threshold=np.float32(0.2),
+                mheight=np.int64(2),
+                mwidth=np.int64(3),
+                **common,
+            ),
+            lambda: mp.abjoin_matrix(
+                a,
+                b,
+                m,
+                threshold=np.float32(0.2),
+                mheight=np.int64(2),
+                mwidth=np.int64(3),
+                **common,
+            ),
+            lambda: mp.selfjoin_knn(a, m, 2, threshold=np.float32(0.2), **common),
+            lambda: mp.abjoin_knn(a, b, m, 2, threshold=np.float32(0.2), **common),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                call()
 
     def test_resource_kwargs_select_expected_stream(self):
         cases = [
@@ -285,10 +572,13 @@ class PyScampCompatTests(unittest.TestCase):
                     self.assertEqual(expected_device, stream.device)
 
     def test_resource_kwargs_reject_unsupported_gpu_requests(self):
-        for gpus in ([1], [-1], ["0"]):
+        for gpus in ([1], [-1]):
             with self.subTest(gpus=gpus):
                 with self.assertRaisesRegex(ValueError, "GPU device ID"):
                     mp.selfjoin(self.a, self.m, gpus=gpus)
+
+        with self.assertRaisesRegex(TypeError, "GPU device ID"):
+            mp.selfjoin(self.a, self.m, gpus=["0"])
 
         for gpus in ([0, 1], [0, 0]):
             with self.subTest(gpus=gpus):
