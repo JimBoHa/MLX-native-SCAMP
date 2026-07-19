@@ -149,6 +149,47 @@ class PyScampCompatTests(unittest.TestCase):
         matches = mp.abjoin_knn(self.a, self.b, self.m, 3, threshold=0.2, pearson=True)
         self._assert_knn_matches_reference(matches, self.dm_ab, 0.2)
 
+    def test_profiles_schedule_compact_reducer_state_per_block(self):
+        rng = np.random.default_rng(7)
+        a = rng.normal(size=10).astype(np.float32)
+        b = rng.normal(size=14).astype(np.float32)
+        m = 4
+        block_rows = 3
+        columns = len(a) - m + 1
+        rows = len(b) - m + 1
+        expected_blocks = (rows + block_rows - 1) // block_rows
+        profiles = [
+            ("1nn", lambda: mp.abjoin(a, b, m, pearson=True), ((columns,), (columns,))),
+            ("sum", lambda: mp.abjoin_sum(a, b, m, threshold=0.2), ((columns,),)),
+            (
+                "matrix",
+                lambda: mp.abjoin_matrix(a, b, m, mheight=2, mwidth=3, pearson=True),
+                ((2, 3),),
+            ),
+            (
+                "knn",
+                lambda: mp.abjoin_knn(a, b, m, 2, threshold=0.2, pearson=True),
+                ((2, columns), (2, columns)),
+            ),
+        ]
+
+        for name, run_profile, expected_shapes in profiles:
+            with self.subTest(profile=name):
+                with (
+                    patch.object(scamp_core, "BLOCK_ROWS", block_rows),
+                    patch.object(
+                        scamp_core,
+                        "_schedule_reducer_state",
+                        wraps=scamp_core._schedule_reducer_state,
+                    ) as schedule,
+                ):
+                    run_profile()
+
+                self.assertEqual(expected_blocks, schedule.call_count)
+                for call in schedule.call_args_list:
+                    actual_shapes = tuple(tuple(state.shape) for state in call.args)
+                    self.assertEqual(expected_shapes, actual_shapes)
+
     def test_abjoin_knn_excludes_matches_equal_to_threshold(self):
         a = np.array([1, 0, -1, 0], dtype=np.float32)
         b = np.array([0, 1, 0, -1], dtype=np.float32)
