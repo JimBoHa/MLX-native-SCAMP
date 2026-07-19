@@ -17,6 +17,16 @@ The package provides an MLX-native `pyscamp`-compatible import surface for the f
 The implementation is pure Python plus MLX and is meant to be called by other apps without requiring CUDA.
 All nine upstream `pyscamp` callables are implemented in the local MLX engine rather than delegated back to CUDA SCAMP.
 
+## Native C++ library
+
+The repository also contains an initial native C++ API compatible with
+SCAMP's `SCAMPArgs`, `Profile`, and `do_SCAMP` concepts. It links directly to
+MLX's C++ library and executes indexed 1NN self/AB joins with a custom Metal
+diagonal-recurrence kernel; it does not launch or embed Python.
+
+See [`cpp/README.md`](cpp/README.md) for build instructions, current coverage,
+and the remaining C++ parity work.
+
 ## Install
 
 ```bash

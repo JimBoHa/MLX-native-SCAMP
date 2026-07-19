@@ -26,3 +26,16 @@ jobs:
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
+
+      - name: Configure native C++ library
+        run: |
+          MLX_DIR="$(python -c 'import mlx.core, pathlib; print(pathlib.Path(mlx.core.__file__).parent / "share/cmake/MLX")')"
+          cmake -S . -B build/cpp \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMLX_DIR="$MLX_DIR"
+
+      - name: Build native C++ library
+        run: cmake --build build/cpp --parallel
+
+      - name: Test native C++ library
+        run: ctest --test-dir build/cpp --output-on-failure
