@@ -121,6 +121,31 @@ _KERNEL = mx.fast.metal_kernel(
 )
 
 
+_INT32_MAX = int(np.iinfo(np.int32).max)
+_UINT32_MAX = int(np.iinfo(np.uint32).max)
+
+
+def indexing_is_safe(
+    n_a: int,
+    n_b: int,
+    rows: int,
+    cols: int,
+    self_join: bool,
+    exclusion: int,
+) -> bool:
+    """Return whether every Metal matrix coordinate fits its kernel type."""
+
+    if min(n_a, n_b, rows, cols) <= 0 or exclusion < 0:
+        return False
+    if max(n_a, n_b, rows, cols) > _UINT32_MAX:
+        return False
+    if exclusion > _INT32_MAX or rows * cols > _UINT32_MAX:
+        return False
+    if self_join:
+        return n_a - 1 <= _INT32_MAX
+    return n_a + n_b - 2 <= _INT32_MAX
+
+
 def matrix_summary(
     prepared_a: Any,
     prepared_b: Any,
@@ -136,6 +161,10 @@ def matrix_summary(
 
     n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
+    if not indexing_is_safe(
+        n_a, n_b, rows, cols, self_join, exclusion
+    ):
+        raise ValueError("matrix dimensions exceed Metal indexing limits")
     diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
     if diagonal_count <= 0:
         return np.full((rows, cols), -2.0, dtype=np.float32)

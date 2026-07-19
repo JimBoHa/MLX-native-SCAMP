@@ -8,6 +8,61 @@ import mlx_native_scamp as mp
 from mlx_native_scamp import _metal_matrix, core
 
 
+class MetalMatrixIndexingTests(unittest.TestCase):
+    def test_signed_diagonal_boundaries(self):
+        int32_max = int(np.iinfo(np.int32).max)
+
+        self.assertTrue(
+            _metal_matrix.indexing_is_safe(
+                int32_max + 1, int32_max + 1, 1, 1, True, 0
+            )
+        )
+        self.assertFalse(
+            _metal_matrix.indexing_is_safe(
+                int32_max + 2, int32_max + 2, 1, 1, True, 0
+            )
+        )
+        self.assertTrue(
+            _metal_matrix.indexing_is_safe(
+                int32_max + 1, 1, 1, 1, False, 0
+            )
+        )
+        self.assertFalse(
+            _metal_matrix.indexing_is_safe(
+                int32_max + 2, 1, 1, 1, False, 0
+            )
+        )
+
+    def test_output_cell_and_exclusion_boundaries(self):
+        int32_max = int(np.iinfo(np.int32).max)
+
+        self.assertTrue(
+            _metal_matrix.indexing_is_safe(
+                int32_max + 1,
+                int32_max + 1,
+                65_535,
+                65_537,
+                True,
+                int32_max,
+            )
+        )
+        self.assertFalse(
+            _metal_matrix.indexing_is_safe(
+                8, 8, 65_536, 65_536, True, 0
+            )
+        )
+        self.assertFalse(
+            _metal_matrix.indexing_is_safe(
+                int32_max + 1,
+                int32_max + 1,
+                1,
+                1,
+                True,
+                int32_max + 1,
+            )
+        )
+
+
 @unittest.skipUnless(mx.metal.is_available(), "Metal is unavailable")
 class MetalMatrixSummaryTests(unittest.TestCase):
     def setUp(self):
@@ -313,6 +368,38 @@ class MetalMatrixSummaryTests(unittest.TestCase):
                 )
 
         kernel.assert_not_called()
+
+    def test_unsafe_kernel_indexing_keeps_portable_path(self):
+        series = np.random.default_rng(283).normal(size=64).astype(np.float32)
+
+        with (
+            mock.patch.object(
+                _metal_matrix, "indexing_is_safe", return_value=False
+            ) as indexing_is_safe,
+            mock.patch.object(
+                core,
+                "_prepare_metal_recurrence",
+                side_effect=AssertionError(
+                    "unsafe matrix indexing reached Metal preparation"
+                ),
+            ) as metal_preparation,
+            mock.patch.object(_metal_matrix, "matrix_summary") as kernel,
+        ):
+            summary = mp.selfjoin_matrix(
+                series,
+                8,
+                mheight=5,
+                mwidth=7,
+                threshold=-1.0,
+                pearson=True,
+                precision="single",
+                gpus=[0],
+            )
+
+        indexing_is_safe.assert_called_once_with(57, 57, 5, 7, True, 2)
+        metal_preparation.assert_not_called()
+        kernel.assert_not_called()
+        self.assertEqual((5, 7), summary.shape)
 
     def test_explicit_tile_ceiling_keeps_oversized_abjoin_portable(self):
         rng = np.random.default_rng(281)

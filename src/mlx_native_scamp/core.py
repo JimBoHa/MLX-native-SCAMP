@@ -1703,6 +1703,17 @@ def _run_profile(
         and float32_sources
         and join_fits_tile
     )
+    if matrix_recurrence:
+        from ._metal_matrix import indexing_is_safe
+
+        matrix_recurrence = indexing_is_safe(
+            subsequences_a,
+            subsequences_b,
+            mheight,
+            mwidth,
+            self_join,
+            exclusion,
+        )
     if (
         profile in {"1nn", "1nn_value", "1nn_bidirectional"}
         and use_metal_1nn
