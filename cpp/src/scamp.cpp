@@ -380,6 +380,18 @@ void MaterializeProfile(const mx::array &keys, const mx::array &indices,
   }
 }
 
+void MaterializeCorrelations(const mx::array &evaluated_keys,
+                             std::vector<float> *output) {
+  const auto *key_data = evaluated_keys.data<std::uint32_t>();
+  output->resize(evaluated_keys.size());
+  for (std::size_t i = 0; i < output->size(); ++i) {
+    // The atomic maximum starts at key zero. No finite float maps to zero, so
+    // it remains an unambiguous marker for a column/row with no valid match.
+    (*output)[i] = key_data[i] == 0U ? kInvalidCorrelation
+                                    : DecodeOrderedKey(key_data[i]);
+  }
+}
+
 void ValidateResources(const std::vector<int> &devices, int num_threads) {
   if (num_threads < 0) {
     throw SCAMPException("Error: num_threads must not be negative");
@@ -498,10 +510,11 @@ void Profile::Alloc(std::size_t size, std::int64_t matrix_height,
 }
 
 void SCAMPArgs::validate() {
-  if (profile_type != PROFILE_TYPE_1NN_INDEX) {
+  if (profile_type != PROFILE_TYPE_1NN_INDEX &&
+      profile_type != PROFILE_TYPE_1NN) {
     throw SCAMPException(
         "Error: native C++ support currently covers PROFILE_TYPE_1NN_INDEX "
-        "only");
+        "and PROFILE_TYPE_1NN only");
   }
   if (precision_type != PRECISION_SINGLE) {
     throw SCAMPException(
@@ -716,20 +729,37 @@ void do_SCAMP(SCAMPArgs *args, const std::vector<int> &devices,
       {mx::uint32, mx::uint32}, {grid, 1, 1}, {threadgroup, 1, 1}, {}, 0.0F,
       false, gpu);
 
-  inputs.push_back(best[0]);
-  inputs.push_back(best[1]);
-  auto indices = IndexKernel()(
-      inputs, {mx::Shape{output_a_size}, mx::Shape{output_b_size}},
-      {mx::uint32, mx::uint32}, {grid, 1, 1}, {threadgroup, 1, 1}, {},
-      static_cast<float>(kIndexInitializer), false, gpu);
+  if (args->profile_type == PROFILE_TYPE_1NN) {
+    // Evaluate both outputs together so a bidirectional AB join executes the
+    // shared profile kernel only once. Index-free 1NN ends here: it neither
+    // constructs nor dispatches IndexKernel.
+    auto evaluated_a = best[0];
+    auto evaluated_b = best[1];
+    mx::eval(evaluated_a, evaluated_b);
+    if (args->computing_columns) {
+      MaterializeCorrelations(evaluated_a,
+                              &args->profile_a.data[0].float_value);
+    }
+    if (args->has_b && args->computing_rows) {
+      MaterializeCorrelations(evaluated_b,
+                              &args->profile_b.data[0].float_value);
+    }
+  } else {
+    inputs.push_back(best[0]);
+    inputs.push_back(best[1]);
+    auto indices = IndexKernel()(
+        inputs, {mx::Shape{output_a_size}, mx::Shape{output_b_size}},
+        {mx::uint32, mx::uint32}, {grid, 1, 1}, {threadgroup, 1, 1}, {},
+        static_cast<float>(kIndexInitializer), false, gpu);
 
-  if (args->computing_columns) {
-    MaterializeProfile(best[0], indices[0],
-                       &args->profile_a.data[0].uint64_value);
-  }
-  if (args->has_b && args->computing_rows) {
-    MaterializeProfile(best[1], indices[1],
-                       &args->profile_b.data[0].uint64_value);
+    if (args->computing_columns) {
+      MaterializeProfile(best[0], indices[0],
+                         &args->profile_a.data[0].uint64_value);
+    }
+    if (args->has_b && args->computing_rows) {
+      MaterializeProfile(best[1], indices[1],
+                         &args->profile_b.data[0].uint64_value);
+    }
   }
 
   if (!args->silent_mode) {

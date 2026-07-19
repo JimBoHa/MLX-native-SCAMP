@@ -21,13 +21,13 @@ All nine upstream `pyscamp` callables are implemented in the local MLX engine ra
 
 The repository also contains an initial native C++ API compatible with
 SCAMP's `SCAMPArgs`, `Profile`, and `do_SCAMP` concepts. It links directly to
-MLX's C++ library and executes indexed 1NN self/AB joins with a custom Metal
-diagonal-recurrence kernel; it does not launch or embed Python.
+MLX's C++ library and executes indexed or index-free 1NN self/AB joins with a
+custom Metal diagonal-recurrence kernel; it does not launch or embed Python.
 
 Top-level CMake builds also produce `mlx-scamp-native`, a native executable
 linked to that library. Its distinct name avoids a case-insensitive APFS name
-collision with the Python `scamp` entry point. The current CLI intentionally
-accepts only the implemented indexed-1NN/single-precision capability:
+collision with the Python `scamp` entry point. The current CLI accepts the
+implemented single-precision `1NN_INDEX` and `1NN` capabilities:
 
 ```bash
 mlx-scamp-native \
@@ -43,6 +43,10 @@ default z-normalized Euclidean output, and aligned distributed offsets. Input
 is whitespace-delimited text. Unsupported upstream reducers and execution
 modes fail before input is read or output is touched; output sets are fully
 staged, fsynced, and then committed with rollback protection.
+
+Use `--profile_type=1NN` when match indexes are not needed. That path omits the
+second Metal index-selection pass and writes only `--output_a_file_name` (plus
+`--output_b_file_name` with `--keep_rows`); index-output flags are inactive.
 
 See [`cpp/README.md`](cpp/README.md) for build instructions, current coverage,
 and the remaining C++ parity work.

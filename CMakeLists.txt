@@ -101,6 +101,10 @@ if(MLX_SCAMP_BUILD_TESTS)
   target_link_libraries(mlx_scamp_cpp_test PRIVATE MLXNativeSCAMP::scamp)
   add_test(NAME mlx_scamp_cpp_indexed_1nn COMMAND mlx_scamp_cpp_test)
 
+  add_executable(mlx_scamp_cpp_1nn_test cpp/tests/test_1nn.cpp)
+  target_link_libraries(mlx_scamp_cpp_1nn_test PRIVATE MLXNativeSCAMP::scamp)
+  add_test(NAME mlx_scamp_cpp_1nn COMMAND mlx_scamp_cpp_1nn_test)
+
   add_executable(mlx_scamp_cpp_api_test cpp/tests/test_upstream_api.cpp)
   target_link_libraries(mlx_scamp_cpp_api_test PRIVATE MLXNativeSCAMP::scamp)
   add_test(NAME mlx_scamp_cpp_upstream_api COMMAND mlx_scamp_cpp_api_test)

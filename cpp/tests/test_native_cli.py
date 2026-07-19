@@ -96,12 +96,19 @@ def assert_values_close(
 
 
 class NativeCliTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.process_directory = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.process_directory.cleanup()
+
     def run_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(CLI), *map(str, arguments)],
             check=False,
             text=True,
             capture_output=True,
+            cwd=self.process_directory.name,
         )
 
     def write_series(self, path: Path, values: list[float], *, trailing=True) -> None:
@@ -128,8 +135,8 @@ class NativeCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.strip(),
-            "v0 backend=mlx-metal strategy=two-pass-diagonal-recurrence "
-            "profile=1NN_INDEX precision=single device=0",
+            "v0 backend=mlx-metal strategy=diagonal-recurrence "
+            "profile=1NN_INDEX,1NN precision=single device=0",
         )
 
     def test_self_join_supports_gflags_forms_and_pearson(self) -> None:
@@ -245,12 +252,119 @@ class NativeCliTest(unittest.TestCase):
             self.assertTrue(all(math.isnan(value) for value in read_values(root / "values")))
             self.assertTrue(all(value == -1 for value in read_indexes(root / "indexes")))
 
+    def test_index_free_ab_join_writes_only_value_outputs(self) -> None:
+        a = [0.1, 1.0, -0.3, 0.8, 1.7, -1.2, 0.4, 1.1, -0.6, 0.2, 1.5]
+        b = [-0.8, 0.5, 1.4, -0.1, 0.9, -1.5, 0.3, 1.8, -0.4, 0.6, 1.2, -0.7]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_a, input_b = root / "a", root / "b"
+            self.write_series(input_a, a)
+            self.write_series(input_b, b)
+            original_a = input_a.read_text(encoding="utf-8")
+            original_b = input_b.read_text(encoding="utf-8")
+            output_a, output_b = root / "av", root / "bv"
+            result = self.run_cli(
+                "--profile_type=1NN",
+                "--window=4",
+                f"--input_a_file_name={input_a}",
+                f"--input_b_file_name={input_b}",
+                "--single_precision",
+                "--keep_rows",
+                "--output_pearson",
+                "--aligned",
+                "--global_col=3",
+                "--global_row=1",
+                f"--output_a_file_name={output_a}",
+                f"--output_b_file_name={output_b}",
+                # Index outputs are completely inactive for 1NN and may alias
+                # inputs without being inspected, truncated, or replaced.
+                f"--output_a_index_file_name={input_a}",
+                f"--output_b_index_file_name={input_b}",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected_a, _ = reference(
+                a, b, 4, columns=True, aligned=True, global_col=3, global_row=1
+            )
+            expected_b, _ = reference(
+                a, b, 4, columns=False, aligned=True, global_col=3, global_row=1
+            )
+            assert_values_close(self, read_values(output_a), expected_a)
+            assert_values_close(self, read_values(output_b), expected_b)
+            self.assertEqual(input_a.read_text(encoding="utf-8"), original_a)
+            self.assertEqual(input_b.read_text(encoding="utf-8"), original_b)
+            self.assertIn("committed 2 output files", result.stderr)
+
+    def test_index_free_euclidean_and_invalid_nan_formatting(self) -> None:
+        cases = [
+            ("valid", [0.2, 1.3, -0.7, 2.1, 0.5, -1.4, 0.9, 1.8]),
+            ("invalid", [math.nan, math.inf, 2.0, 2.0, 2.0, 2.0]),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label, series in cases:
+                with self.subTest(case=label):
+                    input_a = root / f"{label}-input"
+                    output = root / f"{label}-values"
+                    self.write_series(input_a, series)
+                    result = self.run_cli(
+                        "--profile_type=1NN",
+                        "--window=4",
+                        f"--input_a_file_name={input_a}",
+                        "--single_precision",
+                        f"--output_a_file_name={output}",
+                        "--output_a_index_file_name=",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    correlations, _ = reference(
+                        series, series, 4, columns=True, self_join=True
+                    )
+                    distances = [
+                        math.nan
+                        if math.isnan(value)
+                        else math.sqrt(max(8 * (1 - value), 0))
+                        for value in correlations
+                    ]
+                    assert_values_close(self, read_values(output), distances, 5e-4)
+
+    def test_index_free_commit_failure_restores_both_value_outputs(self) -> None:
+        if not hasattr(os, "chflags") or not hasattr(stat, "UF_IMMUTABLE"):
+            self.skipTest("immutable file flags are unavailable")
+        a = [0.2, 1.3, -0.7, 2.1, 0.5, -1.4, 0.9, 1.8]
+        b = [-0.8, 0.5, 1.4, -0.1, 0.9, -1.5, 0.3, 1.8]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_a, input_b = root / "a", root / "b"
+            self.write_series(input_a, a)
+            self.write_series(input_b, b)
+            output_a, output_b = root / "av", root / "bv"
+            output_a.write_text("old-a", encoding="utf-8")
+            output_b.write_text("old-b", encoding="utf-8")
+            os.chflags(output_b, stat.UF_IMMUTABLE)
+            try:
+                result = self.run_cli(
+                    "--profile_type=1NN",
+                    "--window=4",
+                    f"--input_a_file_name={input_a}",
+                    f"--input_b_file_name={input_b}",
+                    "--single_precision",
+                    "--keep_rows",
+                    f"--output_a_file_name={output_a}",
+                    f"--output_b_file_name={output_b}",
+                )
+            finally:
+                os.chflags(output_b, 0)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stage existing output", result.stderr)
+            self.assertEqual(output_a.read_text(encoding="utf-8"), "old-a")
+            self.assertEqual(output_b.read_text(encoding="utf-8"), "old-b")
+            self.assertFalse(list(root.glob(".mlx-scamp-*")))
+
     def test_unsupported_requests_fail_before_input_or_output_io(self) -> None:
         unsupported = [
-            ("--profile_type=SUM_THRESH", "1NN_INDEX only"),
-            ("--profile_type=1NN", "1NN_INDEX only"),
-            ("--profile_type=ALL_NEIGHBORS", "1NN_INDEX only"),
-            ("--profile_type=MATRIX_SUMMARY", "1NN_INDEX only"),
+            ("--profile_type=SUM_THRESH", "1NN_INDEX and 1NN only"),
+            ("--profile_type=1nn", "1NN_INDEX and 1NN only"),
+            ("--profile_type=ALL_NEIGHBORS", "1NN_INDEX and 1NN only"),
+            ("--profile_type=MATRIX_SUMMARY", "1NN_INDEX and 1NN only"),
             ("--double_precision", "double and ultra"),
             ("--ultra_precision", "double and ultra"),
             ("--no_gpu", "CPU path"),
