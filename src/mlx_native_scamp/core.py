@@ -320,6 +320,18 @@ def _portable_tile_shape(
 
 
 def gpu_supported() -> bool:
+    """Return whether the installed MLX runtime can use Apple Metal.
+
+    This reports Metal availability independently of MLX's current default
+    device. It returns ``False`` when capability discovery itself fails and
+    does not report CUDA availability.
+
+    Returns
+    -------
+    bool
+        ``True`` when MLX exposes the Apple GPU through Metal.
+    """
+
     try:
         return bool(mx.metal.is_available())
     except Exception:
@@ -2448,6 +2460,52 @@ def _autotune_execute_candidate(workload: Any, strategy: Any) -> Any:
 
 
 def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the indexed 1-nearest-neighbor profile of one time series.
+
+    Parameters
+    ----------
+    a : one-dimensional array-like
+        Input time series.
+    m : int
+        Subsequence length. It must be at least 3 and no greater than
+        ``len(a)``.
+
+    Other Parameters
+    ----------------
+    pearson : bool, default False
+        Return Pearson correlations instead of z-normalized Euclidean
+        distances.
+    precision : {"single", "double", "ultra"}, default "double"
+        Compute in float32 for ``single`` or float64 for ``double`` and
+        ``ultra``. The two float64 modes currently use the same MLX algorithm.
+    gpus : sequence of int, optional
+        ``[0]`` explicitly selects Metal and requires single precision;
+        ``[]`` selects CPU. When omitted, cached tuning and the MLX default
+        device may select the route.
+    threads : int, default 0
+        A positive value selects CPU execution. MLX controls the actual worker
+        count. It cannot be combined with ``gpus=[0]``.
+    max_tile_size : int, optional
+        Upper bound on each input tile in time-series samples. Explicit values
+        must be at least 1024 and at least ``2 * m``.
+    verbose : bool, default False
+        Emit resolved route and synchronized completion details to stdout.
+
+    Returns
+    -------
+    profile : numpy.ndarray of float32
+        Best distance or correlation with shape ``(len(a) - m + 1,)``.
+    index : numpy.ndarray of int32
+        Start index of each best match with the same shape. Equal values prefer
+        the smaller match index. Invalid or flat subsequences produce ``NaN``
+        values and index ``-1``.
+
+    Notes
+    -----
+    Matches whose start positions differ by less than ``ceil(m / 4)`` are
+    excluded as trivial self-matches.
+    """
+
     params = _parse_common_kwargs(kwargs)
     return _run_profile_with_resources(
         params,
@@ -2460,6 +2518,46 @@ def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
 
 
 def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Find one nearest neighbor in ``b`` for each subsequence of ``a``.
+
+    Parameters
+    ----------
+    a, b : one-dimensional array-like
+        Query time series ``a`` and search time series ``b``.
+    m : int
+        Subsequence length, at least 3 and no greater than either input.
+
+    Other Parameters
+    ----------------
+    pearson : bool, default False
+        Return Pearson correlations instead of z-normalized Euclidean
+        distances.
+    precision : {"single", "double", "ultra"}, default "double"
+        Compute in float32 for ``single`` or float64 for ``double`` and
+        ``ultra``. Metal supports only single precision.
+    allow_trivial_match : bool, default True
+        Consider every pair. If false, treat the inputs as aligned and exclude
+        pairs within ``ceil(m / 4)`` of the shared-coordinate diagonal.
+    gpus : sequence of int, optional
+        ``[0]`` explicitly selects Metal and ``[]`` selects CPU. Omission
+        permits cached tuning and the MLX default device to choose the route.
+    threads : int, default 0
+        A positive value selects CPU execution; MLX controls its worker count.
+    max_tile_size : int, optional
+        Input-tile ceiling in samples, at least 1024 and ``2 * m``.
+    verbose : bool, default False
+        Emit resolved route and synchronized completion details to stdout.
+
+    Returns
+    -------
+    profile : numpy.ndarray of float32
+        One best value per subsequence in ``a``, with shape
+        ``(len(a) - m + 1,)``.
+    index : numpy.ndarray of int32
+        Corresponding start positions in ``b``. Equal values prefer the
+        smaller index; invalid matches use ``-1``.
+    """
+
     params = _parse_common_kwargs(kwargs, is_ab_join=True)
     return _run_profile_with_resources(
         params,
@@ -2480,10 +2578,36 @@ def abjoin_bidirectional(
 ) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
     """Compute indexed AB-join profiles for both distance-matrix axes.
 
-    The first pair matches ``abjoin(a, b, m)``. The second pair matches
-    ``abjoin(b, a, m)`` and corresponds to SCAMP's ``keep_rows`` output.
-    This native extension is intentionally not part of the strict ``pyscamp``
-    compatibility namespace.
+    Parameters
+    ----------
+    a, b : one-dimensional array-like
+        Column and row time series of the AB distance matrix.
+    m : int
+        Subsequence length, at least 3 and no greater than either input.
+
+    Other Parameters
+    ----------------
+    pearson : bool, default False
+        Return Pearson correlations instead of z-normalized distances.
+    precision : {"single", "double", "ultra"}, default "double"
+        Select float32 or float64 computation.
+    allow_trivial_match : bool, default True
+        If false, exclude aligned near-diagonal pairs.
+    gpus, threads, max_tile_size, verbose : optional
+        Use the same resource, tiling, and reporting controls as :func:`abjoin`.
+
+    Returns
+    -------
+    ((values_a, indices_a), (values_b, indices_b))
+        Float32 values and int32 indices with lengths ``len(a) - m + 1`` and
+        ``len(b) - m + 1``. The first pair equals ``abjoin(a, b, m)``; the
+        second equals ``abjoin(b, a, m)`` and maps to SCAMP's ``keep_rows``
+        output.
+
+    Notes
+    -----
+    This native extension reduces both axes in one traversal and is not part
+    of the strict ``pyscamp`` namespace.
     """
 
     params = _parse_common_kwargs(kwargs, is_ab_join=True)
@@ -2499,7 +2623,28 @@ def abjoin_bidirectional(
 
 
 def selfjoin_1nn(a: Any, m: int, **kwargs: Any) -> np.ndarray:
-    """Compute SCAMP's index-free 1NN profile for a self-join."""
+    """Compute SCAMP's index-free 1NN profile for a self-join.
+
+    Parameters
+    ----------
+    a : one-dimensional array-like
+        Input time series.
+    m : int
+        Subsequence length, at least 3 and no greater than ``len(a)``.
+
+    Other Parameters
+    ----------------
+    pearson, precision, gpus, threads, max_tile_size, verbose : optional
+        The value, precision, resource, tiling, and reporting controls
+        documented by :func:`selfjoin`.
+
+    Returns
+    -------
+    numpy.ndarray of float32
+        Shape ``(len(a) - m + 1,)`` with one best distance or correlation per
+        subsequence. Invalid or flat subsequences produce ``NaN``. Match
+        indexes are not computed.
+    """
 
     params = _parse_common_kwargs(kwargs)
     return _run_profile_with_resources(
@@ -2513,7 +2658,28 @@ def selfjoin_1nn(a: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def abjoin_1nn(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
-    """Compute SCAMP's index-free 1NN profile for an AB-join."""
+    """Compute SCAMP's index-free 1NN profile for an AB-join.
+
+    Parameters
+    ----------
+    a, b : one-dimensional array-like
+        Query time series ``a`` and search time series ``b``.
+    m : int
+        Subsequence length, at least 3 and no greater than either input.
+
+    Other Parameters
+    ----------------
+    pearson, precision, allow_trivial_match, gpus, threads, max_tile_size,
+    verbose : optional
+        The value, alignment, resource, tiling, and reporting controls
+        documented by :func:`abjoin`.
+
+    Returns
+    -------
+    numpy.ndarray of float32
+        Shape ``(len(a) - m + 1,)`` with one best distance or correlation per
+        subsequence in ``a``. Match indexes are not computed.
+    """
 
     params = _parse_common_kwargs(kwargs, is_ab_join=True)
     return _run_profile_with_resources(
@@ -2528,6 +2694,42 @@ def abjoin_1nn(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def selfjoin_sum(a: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Sum correlations above a threshold for each subsequence of ``a``.
+
+    Parameters
+    ----------
+    a : one-dimensional array-like
+        Input time series.
+    m : int
+        Subsequence length, at least 3 and no greater than ``len(a)``.
+
+    Other Parameters
+    ----------------
+    threshold : float, default 0.0
+        Finite correlation threshold in ``[-1, 1]``. Only correlations
+        strictly greater than the threshold contribute to the sum.
+    precision : {"single", "double", "ultra"}, default "double"
+        Select float32 or float64 computation. The returned array is float64.
+    pearson : bool, default False
+        Accepted for upstream compatibility; SUM output is always a sum of
+        Pearson correlations.
+    gpus : sequence of int, optional
+        ``[0]`` explicitly selects single-precision Metal and ``[]`` selects
+        CPU. Omission permits normal route selection.
+    threads : int, default 0
+        A positive value selects CPU execution; MLX controls its worker count.
+    max_tile_size : int, optional
+        Input-tile ceiling in samples, at least 1024 and ``2 * m``.
+    verbose : bool, default False
+        Emit resolved route and synchronized completion details to stdout.
+
+    Returns
+    -------
+    numpy.ndarray of float64
+        Shape ``(len(a) - m + 1,)`` with one correlation sum per subsequence.
+        Trivial self-matches and invalid pairs contribute zero.
+    """
+
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile_with_resources(
         params,
@@ -2541,6 +2743,36 @@ def selfjoin_sum(a: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Sum qualifying correlations in ``b`` for each subsequence of ``a``.
+
+    Parameters
+    ----------
+    a, b : one-dimensional array-like
+        Query time series ``a`` and search time series ``b``.
+    m : int
+        Subsequence length, at least 3 and no greater than either input.
+
+    Other Parameters
+    ----------------
+    threshold : float, default 0.0
+        Finite correlation threshold in ``[-1, 1]``; comparison is strict.
+    precision : {"single", "double", "ultra"}, default "double"
+        Select float32 or float64 computation. Output is float64.
+    pearson : bool, default False
+        Accepted for compatibility; SUM values are always correlations.
+    allow_trivial_match : bool, default True
+        If false, exclude aligned pairs within ``ceil(m / 4)`` of the diagonal.
+    gpus, threads, max_tile_size, verbose : optional
+        Resource, tiling, and reporting controls as documented by
+        :func:`abjoin`.
+
+    Returns
+    -------
+    numpy.ndarray of float64
+        Shape ``(len(a) - m + 1,)`` with one qualifying correlation sum per
+        subsequence in ``a``. Invalid pairs contribute zero.
+    """
+
     params = _parse_common_kwargs(
         kwargs, allow_threshold=True, is_ab_join=True
     )
@@ -2557,6 +2789,41 @@ def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Return a pooled summary of a self-join distance matrix.
+
+    Parameters
+    ----------
+    a : one-dimensional array-like
+        Input time series.
+    m : int
+        Subsequence length, at least 3 and no greater than ``len(a)``.
+
+    Other Parameters
+    ----------------
+    mheight, mwidth : int, default 50
+        Positive output dimensions, each no greater than the number of
+        subsequences in ``a``.
+    threshold : float, default 0.0
+        Finite correlation threshold in ``[-1, 1]``. Pooled values below it
+        become ``NaN``.
+    pearson : bool, default False
+        Return pooled correlations or their z-normalized Euclidean distances.
+    precision : {"single", "double", "ultra"}, default "double"
+        Select float32 or float64 computation. Output is always float32.
+    gpus, threads, max_tile_size, verbose : optional
+        Resource, tiling, and reporting controls as documented by
+        :func:`selfjoin`.
+
+    Returns
+    -------
+    numpy.ndarray of float32
+        Array with shape ``(mheight, mwidth)``. Each cell contains the largest
+        valid correlation in its bin, optionally converted to distance. Empty
+        or below-threshold cells contain ``NaN``; equality is retained. Only
+        upper-triangle pairs are pooled, so lower-triangle bins without an
+        eligible pair are ``NaN``.
+    """
+
     params = _parse_common_kwargs(kwargs, allow_threshold=True, allow_matrix=True)
     return _run_profile_with_resources(
         params,
@@ -2572,6 +2839,40 @@ def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
+    """Return a pooled summary of the AB-join distance matrix.
+
+    Parameters
+    ----------
+    a, b : one-dimensional array-like
+        ``a`` supplies matrix columns and ``b`` supplies matrix rows.
+    m : int
+        Subsequence length, at least 3 and no greater than either input.
+
+    Other Parameters
+    ----------------
+    mheight, mwidth : int, default 50
+        Positive output dimensions. Height cannot exceed the subsequence count
+        of ``b`` and width cannot exceed that of ``a``.
+    threshold : float, default 0.0
+        Finite correlation threshold in ``[-1, 1]``. Pooled values below it
+        become ``NaN``.
+    pearson : bool, default False
+        Return pooled correlations or their z-normalized Euclidean distances.
+    precision : {"single", "double", "ultra"}, default "double"
+        Select float32 or float64 computation. Output is always float32.
+    allow_trivial_match : bool, default True
+        If false, exclude aligned near-diagonal pairs before pooling.
+    gpus, threads, max_tile_size, verbose : optional
+        Resource, tiling, and reporting controls as documented by
+        :func:`abjoin`.
+
+    Returns
+    -------
+    numpy.ndarray of float32
+        Pooled matrix with shape ``(mheight, mwidth)``. Empty or
+        below-threshold cells contain ``NaN``; equality is retained.
+    """
+
     params = _parse_common_kwargs(
         kwargs,
         allow_threshold=True,
@@ -2593,6 +2894,38 @@ def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 
 def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
+    """Return up to ``k`` nearest neighbors for each subsequence of ``a``.
+
+    Parameters
+    ----------
+    a : one-dimensional array-like
+        Input time series.
+    m : int
+        Subsequence length, at least 3 and no greater than ``len(a)``.
+    k : int
+        Positive maximum number of neighbors per subsequence.
+
+    Other Parameters
+    ----------------
+    threshold : float, default 0.0
+        Finite correlation threshold in ``[-1, 1]``. Matches must be strictly
+        greater than it, even when returned values are distances.
+    pearson : bool, default False
+        Return correlation values instead of z-normalized distances.
+    precision : {"single", "double", "ultra"}, default "double"
+        Select float32 or float64 computation.
+    gpus, threads, max_tile_size, verbose : optional
+        Resource, tiling, and reporting controls as documented by
+        :func:`selfjoin`.
+
+    Returns
+    -------
+    list of (column, row, value)
+        Matches grouped by ascending subsequence column. Within a column they
+        are ordered by decreasing correlation, with smaller row indexes
+        breaking ties. Invalid pairs and trivial self-matches are omitted.
+    """
+
     k = _positive_knn_k(k)
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
     return _run_profile_with_resources(
@@ -2608,6 +2941,39 @@ def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, 
 
 
 def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
+    """Return up to ``k`` neighbors in ``b`` for each subsequence of ``a``.
+
+    Parameters
+    ----------
+    a, b : one-dimensional array-like
+        Query time series ``a`` and search time series ``b``.
+    m : int
+        Subsequence length, at least 3 and no greater than either input.
+    k : int
+        Positive maximum number of neighbors per subsequence in ``a``.
+
+    Other Parameters
+    ----------------
+    threshold : float, default 0.0
+        Finite correlation threshold in ``[-1, 1]``; comparison is strict even
+        when returned values are distances.
+    pearson : bool, default False
+        Return correlation values instead of z-normalized distances.
+    precision : {"single", "double", "ultra"}, default "double"
+        Select float32 or float64 computation.
+    allow_trivial_match : bool, default True
+        If false, omit aligned near-diagonal matches.
+    gpus, threads, max_tile_size, verbose : optional
+        Resource, tiling, and reporting controls as documented by
+        :func:`abjoin`.
+
+    Returns
+    -------
+    list of (column, row, value)
+        ``column`` indexes a subsequence in ``a`` and ``row`` its match in
+        ``b``. Results have deterministic correlation and row-index ordering.
+    """
+
     k = _positive_knn_k(k)
     params = _parse_common_kwargs(
         kwargs, allow_threshold=True, is_ab_join=True

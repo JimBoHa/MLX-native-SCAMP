@@ -1,3 +1,5 @@
+"""Versioned, bounded, and process-safe MLX autotune sidecar storage."""
+
 from __future__ import annotations
 
 import hashlib
@@ -724,6 +726,20 @@ def lookup_record(key: WorkloadKey, cache_path: str = "") -> TuningRecord | None
 
 
 def reset_cache(cache_path: str = "") -> bool:
+    """Remove the MLX autotune sidecar without touching upstream's cache.
+
+    Parameters
+    ----------
+    cache_path : str, default ""
+        Upstream cache filename used to resolve the adjacent ``.mlx.json``
+        sidecar. An empty string uses SCAMP's platform cache location.
+
+    Returns
+    -------
+    bool
+        ``True`` if a sidecar was removed, otherwise ``False``.
+    """
+
     path = sidecar_path(cache_path)
     removed = False
     with _locked_cache(path):
@@ -738,6 +754,21 @@ def reset_cache(cache_path: str = "") -> bool:
 
 
 def cache_status(cache_path: str = "") -> dict[str, Any]:
+    """Inspect the current environment's MLX autotune sidecar status.
+
+    Parameters
+    ----------
+    cache_path : str, default ""
+        Upstream cache filename used to resolve the independent MLX sidecar.
+
+    Returns
+    -------
+    dict
+        ``path``, filesystem ``exists`` state, current ``environment_id``,
+        current candidate ``manifest_id``, and count of compatible ``records``.
+        Malformed, stale, or foreign-environment records are not counted.
+    """
+
     path = sidecar_path(cache_path)
     records = load_records(cache_path)
     return {

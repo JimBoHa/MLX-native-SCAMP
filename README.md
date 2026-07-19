@@ -1,8 +1,10 @@
 # MLX-native-SCAMP
 
-`MLX-native-SCAMP` is an Apple Silicon port of SCAMP's Python-facing API built on top of Apple MLX.
+`MLX-native-SCAMP` brings the original
+[SCAMP](https://github.com/zpzim/SCAMP) Python API and growing native/runtime
+pathways to Apple Silicon with Apple MLX and Metal.
 
-The package provides an MLX-native `pyscamp`-compatible import surface for the full upstream Python API:
+The package provides this strict MLX-native `pyscamp` compatibility surface:
 
 - `gpu_supported`
 - `selfjoin`
@@ -15,11 +17,14 @@ The package provides an MLX-native `pyscamp`-compatible import surface for the f
 - `abjoin_knn`
 - `autotune`
 
-The implementation is pure Python plus MLX and is meant to be called by other apps without requiring CUDA.
-All ten upstream `pyscamp` callables are implemented locally rather than
-delegated back to CUDA SCAMP. The native `mlx_native_scamp` namespace also
-exposes index-free 1NN, one-pass bidirectional AB joins, and typed autotune
-planning/status controls without expanding the strict `pyscamp` surface.
+The Python implementation uses MLX without requiring CUDA. The strict
+`pyscamp` namespace implements all nine callables released in
+[SCAMP v4.0.3](https://github.com/zpzim/SCAMP/releases/tag/v4.0.3), plus the
+`autotune` API subsequently added to upstream `master`, for ten callables in
+total. They execute locally rather than delegating back to CUDA SCAMP. The
+native `mlx_native_scamp` namespace also exposes index-free 1NN, one-pass
+bidirectional AB joins, and typed autotune planning/status controls without
+expanding the strict compatibility surface.
 
 ## Native C++ library and CLI
 
@@ -211,15 +216,15 @@ remain follow-up work.
 ## Notes
 
 - The compute-heavy matrix profile kernels are MLX-native on Apple Silicon.
-- Single-precision `selfjoin`, `abjoin`, `selfjoin_sum`, and `abjoin_sum` use
-  custom Metal kernels that follow SCAMP's rolling-covariance diagonal
-  algorithm. Other profiles and execution modes use the portable MLX
-  implementation.
-- Single-precision matrix summaries whose inputs fit the active
-  `max_tile_size` ceiling also use the diagonal recurrence on Metal, atomically
+- Eligible single-precision indexed, index-free, and bidirectional 1NN joins
+  can use a custom Metal kernel that follows SCAMP's rolling-covariance
+  diagonal algorithm. Safety, tiling, and autotune gates otherwise select the
+  portable MLX implementation.
+- Eligible single-precision matrix summaries whose inputs fit the active
+  `max_tile_size` ceiling can use the diagonal recurrence on Metal, atomically
   reducing directly into the requested pooled matrix instead of materializing
-  similarity blocks. Oversized, CPU, and higher-precision summaries retain the
-  bounded portable implementation.
+  similarity blocks. Safety and autotune gates, oversized inputs, CPU routes,
+  and higher precision retain the bounded portable implementation.
 - Eligible native float32 joins are translated by a finite per-series origin
   after quantization, then prepared with stable float64 CPU statistics. The
   rolling recurrence is vectorized in bounded NumPy blocks with high-accuracy
@@ -256,15 +261,15 @@ remain follow-up work.
   ceiling that cannot contain the join selects the bounded portable path;
   checkpointed multi-dispatch execution in the custom Metal kernel remains a
   follow-up for exceptionally long joins.
-- For nonnegative thresholds, sufficiently large SUM workloads use a sparse
-  Metal reducer. It refreshes covariance directly every 64 diagonal steps,
-  bounds float32 atomic accumulation to 2,048 diagonals at a time, and merges
-  partial profiles in float64 on CPU. A bounded correlation sample estimates
-  atomic-update density; density, window size, pair count, join shape, and join
-  type select conservative benchmarked crossovers. Smaller, short-window,
-  dense, highly rectangular, and negative-threshold joins retain the portable
-  reducer because atomics or short diagonals can be slower than MLX matrix
-  multiplication. Correlations within float32
+- For nonnegative thresholds, sufficiently large SUM workloads can use a
+  sparse Metal reducer. It refreshes covariance directly every 64 diagonal
+  steps, bounds float32 atomic accumulation to 2,048 diagonals at a time, and
+  merges partial profiles in float64 on CPU. A bounded correlation sample
+  estimates atomic-update density; density, window size, pair count, join
+  shape, and join type select conservative benchmarked crossovers. Smaller,
+  short-window, dense, highly rectangular, and negative-threshold joins retain
+  the portable reducer because atomics or short diagonals can be slower than
+  MLX matrix multiplication. Correlations within float32
   roundoff of a strict threshold can fall on either side; use double precision
   on CPU when that boundary must be stable. Double and ultra precision remain
   entirely on MLX CPU.
@@ -297,3 +302,13 @@ remain follow-up work.
 - Explicit `gpus=[0]` requests with `double` or `ultra` are rejected instead of
   silently moving float64 work to CPU.
 - The implementation currently targets dense 1D numeric arrays.
+
+## Upstream and citation
+
+This port builds on the SCAMP algorithms and public interfaces maintained by
+[Zachary Zimmerman and the SCAMP contributors](https://github.com/zpzim/SCAMP).
+Please retain that attribution and cite the upstream work when appropriate:
+
+Zimmerman, Zachary, et al. “Matrix Profile XIV: Scaling Time Series Motif
+Discovery with GPUs to Break a Quintillion Pairwise Comparisons a Day and
+Beyond.” *Proceedings of the ACM Symposium on Cloud Computing*, 2019.
