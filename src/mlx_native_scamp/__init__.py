@@ -1,27 +1,44 @@
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _distribution_version
+
 from .core import (
     abjoin,
+    abjoin_1nn,
+    abjoin_bidirectional,
     abjoin_knn,
     abjoin_matrix,
     abjoin_sum,
     autotune,
     gpu_supported,
     selfjoin,
+    selfjoin_1nn,
     selfjoin_knn,
     selfjoin_matrix,
     selfjoin_sum,
 )
 
-__version__ = "dev"
+
+def _resolve_version() -> str:
+    try:
+        return _distribution_version("mlx-native-scamp")
+    except _PackageNotFoundError:
+        return "dev"
+
+
+__version__ = _resolve_version()
 
 __all__ = [
     "__version__",
     "abjoin",
+    "abjoin_1nn",
+    "abjoin_bidirectional",
     "abjoin_knn",
     "abjoin_matrix",
     "abjoin_sum",
     "autotune",
     "gpu_supported",
     "selfjoin",
+    "selfjoin_1nn",
     "selfjoin_knn",
     "selfjoin_matrix",
     "selfjoin_sum",
