@@ -32,7 +32,7 @@ class PreparedSeries:
 
 def gpu_supported() -> bool:
     try:
-        return mx.default_device() == mx.gpu
+        return bool(mx.metal.is_available())
     except Exception:
         return False
 

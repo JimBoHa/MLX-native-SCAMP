@@ -49,8 +49,13 @@ class PyScampCompatTests(unittest.TestCase):
         self.assertEqual(EXPECTED_PUBLIC_CALLABLES, exported)
         self.assertEqual("dev", mp.__version__)
 
-    def test_gpu_supported(self):
-        self.assertTrue(mp.gpu_supported())
+    def test_gpu_supported_is_independent_of_default_device(self):
+        previous_device = mx.default_device()
+        try:
+            mx.set_default_device(mx.cpu)
+            self.assertEqual(mx.metal.is_available(), mp.gpu_supported())
+        finally:
+            mx.set_default_device(previous_device)
 
     def test_selfjoin_matches_reference(self):
         valid_dist, valid_idx = reduce_1nn_index(self.dm_self)
