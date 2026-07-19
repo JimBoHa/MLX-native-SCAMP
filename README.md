@@ -51,6 +51,9 @@ scamp --window=128 --input_a_file_name=a.txt --input_b_file_name=b.txt \
 Inputs use SCAMP's whitespace-delimited ASCII format. `-` may be used as one
 input to read from stdin or as one output to write to stdout. Progress messages
 from `--print_debug_info` go to stderr so stdout remains machine-readable.
+Active input/output paths are checked for canonical, hard-link, case-only, and
+Unicode-normalization aliases before computation; file outputs replace their
+targets atomically only after a complete write.
 
 All upstream profile modes are available: `1NN_INDEX`, `1NN`, `SUM_THRESH`,
 `ALL_NEIGHBORS`, and `MATRIX_SUMMARY`. For an AB-join, `--keep_rows` computes

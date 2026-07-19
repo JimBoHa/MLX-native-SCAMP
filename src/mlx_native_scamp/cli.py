@@ -5,6 +5,7 @@ import importlib
 import os
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
@@ -340,7 +341,18 @@ def _validate_outputs(args: argparse.Namespace) -> None:
         }
     except OSError as exc:
         raise CLIError(f"unable to resolve input/output paths: {exc}") from exc
-    if len(resolved_outputs) != len(set(resolved_outputs)):
+    # Reject case/Unicode-only aliases conservatively. The target macOS
+    # volumes are commonly case-insensitive, and a nonexistent path cannot be
+    # compared with samefile() before the first output is created.
+    output_keys = [
+        unicodedata.normalize("NFC", os.fspath(path)).casefold()
+        for path in resolved_outputs
+    ]
+    input_keys = {
+        unicodedata.normalize("NFC", os.fspath(path)).casefold()
+        for path in resolved_inputs
+    }
+    if len(output_keys) != len(set(output_keys)):
         raise CLIError("active output filenames must be distinct")
     for position, output in enumerate(resolved_outputs):
         for other in resolved_outputs[position + 1 :]:
@@ -350,9 +362,9 @@ def _validate_outputs(args: argparse.Namespace) -> None:
             except OSError as exc:
                 raise CLIError(f"unable to compare output paths: {exc}") from exc
     collisions = resolved_inputs.intersection(resolved_outputs)
-    if collisions:
+    if collisions or input_keys.intersection(output_keys):
         raise CLIError(
-            f"an output filename aliases an input file: {next(iter(collisions))}"
+            "an output filename aliases an input file"
         )
     for output in resolved_outputs:
         for input_path in resolved_inputs:

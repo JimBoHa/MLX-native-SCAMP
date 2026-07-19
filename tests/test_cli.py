@@ -170,6 +170,19 @@ class CLIParityTests(unittest.TestCase):
             with self.assertRaisesRegex(cli.CLIError, "distinct"):
                 cli.run(args)
 
+    def test_case_only_output_aliases_are_rejected_before_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory, "input.txt")
+            input_path.write_text("0\n1\n2\n3\n", encoding="utf-8")
+            args = self.parse(
+                "--window=3",
+                f"--input_a_file_name={input_path}",
+                f"--output_a_file_name={Path(directory, 'profile.txt')}",
+                f"--output_a_index_file_name={Path(directory, 'PROFILE.TXT')}",
+            )
+            with self.assertRaisesRegex(cli.CLIError, "distinct"):
+                cli.run(args)
+
     def test_file_output_replaces_target_only_after_all_lines_succeed(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "profile.txt")
