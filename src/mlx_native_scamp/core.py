@@ -18,6 +18,16 @@ VALID_PRECISIONS = {"single", "double", "ultra"}
 BLOCK_ROWS = 256
 ROLLING_STATISTICS_BLOCK = 4096
 ROLLING_STATISTICS_SAFETY_FACTOR = 262144.0
+MIB = 1024 * 1024
+DEFAULT_UNIFIED_MEMORY_BYTES = 2 * 1024 * MIB
+MIN_SIMILARITY_TILE_BUDGET_BYTES = 8 * MIB
+MAX_SIMILARITY_TILE_BUDGET_BYTES = 64 * MIB
+SIMILARITY_TILE_WORKING_SET_DIVISOR = 64
+NORMALIZED_WINDOW_TEMPORARY_FACTOR = 8
+SIMILARITY_CELL_TEMPORARY_FACTOR = 6
+MAX_IN_FLIGHT_SIMILARITY_TILES = 2
+UPSTREAM_CPU_MAX_TILE_SIZE = 128000
+UPSTREAM_METAL_MAX_TILE_SIZE = 512000
 
 
 @dataclass(slots=True)
@@ -32,9 +42,153 @@ class PreparedSeries:
     recurrence_dg: Any | None = None
 
 
+@dataclass(slots=True)
+class TiledSeries:
+    values: Any
+    subsequences: int
+
+
+@dataclass(slots=True)
+class SimilarityTile:
+    row_start: int
+    row_end: int
+    col_start: int
+    col_end: int
+    row_indices: Any
+    col_indices: Any
+    values: Any
+
+
+@dataclass(slots=True)
+class ReducerScheduler:
+    """Bound lazy similarity graphs while retaining compact reducer state."""
+
+    pending: int = 0
+
+    def schedule(self, *state: Any) -> None:
+        _schedule_reducer_state(*state)
+        self.pending += 1
+        if self.pending >= MAX_IN_FLIGHT_SIMILARITY_TILES:
+            self.finish()
+
+    def finish(self) -> None:
+        if self.pending:
+            mx.synchronize()
+            self.pending = 0
+
+
 def _schedule_reducer_state(*state: Any) -> None:
     """Schedule compact state so MLX can release its similarity block."""
     mx.async_eval(*state)
+
+
+def _device_working_set_bytes() -> int:
+    """Return Apple's recommended unified-memory working set when available."""
+
+    getters = []
+    if hasattr(mx, "device_info"):
+        getters.append(mx.device_info)
+    metal = getattr(mx, "metal", None)
+    if not getters and metal is not None and hasattr(metal, "device_info"):
+        getters.append(metal.device_info)
+
+    for getter in getters:
+        try:
+            info = getter()
+        except Exception:
+            continue
+        if not isinstance(info, dict):
+            continue
+        for key in ("max_recommended_working_set_size", "memory_size"):
+            try:
+                size = int(info.get(key, 0))
+            except (TypeError, ValueError):
+                continue
+            if size > 0:
+                return size
+    return DEFAULT_UNIFIED_MEMORY_BYTES
+
+
+def _similarity_tile_budget_bytes() -> int:
+    target = _device_working_set_bytes() // SIMILARITY_TILE_WORKING_SET_DIVISOR
+    return max(
+        MIN_SIMILARITY_TILE_BUDGET_BYTES,
+        min(MAX_SIMILARITY_TILE_BUDGET_BYTES, target),
+    )
+
+
+def _dtype_itemsize(dtype: Any) -> int:
+    if dtype == mx.float32:
+        return np.dtype(np.float32).itemsize
+    if dtype == mx.float64:
+        return np.dtype(np.float64).itemsize
+    raise TypeError(f"Unsupported MLX compute dtype: {dtype}")
+
+
+def _default_max_tile_size() -> int:
+    try:
+        selected_metal = mx.default_device() == mx.gpu
+    except Exception:
+        selected_metal = False
+    upstream_default = (
+        UPSTREAM_METAL_MAX_TILE_SIZE
+        if selected_metal
+        else UPSTREAM_CPU_MAX_TILE_SIZE
+    )
+    return upstream_default
+
+
+def _tile_subsequence_count(max_tile_size: int, m: int) -> int:
+    """Translate SCAMP's time-series tile length to matrix dimensions."""
+
+    return max_tile_size - m + 1
+
+
+def _estimate_similarity_tile_bytes(
+    row_count: int,
+    column_count: int,
+    m: int,
+    itemsize: int,
+) -> int:
+    """Estimate transient MLX storage used by one portable similarity tile."""
+
+    axis_bytes = m * itemsize * NORMALIZED_WINDOW_TEMPORARY_FACTOR + 33
+    cell_bytes = itemsize * SIMILARITY_CELL_TEMPORARY_FACTOR + 2
+    return (row_count + column_count) * axis_bytes + (
+        row_count * column_count * cell_bytes
+    )
+
+
+def _portable_tile_shape(
+    row_subsequences: int,
+    column_subsequences: int,
+    m: int,
+    dtype: Any,
+    max_tile_size: int,
+) -> tuple[int, int]:
+    """Choose bounded row/column spans within SCAMP's tile-size ceiling."""
+
+    max_subsequences = _tile_subsequence_count(max_tile_size, m)
+    row_limit = min(row_subsequences, max_subsequences, BLOCK_ROWS)
+    column_limit = min(column_subsequences, max_subsequences)
+    if row_limit <= 0 or column_limit <= 0:
+        raise ValueError("portable tile dimensions must be positive")
+
+    budget = _similarity_tile_budget_bytes()
+    itemsize = _dtype_itemsize(dtype)
+    axis_bytes = m * itemsize * NORMALIZED_WINDOW_TEMPORARY_FACTOR + 33
+    cell_bytes = itemsize * SIMILARITY_CELL_TEMPORARY_FACTOR + 2
+
+    # Reserve most of the target for the column windows and the lazy GEMM
+    # graph. A one-row/one-column tile is the irreducible lower bound when a
+    # single very large window already exceeds the advisory byte target.
+    row_window_limit = max(1, budget // max(4 * axis_bytes, 1))
+    row_matrix_limit = max(1, math.isqrt(max(1, budget // (4 * cell_bytes))))
+    tile_rows = min(row_limit, row_window_limit, row_matrix_limit)
+    remaining = max(0, budget - tile_rows * axis_bytes)
+    bytes_per_column = axis_bytes + tile_rows * cell_bytes
+    tile_columns = min(column_limit, max(1, remaining // bytes_per_column))
+    return tile_rows, tile_columns
 
 
 def gpu_supported() -> bool:
@@ -141,7 +295,14 @@ def _parse_common_kwargs(
     allow_threshold: bool = False,
     is_ab_join: bool = False,
 ) -> dict[str, Any]:
-    valid_keys = {"verbose", "precision", "pearson", "gpus", "threads"}
+    valid_keys = {
+        "verbose",
+        "precision",
+        "pearson",
+        "gpus",
+        "threads",
+        "max_tile_size",
+    }
     if allow_threshold:
         valid_keys.add("threshold")
     if allow_matrix:
@@ -175,6 +336,16 @@ def _parse_common_kwargs(
     if threads < 0:
         raise ValueError("Invalid number of cpu worker threads specified, must be greater than or equal to 0.")
 
+    max_tile_size = None
+    if "max_tile_size" in kwargs:
+        max_tile_size = _index_kwarg(kwargs["max_tile_size"], "max_tile_size")
+        if max_tile_size <= 0:
+            raise ValueError(
+                "Invalid max_tile_size specified: value must be greater than 0"
+            )
+        if max_tile_size < 1024:
+            raise ValueError("max_tile_size must be at least 1024")
+
     params = {
         "pearson": _bool_kwarg(kwargs.get("pearson", False), "pearson"),
         "precision": precision,
@@ -182,6 +353,7 @@ def _parse_common_kwargs(
         "verbose": _bool_kwarg(kwargs.get("verbose", False), "verbose"),
         "threads": threads,
         "gpus": _gpu_kwarg(kwargs["gpus"]) if "gpus" in kwargs else None,
+        "max_tile_size": max_tile_size,
     }
     if is_ab_join:
         params["allow_trivial_match"] = _bool_kwarg(
@@ -249,6 +421,85 @@ def _prepare_series(values: Any, m: int) -> PreparedSeries:
         recurrence_df=df,
         recurrence_dg=dg,
     )
+
+
+def _prepare_tiled_series(values: Any, m: int) -> TiledSeries:
+    return TiledSeries(
+        values=values,
+        subsequences=int(values.shape[0]) - m + 1,
+    )
+
+
+def _prepare_series_tile(
+    series: TiledSeries,
+    start: int,
+    end: int,
+    m: int,
+) -> PreparedSeries:
+    segment = series.values[start : end + m - 1]
+    prepared = _prepare_series(segment, m)
+    # Materialize normalization before constructing the GEMM graph. This
+    # prevents the lazy graph from retaining every normalization temporary
+    # alongside the similarity-mask temporaries.
+    mx.eval(prepared.windows, prepared.valid)
+    return prepared
+
+
+def _tile_ranges(subsequences: int, tile_subsequences: int):
+    for start in range(0, subsequences, tile_subsequences):
+        yield start, min(subsequences, start + tile_subsequences)
+
+
+def _iterate_tiled_blocks(
+    series_a: TiledSeries,
+    series_b: TiledSeries,
+    m: int,
+    exclusion: int,
+    tile_rows: int,
+    tile_columns: int,
+):
+    for col_start, col_end in _tile_ranges(
+        series_a.subsequences, tile_columns
+    ):
+        prepared_a = _prepare_series_tile(series_a, col_start, col_end, m)
+        col_indices = mx.arange(col_start, col_end, dtype=mx.int32)
+        for row_start, row_end in _tile_ranges(
+            series_b.subsequences, tile_rows
+        ):
+            if (
+                series_a is series_b
+                and row_start == col_start
+                and row_end == col_end
+            ):
+                prepared_b = prepared_a
+            else:
+                prepared_b = _prepare_series_tile(
+                    series_b, row_start, row_end, m
+                )
+            row_indices = mx.arange(row_start, row_end, dtype=mx.int32)
+            block = prepared_b.windows @ prepared_a.windows.T
+            valid_mask = prepared_b.valid[:, None] & prepared_a.valid[None, :]
+            sentinel_block = mx.full(block.shape, SENTINEL, dtype=block.dtype)
+            block = mx.where(
+                valid_mask,
+                mx.clip(block, -1.0, 1.0),
+                sentinel_block,
+            )
+            if exclusion > 0:
+                diag_mask = (
+                    mx.abs(row_indices[:, None] - col_indices[None, :])
+                    < exclusion
+                )
+                block = mx.where(diag_mask, sentinel_block, block)
+            yield SimilarityTile(
+                row_start=row_start,
+                row_end=row_end,
+                col_start=col_start,
+                col_end=col_end,
+                row_indices=row_indices,
+                col_indices=col_indices,
+                values=block,
+            )
 
 
 def _rolling_mean_and_norm_sq_scalar(
@@ -615,12 +866,30 @@ def _metal_recurrence_is_safe(
     )
 
 
-def _topk_desc_axis0(values: Any, k: int) -> Any:
+def _topk_corr_then_smallest_index(
+    values: Any,
+    indices: Any,
+    k: int,
+    *,
+    indices_are_sorted: bool = False,
+) -> tuple[Any, Any]:
+    """Select correlations descending with the smallest row breaking ties."""
+
     rows = int(values.shape[0])
     k = max(1, min(int(k), rows))
-    order = mx.argsort(values, axis=0)
-    positions = mx.arange(rows - 1, rows - k - 1, -1)
-    return mx.take(order, positions, axis=0)
+    if not indices_are_sorted:
+        index_order = mx.argsort(indices, axis=0)
+        values = mx.take_along_axis(values, index_order, axis=0)
+        indices = mx.take_along_axis(indices, index_order, axis=0)
+
+    # MLX argsort is stable. Sorting rows first and then sorting negative
+    # correlations preserves ascending row order within every equal-value run.
+    correlation_order = mx.argsort(-values, axis=0)
+    top_order = mx.take(correlation_order, mx.arange(k), axis=0)
+    return (
+        mx.take_along_axis(values, top_order, axis=0),
+        mx.take_along_axis(indices, top_order, axis=0),
+    )
 
 
 def _convert_profile_output(corr: np.ndarray, m: int, pearson: bool) -> np.ndarray:
@@ -641,41 +910,16 @@ def _convert_match_value(corr: float, m: int, pearson: bool) -> float:
     return float(np.sqrt(max(2.0 * m * (1.0 - corr), 0.0)))
 
 
-def _iterate_blocks(
-    prepared_a: PreparedSeries,
-    prepared_b: PreparedSeries,
-    exclusion: int,
-    block_rows: int,
-):
-    n_cols = prepared_a.subsequences
-    col_indices = mx.arange(n_cols, dtype=mx.int32)
-    for row_start in range(0, prepared_b.subsequences, block_rows):
-        row_end = min(prepared_b.subsequences, row_start + block_rows)
-        row_indices = mx.arange(row_start, row_end, dtype=mx.int32)
-        block_b = mx.take(prepared_b.windows, row_indices, axis=0)
-        row_valid = mx.take(prepared_b.valid, row_indices, axis=0)
-        block = block_b @ prepared_a.windows.T
-        valid_mask = row_valid[:, None] & prepared_a.valid[None, :]
-        sentinel_block = mx.full(block.shape, SENTINEL, dtype=block.dtype)
-        block = mx.where(
-            valid_mask,
-            mx.clip(block, -1.0, 1.0),
-            sentinel_block,
-        )
-        if exclusion > 0:
-            diag_mask = mx.abs(row_indices[:, None] - col_indices[None, :]) < exclusion
-            block = mx.where(diag_mask, sentinel_block, block)
-        yield row_start, row_end, row_indices, block
-
-
 def _best_match_profile(
-    prepared_a: PreparedSeries,
-    prepared_b: PreparedSeries,
+    prepared_a: PreparedSeries | TiledSeries,
+    prepared_b: PreparedSeries | TiledSeries,
     m: int,
     pearson: bool,
     self_join: bool,
     exclusion: int,
     use_metal_kernel: bool,
+    tile_rows: int | None = None,
+    tile_columns: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if use_metal_kernel:
         from ._metal_1nn import best_match
@@ -685,33 +929,76 @@ def _best_match_profile(
         )
         return _convert_profile_output(corr_np, m, pearson), idx_np
 
-    best_corr = mx.full(
-        (prepared_a.subsequences,), SENTINEL, dtype=prepared_a.windows.dtype
-    )
-    best_idx = mx.full((prepared_a.subsequences,), -1, dtype=mx.int32)
-    for row_start, _, _, block in _iterate_blocks(
-        prepared_a, prepared_b, exclusion, block_rows=BLOCK_ROWS
+    if not isinstance(prepared_a, TiledSeries) or not isinstance(
+        prepared_b, TiledSeries
     ):
-        block_best_corr = mx.max(block, axis=0)
-        block_best_idx = mx.argmax(block, axis=0) + row_start
-        update = block_best_corr > best_corr
-        best_corr = mx.where(update, block_best_corr, best_corr)
-        best_idx = mx.where(update, block_best_idx, best_idx)
-        _schedule_reducer_state(best_corr, best_idx)
-    corr_np = np.asarray(best_corr).astype(np.float32)
-    idx_np = np.asarray(best_idx).astype(np.int32)
+        raise TypeError("portable reducers require tiled series inputs")
+    if tile_rows is None or tile_columns is None:
+        raise TypeError("portable reducers require explicit tile dimensions")
+
+    column_ranges = list(
+        _tile_ranges(prepared_a.subsequences, tile_columns)
+    )
+    best_corr = {
+        start: mx.full(
+            (end - start,), SENTINEL, dtype=prepared_a.values.dtype
+        )
+        for start, end in column_ranges
+    }
+    best_idx = {
+        start: mx.full((end - start,), -1, dtype=mx.int32)
+        for start, end in column_ranges
+    }
+    scheduler = ReducerScheduler()
+    for tile in _iterate_tiled_blocks(
+        prepared_a,
+        prepared_b,
+        m,
+        exclusion,
+        tile_rows,
+        tile_columns,
+    ):
+        block_best_corr = mx.max(tile.values, axis=0)
+        block_best_idx = mx.argmax(tile.values, axis=0) + tile.row_start
+        current_corr = best_corr[tile.col_start]
+        current_idx = best_idx[tile.col_start]
+        update = block_best_corr > current_corr
+        best_corr[tile.col_start] = mx.where(
+            update, block_best_corr, current_corr
+        )
+        best_idx[tile.col_start] = mx.where(
+            update, block_best_idx, current_idx
+        )
+        scheduler.schedule(
+            best_corr[tile.col_start], best_idx[tile.col_start]
+        )
+    scheduler.finish()
+    corr_np = np.concatenate(
+        [
+            np.asarray(best_corr[start]).astype(np.float32)
+            for start, _ in column_ranges
+        ]
+    )
+    idx_np = np.concatenate(
+        [
+            np.asarray(best_idx[start]).astype(np.int32)
+            for start, _ in column_ranges
+        ]
+    )
     idx_np[corr_np < -1.0] = -1
     return _convert_profile_output(corr_np, m, pearson), idx_np
 
 
 def _sum_threshold_profile(
-    prepared_a: PreparedSeries,
-    prepared_b: PreparedSeries,
+    prepared_a: PreparedSeries | TiledSeries,
+    prepared_b: PreparedSeries | TiledSeries,
     m: int,
     threshold: float,
     self_join: bool,
     exclusion: int,
     use_metal_kernel: bool,
+    tile_rows: int | None = None,
+    tile_columns: int | None = None,
 ) -> np.ndarray:
     if use_metal_kernel:
         from ._metal_sum import sum_threshold
@@ -720,14 +1007,45 @@ def _sum_threshold_profile(
             prepared_a, prepared_b, m, threshold, self_join, exclusion
         )
 
-    accum = mx.zeros((prepared_a.subsequences,), dtype=prepared_a.windows.dtype)
-    for _, _, _, block in _iterate_blocks(
-        prepared_a, prepared_b, exclusion, block_rows=BLOCK_ROWS
+    if not isinstance(prepared_a, TiledSeries) or not isinstance(
+        prepared_b, TiledSeries
     ):
-        filtered = mx.where(block > threshold, block, mx.zeros_like(block))
-        accum = accum + mx.sum(filtered, axis=0)
-        _schedule_reducer_state(accum)
-    return np.asarray(accum, dtype=np.float64)
+        raise TypeError("portable reducers require tiled series inputs")
+    if tile_rows is None or tile_columns is None:
+        raise TypeError("portable reducers require explicit tile dimensions")
+
+    column_ranges = list(
+        _tile_ranges(prepared_a.subsequences, tile_columns)
+    )
+    accum = {
+        start: mx.zeros((end - start,), dtype=prepared_a.values.dtype)
+        for start, end in column_ranges
+    }
+    scheduler = ReducerScheduler()
+    for tile in _iterate_tiled_blocks(
+        prepared_a,
+        prepared_b,
+        m,
+        exclusion,
+        tile_rows,
+        tile_columns,
+    ):
+        filtered = mx.where(
+            tile.values > threshold,
+            tile.values,
+            mx.zeros_like(tile.values),
+        )
+        accum[tile.col_start] = accum[tile.col_start] + mx.sum(
+            filtered, axis=0
+        )
+        scheduler.schedule(accum[tile.col_start])
+    scheduler.finish()
+    return np.concatenate(
+        [
+            np.asarray(accum[start], dtype=np.float64)
+            for start, _ in column_ranges
+        ]
+    )
 
 
 def _metal_sum_workload_is_worthwhile(
@@ -881,8 +1199,8 @@ def _metal_sum_is_worthwhile(
 
 
 def _matrix_summary(
-    prepared_a: PreparedSeries,
-    prepared_b: PreparedSeries,
+    prepared_a: TiledSeries,
+    prepared_b: TiledSeries,
     m: int,
     pearson: bool,
     threshold: float,
@@ -890,41 +1208,66 @@ def _matrix_summary(
     cols: int,
     self_join: bool,
     exclusion: int,
+    tile_rows: int,
+    tile_columns: int,
 ) -> np.ndarray:
-    row_edges = np.ceil(np.arange(rows + 1) * prepared_b.subsequences / rows).astype(int)
-    col_edges = np.ceil(np.arange(cols + 1) * prepared_a.subsequences / cols).astype(int)
+    row_edges = np.ceil(
+        np.arange(rows + 1) * prepared_b.subsequences / rows
+    ).astype(int)
+    col_edges = np.ceil(
+        np.arange(cols + 1) * prepared_a.subsequences / cols
+    ).astype(int)
     col_ranges = [(int(col_edges[c]), int(col_edges[c + 1])) for c in range(cols)]
-    col_indices = mx.arange(prepared_a.subsequences, dtype=mx.int32)
-    summary = mx.full((rows, cols), SENTINEL, dtype=prepared_a.windows.dtype)
+    summary = mx.full((rows, cols), SENTINEL, dtype=prepared_a.values.dtype)
+    scheduler = ReducerScheduler()
 
-    for row_start, row_end, row_indices, block in _iterate_blocks(
+    for tile in _iterate_tiled_blocks(
         prepared_a,
         prepared_b,
+        m,
         exclusion,
-        block_rows=BLOCK_ROWS,
+        tile_rows,
+        tile_columns,
     ):
+        block = tile.values
         if self_join:
-            upper_mask = row_indices[:, None] <= col_indices[None, :]
-            block = mx.where(upper_mask, block, mx.full(block.shape, SENTINEL, dtype=block.dtype))
+            upper_mask = tile.row_indices[:, None] <= tile.col_indices[None, :]
+            block = mx.where(
+                upper_mask,
+                block,
+                mx.full(block.shape, SENTINEL, dtype=block.dtype),
+            )
         block_rows_summary: list[Any] = []
         for r in range(rows):
-            rs = int(max(row_start, row_edges[r]))
-            re = int(min(row_end, row_edges[r + 1]))
+            rs = int(max(tile.row_start, row_edges[r]))
+            re = int(min(tile.row_end, row_edges[r + 1]))
             if rs >= re:
-                block_rows_summary.append(mx.full((cols,), SENTINEL, dtype=summary.dtype))
+                block_rows_summary.append(
+                    mx.full((cols,), SENTINEL, dtype=summary.dtype)
+                )
                 continue
-            row_slice = block[rs - row_start : re - row_start]
+            row_slice = block[rs - tile.row_start : re - tile.row_start]
             block_cols_summary: list[Any] = []
             for c in range(cols):
-                cs, ce = col_ranges[c]
+                cs = max(tile.col_start, col_ranges[c][0])
+                ce = min(tile.col_end, col_ranges[c][1])
                 if cs >= ce:
-                    block_cols_summary.append(mx.array(SENTINEL, dtype=summary.dtype))
+                    block_cols_summary.append(
+                        mx.array(SENTINEL, dtype=summary.dtype)
+                    )
                     continue
-                block_cols_summary.append(mx.max(row_slice[:, cs:ce]))
+                block_cols_summary.append(
+                    mx.max(
+                        row_slice[
+                            :, cs - tile.col_start : ce - tile.col_start
+                        ]
+                    )
+                )
             block_rows_summary.append(mx.stack(block_cols_summary, axis=0))
         summary = mx.maximum(summary, mx.stack(block_rows_summary, axis=0))
-        _schedule_reducer_state(summary)
+        scheduler.schedule(summary)
 
+    scheduler.finish()
     summary = np.asarray(summary, dtype=np.float32)
     summary[summary < -1.0] = np.nan
     if threshold is not None:
@@ -937,43 +1280,91 @@ def _matrix_summary(
 
 
 def _knn_profile(
-    prepared_a: PreparedSeries,
-    prepared_b: PreparedSeries,
+    prepared_a: TiledSeries,
+    prepared_b: TiledSeries,
     m: int,
     k: int,
     threshold: float,
     pearson: bool,
     exclusion: int,
+    tile_rows: int,
+    tile_columns: int,
 ) -> list[tuple[int, int, float]]:
-    n_cols = prepared_a.subsequences
-    best_corr = mx.full((k, n_cols), SENTINEL, dtype=prepared_a.windows.dtype)
-    best_idx = mx.full((k, n_cols), -1, dtype=mx.int32)
+    column_ranges = list(
+        _tile_ranges(prepared_a.subsequences, tile_columns)
+    )
+    best_corr = {
+        start: mx.full(
+            (k, end - start), SENTINEL, dtype=prepared_a.values.dtype
+        )
+        for start, end in column_ranges
+    }
+    best_idx = {
+        start: mx.full((k, end - start), -1, dtype=mx.int32)
+        for start, end in column_ranges
+    }
+    scheduler = ReducerScheduler()
 
-    for row_start, _, _, block in _iterate_blocks(
-        prepared_a, prepared_b, exclusion, block_rows=BLOCK_ROWS
+    for tile in _iterate_tiled_blocks(
+        prepared_a,
+        prepared_b,
+        m,
+        exclusion,
+        tile_rows,
+        tile_columns,
     ):
-        local_order = _topk_desc_axis0(block, min(k, int(block.shape[0])))
-        local_corr = mx.take_along_axis(block, local_order, axis=0)
-        local_idx = local_order + row_start
-        merged_corr = mx.concatenate([best_corr, local_corr], axis=0)
-        merged_idx = mx.concatenate([best_idx, local_idx], axis=0)
-        merged_order = _topk_desc_axis0(merged_corr, k)
-        best_corr = mx.take_along_axis(merged_corr, merged_order, axis=0)
-        best_idx = mx.take_along_axis(merged_idx, merged_order, axis=0)
-        _schedule_reducer_state(best_corr, best_idx)
+        local_indices = mx.broadcast_to(
+            tile.row_indices[:, None], tile.values.shape
+        )
+        local_corr, local_idx = _topk_corr_then_smallest_index(
+            tile.values,
+            local_indices,
+            k,
+            indices_are_sorted=True,
+        )
+        merged_corr = mx.concatenate(
+            [best_corr[tile.col_start], local_corr], axis=0
+        )
+        merged_idx = mx.concatenate(
+            [best_idx[tile.col_start], local_idx], axis=0
+        )
+        (
+            best_corr[tile.col_start],
+            best_idx[tile.col_start],
+        ) = _topk_corr_then_smallest_index(
+            merged_corr,
+            merged_idx,
+            k,
+        )
+        scheduler.schedule(
+            best_corr[tile.col_start], best_idx[tile.col_start]
+        )
 
-    corr_np = np.asarray(best_corr).astype(np.float32)
-    idx_np = np.asarray(best_idx).astype(np.int32)
+    scheduler.finish()
     results: list[tuple[int, int, float]] = []
-    for col in range(n_cols):
-        seen_rows: set[int] = set()
-        for rank in range(k):
-            corr = corr_np[rank, col]
-            row = int(idx_np[rank, col])
-            if corr <= threshold or corr < -1.0 or row < 0 or row in seen_rows:
-                continue
-            seen_rows.add(row)
-            results.append((col, row, _convert_match_value(corr, m, pearson)))
+    for col_start, col_end in column_ranges:
+        corr_np = np.asarray(best_corr[col_start]).astype(np.float32)
+        idx_np = np.asarray(best_idx[col_start]).astype(np.int32)
+        for local_col in range(col_end - col_start):
+            seen_rows: set[int] = set()
+            for rank in range(k):
+                corr = corr_np[rank, local_col]
+                row = int(idx_np[rank, local_col])
+                if (
+                    corr <= threshold
+                    or corr < -1.0
+                    or row < 0
+                    or row in seen_rows
+                ):
+                    continue
+                seen_rows.add(row)
+                results.append(
+                    (
+                        col_start + local_col,
+                        row,
+                        _convert_match_value(corr, m, pearson),
+                    )
+                )
     return results
 
 
@@ -990,10 +1381,18 @@ def _run_profile(
     allow_trivial_match: bool = True,
     profile: str,
     k: int | None = None,
+    max_tile_size: int | None = None,
     use_metal_1nn: bool = False,
     use_metal_sum: bool = False,
 ):
     m = _normalize_window_size(m)
+    effective_max_tile_size = (
+        _default_max_tile_size()
+        if max_tile_size is None
+        else max_tile_size
+    )
+    if effective_max_tile_size < 2 * m:
+        raise ValueError("max_tile_size must be at least twice m")
     has_b = b is not None
     float32_sources = _is_float32_input(a) and (
         not has_b or _is_float32_input(b)
@@ -1011,9 +1410,10 @@ def _run_profile(
     if int(series_b.shape[0]) < m:
         raise ValueError("m must be less than or equal to len(b)")
 
+    subsequences_a = int(series_a.shape[0]) - m + 1
+    subsequences_b = int(series_b.shape[0]) - m + 1
+
     if profile == "matrix":
-        subsequences_a = int(series_a.shape[0]) - m + 1
-        subsequences_b = int(series_b.shape[0]) - m + 1
         if mwidth > subsequences_a:
             raise ValueError(
                 "mwidth must be less than or equal to the number of subsequences in a"
@@ -1025,6 +1425,10 @@ def _run_profile(
             )
 
     self_join = not has_b
+    join_fits_tile = (
+        int(series_a.shape[0]) <= effective_max_tile_size
+        and int(series_b.shape[0]) <= effective_max_tile_size
+    )
     exclusion = (
         self_join_exclusion(m)
         if self_join or not allow_trivial_match
@@ -1035,19 +1439,23 @@ def _run_profile(
         profile == "sum"
         and use_metal_sum
         and float32_sources
+        and join_fits_tile
         and threshold >= 0.0
         and _metal_sum_is_worthwhile(
             a,
             a if self_join else b,
-            int(series_a.shape[0]) - m + 1,
-            int(series_b.shape[0]) - m + 1,
+            subsequences_a,
+            subsequences_b,
             m,
             threshold,
             self_join,
         )
     )
     if (
-        profile == "1nn" and use_metal_1nn and float32_sources
+        profile == "1nn"
+        and use_metal_1nn
+        and float32_sources
+        and join_fits_tile
     ) or sum_recurrence:
         recurrence_a = _prepare_metal_recurrence(series_a, m)
         recurrence_b = (
@@ -1080,11 +1488,20 @@ def _run_profile(
                 True,
             )
 
-    # Portable reducers intentionally retain their normalized-window path.
-    # It is only materialized after the custom recurrence is ineligible or has
-    # conservatively rejected the input.
-    prepared_a = _prepare_series(series_a, m)
-    prepared_b = _prepare_series(series_b, m)
+    # Portable reducers normalize only overlapping tile segments. The full
+    # (subsequences, m) tensor and full pairwise distance matrix are never
+    # materialized by this path.
+    tile_rows, tile_columns = _portable_tile_shape(
+        subsequences_b,
+        subsequences_a,
+        m,
+        compute_dtype,
+        effective_max_tile_size,
+    )
+    prepared_a = _prepare_tiled_series(series_a, m)
+    prepared_b = (
+        prepared_a if self_join else _prepare_tiled_series(series_b, m)
+    )
 
     if profile == "1nn":
         return _best_match_profile(
@@ -1095,6 +1512,8 @@ def _run_profile(
             self_join,
             exclusion,
             False,
+            tile_rows,
+            tile_columns,
         )
     if profile == "sum":
         return _sum_threshold_profile(
@@ -1105,6 +1524,8 @@ def _run_profile(
             self_join,
             exclusion,
             False,
+            tile_rows,
+            tile_columns,
         )
     if profile == "matrix":
         return _matrix_summary(
@@ -1117,12 +1538,22 @@ def _run_profile(
             mwidth,
             self_join,
             exclusion,
+            tile_rows,
+            tile_columns,
         )
     if profile == "knn":
         if k is None or k <= 0:
             raise ValueError("k must be greater than 0")
         return _knn_profile(
-            prepared_a, prepared_b, m, k, threshold, pearson, exclusion
+            prepared_a,
+            prepared_b,
+            m,
+            k,
+            threshold,
+            pearson,
+            exclusion,
+            tile_rows,
+            tile_columns,
         )
     raise ValueError(f"Unknown profile type: {profile}")
 
@@ -1161,6 +1592,7 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
         return _run_profile(
             *args,
             precision=params["precision"],
+            max_tile_size=params["max_tile_size"],
             use_metal_1nn=use_metal_1nn,
             use_metal_sum=use_metal_1nn,
             **kwargs,
