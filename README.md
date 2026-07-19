@@ -13,12 +13,13 @@ The package provides an MLX-native `pyscamp`-compatible import surface for the f
 - `abjoin_matrix`
 - `selfjoin_knn`
 - `abjoin_knn`
+- `autotune`
 
 The implementation is pure Python plus MLX and is meant to be called by other apps without requiring CUDA.
-All nine upstream `pyscamp` callables are implemented in the local MLX engine rather than delegated back to CUDA SCAMP.
-The native `mlx_native_scamp` namespace additionally exposes
-`abjoin_bidirectional`, which computes both AB-join axes in one traversal for
-SCAMP `keep_rows` consumers without changing the strict `pyscamp` surface.
+All ten upstream `pyscamp` callables are implemented locally rather than
+delegated back to CUDA SCAMP. The native `mlx_native_scamp` namespace also
+exposes index-free 1NN, one-pass bidirectional AB joins, and typed autotune
+planning/status controls without expanding the strict `pyscamp` surface.
 
 ## Native C++ library and CLI
 
@@ -76,6 +77,45 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 # at least 1024 samples and at least twice the subsequence window.
 profile, index = mp.selfjoin(series, 128, max_tile_size=4096)
 ```
+
+## Apple/MLX autotuning
+
+Autotuning is explicit: importing the package and running an untuned join do
+not launch benchmarks. The upstream-compatible entry point runs a bounded
+quick plan covering self-joins and AB-joins for all five upstream profile
+families in single and double precision:
+
+```python
+import pyscamp
+
+pyscamp.autotune()
+```
+
+Native integrations can inspect the plan, opt into the larger asymmetric plan
+with aligned AB and bidirectional coverage, inspect cache status, or reset only
+the MLX records:
+
+```python
+import mlx_native_scamp as mlx_scamp
+
+plan = mlx_scamp.autotune_plan("quick")
+mlx_scamp.run_autotune(mode="full")
+print(mlx_scamp.autotune_status())
+mlx_scamp.reset_autotune()
+```
+
+Results are stored in a versioned JSON sidecar next to SCAMP's cache (for
+example, `autotune.txt.mlx.json`). The upstream `SCAMP_AUTOTUNE_V1` file is
+never read as MLX JSON or overwritten. Records include the profile family,
+precision, self/AB shape, work and window buckets, aligned mode, profile
+knobs, tile regime, Apple hardware, macOS, MLX version, and candidate-manifest
+revision. Malformed or stale records are ignored by joins; explicit tuning
+refuses to overwrite an unreadable or newer-format sidecar.
+
+Only joins with implicit resources consult the cache. Explicit `gpus`,
+`threads`, and `max_tile_size` choices retain authority, and cached candidates
+are rechecked by the existing precision, float32 recurrence, density, matrix,
+and memory-ceiling gates. A cache miss preserves the normal MLX default route.
 
 ## Distributed MLX worker (experimental)
 
@@ -160,9 +200,13 @@ remain follow-up work.
   on CPU when that boundary must be stable. Double and ultra precision remain
   entirely on MLX CPU.
 - Inputs can be NumPy arrays, Python sequences, or MLX arrays.
+- Cached autotune winners can choose MLX CPU, portable MLX Metal, or an
+  eligible custom Metal reducer for the matching workload bucket. Portable
+  row choices remain clamped by the adaptive 8–64 MiB scheduler and the
+  explicit/default `max_tile_size` ceiling.
 - `gpus=[]` or a positive `threads` value selects MLX CPU execution; `gpus=[0]`
-  selects the Metal GPU. With neither, the current MLX default device is
-  preserved.
+  selects the Metal GPU. With neither and no matching cached winner, the
+  current MLX default device is preserved.
 - MLX manages its own CPU scheduler, so `threads` selects CPU execution but cannot
   enforce an exact worker count.
 - Multi-GPU requests and GPU IDs other than `0` are unsupported and rejected.
