@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import numpy as np
 
+import mlx_native_scamp.core as scamp_core
 import pyscamp as mp
 
 from reference import corr_to_euclidean, distance_matrix, reduce_1nn_index, reduce_matrix, reduce_sum_thresh
@@ -126,6 +128,128 @@ class PyScampCompatTests(unittest.TestCase):
             verbose=True,
         )
         self.assertEqual(out_dist.shape, out_idx.shape)
+
+    def test_resource_kwargs_select_expected_stream(self):
+        cases = [
+            (None, 0, None),
+            ([], 0, mx.cpu),
+            (None, 2, mx.cpu),
+            ([0], 0, mx.gpu),
+        ]
+
+        for gpus, threads, expected_device in cases:
+            with self.subTest(gpus=gpus, threads=threads):
+                stream = scamp_core._select_execution_stream(gpus, threads)
+                if expected_device is None:
+                    self.assertIsNone(stream)
+                else:
+                    self.assertEqual(expected_device, stream.device)
+
+    def test_resource_kwargs_reject_unsupported_gpu_requests(self):
+        for gpus in ([1], [-1], ["0"]):
+            with self.subTest(gpus=gpus):
+                with self.assertRaisesRegex(ValueError, "GPU device ID"):
+                    mp.selfjoin(self.a, self.m, gpus=gpus)
+
+        for gpus in ([0, 1], [0, 0]):
+            with self.subTest(gpus=gpus):
+                with self.assertRaisesRegex(ValueError, "multi-GPU"):
+                    mp.selfjoin(self.a, self.m, gpus=gpus)
+
+        with self.assertRaisesRegex(ValueError, "Concurrent CPU and Metal"):
+            mp.selfjoin(self.a, self.m, gpus=[0], threads=2)
+
+    def test_selected_stream_wraps_graph_construction_and_evaluation(self):
+        original_device = mx.default_device()
+        original_ensure = scamp_core._ensure_1d_array
+        original_profile = scamp_core._best_match_profile
+        cases = [
+            (mx.gpu, {"gpus": []}, mx.cpu),
+            (mx.cpu, {"gpus": [0]}, mx.gpu),
+        ]
+
+        for outer_device, kwargs, selected_device in cases:
+            observed_devices = []
+
+            def record_ensure(*args, **call_kwargs):
+                observed_devices.append(mx.default_device())
+                return original_ensure(*args, **call_kwargs)
+
+            def record_profile(*args, **call_kwargs):
+                observed_devices.append(mx.default_device())
+                result = original_profile(*args, **call_kwargs)
+                observed_devices.append(mx.default_device())
+                return result
+
+            with self.subTest(kwargs=kwargs):
+                with mx.stream(outer_device):
+                    with patch.object(
+                        scamp_core,
+                        "_ensure_1d_array",
+                        side_effect=record_ensure,
+                    ), patch.object(
+                        scamp_core,
+                        "_best_match_profile",
+                        side_effect=record_profile,
+                    ):
+                        mp.selfjoin(self.a[:64], 16, pearson=True, **kwargs)
+                    self.assertEqual(outer_device, mx.default_device())
+
+                self.assertGreaterEqual(len(observed_devices), 3)
+                self.assertTrue(
+                    all(device == selected_device for device in observed_devices)
+                )
+
+        self.assertEqual(original_device, mx.default_device())
+
+    def test_cpu_resource_kwargs_preserve_default_and_public_output(self):
+        valid_dist, valid_idx = reduce_1nn_index(self.dm_self)
+        original_device = mx.default_device()
+
+        with mx.stream(mx.gpu):
+            for kwargs in ({"gpus": []}, {"threads": 2}):
+                with self.subTest(kwargs=kwargs):
+                    out_dist, out_idx = mp.selfjoin(
+                        self.a,
+                        self.m,
+                        pearson=True,
+                        **kwargs,
+                    )
+                    self.assertEqual(mx.gpu, mx.default_device())
+                    np.testing.assert_allclose(
+                        valid_dist,
+                        out_dist,
+                        equal_nan=True,
+                        rtol=1e-4,
+                        atol=1e-4,
+                    )
+                    np.testing.assert_array_equal(valid_idx, out_idx)
+
+        self.assertEqual(original_device, mx.default_device())
+
+    def test_gpu_resource_kwarg_preserves_default_and_public_output(self):
+        valid_dist, valid_idx = reduce_1nn_index(self.dm_ab)
+        original_device = mx.default_device()
+
+        with mx.stream(mx.cpu):
+            out_dist, out_idx = mp.abjoin(
+                self.a,
+                self.b,
+                self.m,
+                pearson=True,
+                gpus=[0],
+            )
+            self.assertEqual(mx.cpu, mx.default_device())
+            np.testing.assert_allclose(
+                valid_dist,
+                out_dist,
+                equal_nan=True,
+                rtol=1e-4,
+                atol=1e-4,
+            )
+            np.testing.assert_array_equal(valid_idx, out_idx)
+
+        self.assertEqual(original_device, mx.default_device())
 
     def test_invalid_kwargs_raise(self):
         with self.assertRaises(ValueError):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,36 @@ def gpu_supported() -> bool:
         return mx.default_device() == mx.gpu
     except Exception:
         return False
+
+
+def _select_execution_stream(gpus: Any, threads: int) -> Any | None:
+    if gpus is None:
+        if threads > 0:
+            return mx.default_stream(mx.cpu)
+        return None
+
+    try:
+        gpu_ids = list(gpus)
+    except TypeError as exc:
+        raise ValueError("gpus must be a sequence of GPU device IDs") from exc
+
+    if not gpu_ids:
+        return mx.default_stream(mx.cpu)
+    if threads > 0:
+        raise ValueError(
+            "Concurrent CPU and Metal execution is not supported; "
+            "specify either gpus=[0] or a positive threads value"
+        )
+    if len(gpu_ids) > 1:
+        raise ValueError(
+            "MLX/Metal supports only one GPU; multi-GPU requests are not supported"
+        )
+    if gpu_ids[0] != 0:
+        raise ValueError(
+            f"Unsupported GPU device ID {gpu_ids[0]!r}; "
+            "MLX/Metal exposes only GPU device 0"
+        )
+    return mx.default_stream(mx.gpu)
 
 
 def _ensure_1d_array(values: Any, name: str) -> Any:
@@ -272,29 +303,41 @@ def _run_profile(a: Any, b: Any | None, m: int, *, pearson: bool, threshold: flo
     raise ValueError(f"Unknown profile type: {profile}")
 
 
+def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: Any):
+    execution_stream = _select_execution_stream(params["gpus"], params["threads"])
+    stream_context = (
+        nullcontext()
+        if execution_stream is None
+        else mx.stream(execution_stream)
+    )
+    with stream_context:
+        return _run_profile(*args, **kwargs)
+
+
 def selfjoin(a: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
     params = _parse_common_kwargs(kwargs)
-    return _run_profile(a, None, m, pearson=params["pearson"], profile="1nn")
+    return _run_profile_with_resources(params, a, None, m, pearson=params["pearson"], profile="1nn")
 
 
 def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
     params = _parse_common_kwargs(kwargs)
-    return _run_profile(a, b, m, pearson=params["pearson"], profile="1nn")
+    return _run_profile_with_resources(params, a, b, m, pearson=params["pearson"], profile="1nn")
 
 
 def selfjoin_sum(a: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, None, m, pearson=True, threshold=params["threshold"], profile="sum")
+    return _run_profile_with_resources(params, a, None, m, pearson=True, threshold=params["threshold"], profile="sum")
 
 
 def abjoin_sum(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, b, m, pearson=True, threshold=params["threshold"], profile="sum")
+    return _run_profile_with_resources(params, a, b, m, pearson=True, threshold=params["threshold"], profile="sum")
 
 
 def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True, allow_matrix=True)
-    return _run_profile(
+    return _run_profile_with_resources(
+        params,
         a,
         None,
         m,
@@ -308,7 +351,8 @@ def selfjoin_matrix(a: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
     params = _parse_common_kwargs(kwargs, allow_threshold=True, allow_matrix=True)
-    return _run_profile(
+    return _run_profile_with_resources(
+        params,
         a,
         b,
         m,
@@ -322,9 +366,9 @@ def abjoin_matrix(a: Any, b: Any, m: int, **kwargs: Any) -> np.ndarray:
 
 def selfjoin_knn(a: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, None, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
+    return _run_profile_with_resources(params, a, None, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
 
 
 def abjoin_knn(a: Any, b: Any, m: int, k: int, **kwargs: Any) -> list[tuple[int, int, float]]:
     params = _parse_common_kwargs(kwargs, allow_threshold=True)
-    return _run_profile(a, b, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)
+    return _run_profile_with_resources(params, a, b, m, pearson=params["pearson"], threshold=params["threshold"], profile="knn", k=k)

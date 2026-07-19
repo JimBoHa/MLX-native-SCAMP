@@ -40,5 +40,15 @@ profile, index = mp.selfjoin(series, 128, pearson=True)
 
 - The compute-heavy matrix profile kernels are MLX-native on Apple Silicon.
 - Inputs can be NumPy arrays, Python sequences, or MLX arrays.
-- Compatibility kwargs like `gpus`, `threads`, and `precision` are accepted for API compatibility, but CUDA-specific behavior is not reproduced.
+- `gpus=[]` or a positive `threads` value selects MLX CPU execution; `gpus=[0]`
+  selects the Metal GPU. With neither, the current MLX default device is
+  preserved.
+- MLX manages its own CPU scheduler, so `threads` selects CPU execution but cannot
+  enforce an exact worker count.
+- Multi-GPU requests and GPU IDs other than `0` are unsupported and rejected.
+- Concurrent CPU+GPU workers are not exposed by MLX, so supplying both selectors
+  is rejected rather than silently ignoring one or claiming SCAMP's
+  heterogeneous-worker behavior.
+- Other compatibility kwargs such as `precision` are accepted, but CUDA-specific
+  behavior is not reproduced.
 - The implementation currently targets dense 1D numeric arrays.
