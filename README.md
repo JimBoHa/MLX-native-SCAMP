@@ -48,9 +48,10 @@ is whitespace-delimited text. Unsupported upstream reducers and execution
 modes fail before input is read or output is touched; output sets are fully
 staged, fsynced, and then committed with rollback protection.
 
-Use `--profile_type=1NN` when match indexes are not needed. That path omits the
-second Metal index-selection pass and writes only `--output_a_file_name` (plus
-`--output_b_file_name` with `--keep_rows`); index-output flags are inactive.
+In `mlx-scamp-native`, use `--profile_type=1NN` when match indexes are not
+needed. That native path omits the second Metal index-selection pass and writes
+only `--output_a_file_name` (plus `--output_b_file_name` with `--keep_rows`);
+index-output flags are inactive.
 
 See [`cpp/README.md`](cpp/README.md) for build instructions, current coverage,
 and the remaining C++ parity work.
@@ -65,6 +66,71 @@ python -m pip install .
 ```
 
 ## Usage
+
+### Python SCAMP-compatible CLI
+
+Installing the package provides two names for the full Python/MLX command:
+
+| Command | Runtime | Current profile coverage |
+| --- | --- | --- |
+| `scamp` | Python + MLX | All five SCAMP profile families |
+| `mlx-scamp` | Python + MLX | Alias of `scamp`; all five profile families |
+| `mlx-scamp-native` | C++ + MLX, no Python | `1NN_INDEX` and index-free `1NN` |
+
+For example, compute an indexed self-join on Metal or a two-sided AB join on
+the MLX CPU backend:
+
+```bash
+scamp \
+  --window=128 \
+  --input_a_file_name=series.txt \
+  --single_precision \
+  --gpus=0
+
+mlx-scamp \
+  --window=128 \
+  --input_a_file_name=query.txt \
+  --input_b_file_name=reference.txt \
+  --profile_type=1NN \
+  --keep_rows \
+  --no_gpu
+```
+
+Input is whitespace-delimited text. The four upstream output defaults are
+`mp_columns_out`, `mp_columns_out_index`, `mp_rows_out`, and
+`mp_rows_out_index`; only outputs active for the selected profile and
+`--keep_rows` setting are touched. Use `-` for one input stream and at most one
+active output stream. File outputs are serialized and fsynced before the
+whole output set is committed with rollback protection. When a job mixes a
+file sink with stdout, a stdout failure rolls the files back, although bytes
+already accepted by stdout cannot be recalled.
+
+On macOS, destination renames use the native no-replace operation, and the CLI
+rechecks path and inode snapshots throughout ordinary execution and rollback.
+These checks prevent accidental concurrent writers from being overwritten.
+They are not a security boundary against another process running as the same
+user and deliberately racing individual filesystem syscalls, because macOS
+does not provide an unlink-if-inode operation.
+
+The default precision is double on MLX CPU. `--single_precision --gpus=0`
+explicitly selects Metal, while `--no_gpu` or a positive
+`--num_cpu_workers` selects CPU. MLX exposes one Apple GPU, so other IDs,
+multi-GPU requests, concurrent CPU+GPU requests, and explicit double/ultra
+Metal requests fail before input is read. `--print_debug_info` reports the
+resolved CPU, portable Metal, or custom Metal route to stderr without mixing
+diagnostics into profile data on stdout.
+
+Use `scamp --list_variants` to inspect the versioned strategies used by the
+MLX autotune cache and `scamp --autotune` to run its bounded quick plan. These
+describe the Python/MLX engine; `mlx-scamp-native --list_variants` separately
+describes the Python-free C++ engine. Distributed global row/column offsets
+belong to the coordinator API and are not accepted by this local CLI. Upstream
+SCAMP's separate directional left/right self-join output is not yet exposed by
+the Python API, so this CLI accepts `--keep_rows` only for AB joins and rejects
+it for `MATRIX_SUMMARY`; those are flag-level gaps despite coverage of every
+profile family.
+
+### Python API
 
 ```python
 import numpy as np

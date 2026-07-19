@@ -24,6 +24,10 @@ distributed = [
   "protobuf>=4.25.3,<6",
 ]
 
+[project.scripts]
+scamp = "mlx_native_scamp.cli:main"
+mlx-scamp = "mlx_native_scamp.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/JimBoHa/MLX-native-SCAMP"
 Repository = "https://github.com/JimBoHa/MLX-native-SCAMP"
