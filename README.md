@@ -76,6 +76,9 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 # Upstream-compatible upper bound on each time-series tile. Values must be
 # at least 1024 samples and at least twice the subsequence window.
 profile, index = mp.selfjoin(series, 128, max_tile_size=4096)
+
+# Report the route that actually ran after cache selection and safety fallbacks.
+profile, index = mp.selfjoin(series, 128, verbose=True)
 ```
 
 ## Apple/MLX autotuning
@@ -207,6 +210,12 @@ remain follow-up work.
 - `gpus=[]` or a positive `threads` value selects MLX CPU execution; `gpus=[0]`
   selects the Metal GPU. With neither and no matching cached winner, the
   current MLX default device is preserved.
+- `verbose=True` emits one resolved start event and one synchronized completion
+  event (or error event), correlated by operation ID. It reports the actual CPU,
+  portable Metal, or custom Metal implementation, compute dtype, work shape,
+  effective tile ceiling, and portable tile geometry after every fallback gate.
+  The default path performs no reporting, formatting, timing, or extra
+  synchronization.
 - MLX manages its own CPU scheduler, so `threads` selects CPU execution but cannot
   enforce an exact worker count.
 - Multi-GPU requests and GPU IDs other than `0` are unsupported and rejected.
