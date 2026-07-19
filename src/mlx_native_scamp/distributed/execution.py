@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,11 @@ from mlx_native_scamp.core import SENTINEL, _prepare_series
 
 
 MAX_PROFILE_INDEX = int(np.iinfo(np.int64).max)
+
+# MLX's stream context changes process-global default state. Overlapping
+# contexts from gRPC threads can restore that state out of order, leaving a
+# CPU worker's device selected for unrelated callers after the request ends.
+_MLX_STREAM_LOCK = threading.RLock()
 
 
 def estimate_1nn_tile_working_set_bytes(
@@ -58,7 +64,7 @@ def execute_1nn_tile(
 
     Series A is the column dimension. Series B is the row dimension; omitting
     it performs a self-join. Returned indices are global subsequence indices so
-    a future coordinator can merge independently scheduled tiles directly.
+    a coordinator can merge independently scheduled tiles directly.
     """
 
     if window <= 0:
@@ -99,92 +105,90 @@ def execute_1nn_tile(
         series_b is None and row_start == column_start and row_stop == column_stop
     )
 
-    with mx.stream(device):
-        mlx_a = mx.array(segment_a, dtype=mx.float32)
-        prepared_a = _prepare_series(mlx_a, window)
-        if same_self_tile:
-            prepared_b = prepared_a
-        else:
-            mlx_b = mx.array(segment_b, dtype=mx.float32)
-            prepared_b = _prepare_series(mlx_b, window)
+    with _MLX_STREAM_LOCK:
+        with mx.stream(device):
+            mlx_a = mx.array(segment_a, dtype=mx.float32)
+            prepared_a = _prepare_series(mlx_a, window)
+            if same_self_tile:
+                prepared_b = prepared_a
+            else:
+                mlx_b = mx.array(segment_b, dtype=mx.float32)
+                prepared_b = _prepare_series(mlx_b, window)
 
-        tile_a = prepared_a.windows
-        tile_b = prepared_b.windows
-        block = tile_b @ tile_a.T
-        valid = prepared_b.valid[:, None] & prepared_a.valid[None, :]
-        block = mx.where(
-            valid,
-            mx.clip(block, -1.0, 1.0),
-            mx.full(block.shape, SENTINEL, dtype=mx.float32),
-        )
-
-        if exclusion_zone:
-            separated = (
-                row_start >= column_stop + exclusion_zone - 1
-                or column_start >= row_stop + exclusion_zone - 1
+            tile_a = prepared_a.windows
+            tile_b = prepared_b.windows
+            block = tile_b @ tile_a.T
+            valid = prepared_b.valid[:, None] & prepared_a.valid[None, :]
+            block = mx.where(
+                valid,
+                mx.clip(block, -1.0, 1.0),
+                mx.full(block.shape, SENTINEL, dtype=mx.float32),
             )
-            if not separated:
-                base_delta = row_start - column_start
-                int32 = np.iinfo(np.int32)
-                row_count = row_stop - row_start
-                column_count = column_stop - column_start
-                expression_min = base_delta - (column_count - 1)
-                expression_max = base_delta + (row_count - 1)
-                if (
-                    int32.min < expression_min
-                    and expression_max <= int32.max
-                    and exclusion_zone <= int32.max
-                ):
-                    row_indices = mx.arange(row_count, dtype=mx.int32)
-                    column_indices = mx.arange(column_count, dtype=mx.int32)
-                    trivial = (
-                        mx.abs(
-                            row_indices[:, None]
-                            - column_indices[None, :]
-                            + int(base_delta)
-                        )
-                        < exclusion_zone
-                    )
-                else:
-                    # Metal's fast int32 path cannot represent this boundary.
-                    # Construct the rare large-offset mask with safe host int64
-                    # arithmetic, then transfer only the boolean mask.
-                    column_indices = np.arange(column_count, dtype=np.int64)
-                    host_mask = np.empty(
-                        (row_count, column_count), dtype=np.bool_
-                    )
-                    # Fill one row at a time so the fallback retains only the
-                    # boolean matrix plus one int64 row, not an additional
-                    # dense int64 distance matrix outside the preflight bound.
-                    for row_index in range(row_count):
-                        differences = (
-                            np.int64(base_delta + row_index) - column_indices
-                        )
-                        host_mask[row_index] = (
-                            np.abs(differences) < exclusion_zone
-                        )
-                    trivial = mx.array(host_mask)
-                block = mx.where(
-                    trivial,
-                    mx.full(block.shape, SENTINEL, dtype=mx.float32),
-                    block,
+            if exclusion_zone:
+                separated = (
+                    row_start >= column_stop + exclusion_zone - 1
+                    or column_start >= row_stop + exclusion_zone - 1
                 )
+                if not separated:
+                    base_delta = row_start - column_start
+                    int32 = np.iinfo(np.int32)
+                    row_count = row_stop - row_start
+                    column_count = column_stop - column_start
+                    expression_min = base_delta - (column_count - 1)
+                    expression_max = base_delta + (row_count - 1)
+                    if (
+                        int32.min < expression_min
+                        and expression_max <= int32.max
+                        and exclusion_zone <= int32.max
+                    ):
+                        row_indices = mx.arange(row_count, dtype=mx.int32)
+                        column_indices = mx.arange(column_count, dtype=mx.int32)
+                        trivial = (
+                            mx.abs(
+                                row_indices[:, None]
+                                - column_indices[None, :]
+                                + int(base_delta)
+                            )
+                            < exclusion_zone
+                        )
+                    else:
+                        # Metal's fast int32 path cannot represent this
+                        # boundary. Build the rare large-offset mask with safe
+                        # host int64 arithmetic, then transfer only the mask.
+                        column_indices = np.arange(column_count, dtype=np.int64)
+                        host_mask = np.empty((row_count, column_count), dtype=np.bool_)
+                        for row_index in range(row_count):
+                            differences = (
+                                np.int64(base_delta + row_index) - column_indices
+                            )
+                            host_mask[row_index] = np.abs(differences) < exclusion_zone
+                        trivial = mx.array(host_mask)
+                    block = mx.where(
+                        trivial,
+                        mx.full(block.shape, SENTINEL, dtype=mx.float32),
+                        block,
+                    )
 
-        if compute_columns:
-            column_values_mx = mx.max(block, axis=0)
-            column_indices_mx = mx.argmax(block, axis=0).astype(mx.int32)
-        else:
-            column_values_mx = mx.array([], dtype=mx.float32)
-            column_indices_mx = mx.array([], dtype=mx.int64)
+            if compute_columns:
+                column_values_mx = mx.max(block, axis=0)
+                column_indices_mx = mx.argmax(block, axis=0).astype(mx.int32)
+            else:
+                column_values_mx = mx.array([], dtype=mx.float32)
+                column_indices_mx = mx.array([], dtype=mx.int64)
 
-        if compute_rows:
-            row_values_mx = mx.max(block, axis=1)
-            row_indices_mx = mx.argmax(block, axis=1).astype(mx.int32)
-        else:
-            row_values_mx = mx.array([], dtype=mx.float32)
-            row_indices_mx = mx.array([], dtype=mx.int64)
+            if compute_rows:
+                row_values_mx = mx.max(block, axis=1)
+                row_indices_mx = mx.argmax(block, axis=1).astype(mx.int32)
+            else:
+                row_values_mx = mx.array([], dtype=mx.float32)
+                row_indices_mx = mx.array([], dtype=mx.int64)
 
-        mx.eval(column_values_mx, column_indices_mx, row_values_mx, row_indices_mx)
+            mx.eval(
+                column_values_mx,
+                column_indices_mx,
+                row_values_mx,
+                row_indices_mx,
+            )
 
     column_values = np.asarray(column_values_mx, dtype=np.float32)
     column_indices = np.asarray(column_indices_mx, dtype=np.int64)
