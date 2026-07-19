@@ -989,6 +989,140 @@ def _best_match_profile(
     return _convert_profile_output(corr_np, m, pearson), idx_np
 
 
+def _bidirectional_best_match_profile(
+    prepared_a: PreparedSeries | TiledSeries,
+    prepared_b: PreparedSeries | TiledSeries,
+    m: int,
+    pearson: bool,
+    exclusion: int,
+    use_metal_kernel: bool,
+    tile_rows: int | None = None,
+    tile_columns: int | None = None,
+) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+    """Reduce both axes of one AB-join distance matrix."""
+
+    if use_metal_kernel:
+        from ._metal_1nn import bidirectional_best_match
+
+        corr_a, idx_a, corr_b, idx_b = bidirectional_best_match(
+            prepared_a, prepared_b, m, exclusion
+        )
+    else:
+        if not isinstance(prepared_a, TiledSeries) or not isinstance(
+            prepared_b, TiledSeries
+        ):
+            raise TypeError("portable reducers require tiled series inputs")
+        if tile_rows is None or tile_columns is None:
+            raise TypeError(
+                "portable reducers require explicit tile dimensions"
+            )
+
+        column_ranges = list(
+            _tile_ranges(prepared_a.subsequences, tile_columns)
+        )
+        row_ranges = list(_tile_ranges(prepared_b.subsequences, tile_rows))
+        best_corr_a = {
+            start: mx.full(
+                (end - start,), SENTINEL, dtype=prepared_a.values.dtype
+            )
+            for start, end in column_ranges
+        }
+        best_idx_a = {
+            start: mx.full((end - start,), -1, dtype=mx.int32)
+            for start, end in column_ranges
+        }
+        best_corr_b = {
+            start: mx.full(
+                (end - start,), SENTINEL, dtype=prepared_b.values.dtype
+            )
+            for start, end in row_ranges
+        }
+        best_idx_b = {
+            start: mx.full((end - start,), -1, dtype=mx.int32)
+            for start, end in row_ranges
+        }
+        scheduler = ReducerScheduler()
+
+        # One traversal updates compact state for both global matrix axes.
+        # Tiles arrive with columns outermost and both axes in ascending order;
+        # argmax chooses the first local match and strict updates retain the
+        # smallest global index when equal maxima occur in later tiles.
+        for tile in _iterate_tiled_blocks(
+            prepared_a,
+            prepared_b,
+            m,
+            exclusion,
+            tile_rows,
+            tile_columns,
+        ):
+            block_best_corr_a = mx.max(tile.values, axis=0)
+            block_best_idx_a = (
+                mx.argmax(tile.values, axis=0) + tile.row_start
+            )
+            current_corr_a = best_corr_a[tile.col_start]
+            current_idx_a = best_idx_a[tile.col_start]
+            update_a = block_best_corr_a > current_corr_a
+            best_corr_a[tile.col_start] = mx.where(
+                update_a, block_best_corr_a, current_corr_a
+            )
+            best_idx_a[tile.col_start] = mx.where(
+                update_a, block_best_idx_a, current_idx_a
+            )
+
+            block_best_corr_b = mx.max(tile.values, axis=1)
+            block_best_idx_b = (
+                mx.argmax(tile.values, axis=1) + tile.col_start
+            )
+            current_corr_b = best_corr_b[tile.row_start]
+            current_idx_b = best_idx_b[tile.row_start]
+            update_b = block_best_corr_b > current_corr_b
+            best_corr_b[tile.row_start] = mx.where(
+                update_b, block_best_corr_b, current_corr_b
+            )
+            best_idx_b[tile.row_start] = mx.where(
+                update_b, block_best_idx_b, current_idx_b
+            )
+            scheduler.schedule(
+                best_corr_a[tile.col_start],
+                best_idx_a[tile.col_start],
+                best_corr_b[tile.row_start],
+                best_idx_b[tile.row_start],
+            )
+
+        scheduler.finish()
+        corr_a = np.concatenate(
+            [
+                np.asarray(best_corr_a[start]).astype(np.float32)
+                for start, _ in column_ranges
+            ]
+        )
+        idx_a = np.concatenate(
+            [
+                np.asarray(best_idx_a[start]).astype(np.int32)
+                for start, _ in column_ranges
+            ]
+        )
+        corr_b = np.concatenate(
+            [
+                np.asarray(best_corr_b[start]).astype(np.float32)
+                for start, _ in row_ranges
+            ]
+        )
+        idx_b = np.concatenate(
+            [
+                np.asarray(best_idx_b[start]).astype(np.int32)
+                for start, _ in row_ranges
+            ]
+        )
+        idx_a[corr_a < -1.0] = -1
+        idx_b[corr_b < -1.0] = -1
+
+    return (
+        (_convert_profile_output(corr_a, m, pearson), idx_a),
+        (_convert_profile_output(corr_b, m, pearson), idx_b),
+    )
+
+
 def _best_match_values(
     prepared_a: PreparedSeries | TiledSeries,
     prepared_b: PreparedSeries | TiledSeries,
@@ -1455,6 +1589,8 @@ def _run_profile(
     if effective_max_tile_size < 2 * m:
         raise ValueError("max_tile_size must be at least twice m")
     has_b = b is not None
+    if profile == "1nn_bidirectional" and not has_b:
+        raise ValueError("bidirectional profiles require an AB-join")
     float32_sources = _is_float32_input(a) and (
         not has_b or _is_float32_input(b)
     )
@@ -1513,7 +1649,7 @@ def _run_profile(
         )
     )
     if (
-        profile in {"1nn", "1nn_value"}
+        profile in {"1nn", "1nn_value", "1nn_bidirectional"}
         and use_metal_1nn
         and float32_sources
         and join_fits_tile
@@ -1546,6 +1682,15 @@ def _run_profile(
                     m,
                     pearson,
                     self_join,
+                    exclusion,
+                    True,
+                )
+            if profile == "1nn_bidirectional":
+                return _bidirectional_best_match_profile(
+                    recurrence_a,
+                    recurrence_b,
+                    m,
+                    pearson,
                     exclusion,
                     True,
                 )
@@ -1593,6 +1738,17 @@ def _run_profile(
             m,
             pearson,
             self_join,
+            exclusion,
+            False,
+            tile_rows,
+            tile_columns,
+        )
+    if profile == "1nn_bidirectional":
+        return _bidirectional_best_match_profile(
+            prepared_a,
+            prepared_b,
+            m,
+            pearson,
             exclusion,
             False,
             tile_rows,
@@ -1704,6 +1860,32 @@ def abjoin(a: Any, b: Any, m: int, **kwargs: Any) -> tuple[np.ndarray, np.ndarra
         pearson=params["pearson"],
         allow_trivial_match=params["allow_trivial_match"],
         profile="1nn",
+    )
+
+
+def abjoin_bidirectional(
+    a: Any,
+    b: Any,
+    m: int,
+    **kwargs: Any,
+) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+    """Compute indexed AB-join profiles for both distance-matrix axes.
+
+    The first pair matches ``abjoin(a, b, m)``. The second pair matches
+    ``abjoin(b, a, m)`` and corresponds to SCAMP's ``keep_rows`` output.
+    This native extension is intentionally not part of the strict ``pyscamp``
+    compatibility namespace.
+    """
+
+    params = _parse_common_kwargs(kwargs, is_ab_join=True)
+    return _run_profile_with_resources(
+        params,
+        a,
+        b,
+        m,
+        pearson=params["pearson"],
+        allow_trivial_match=params["allow_trivial_match"],
+        profile="1nn_bidirectional",
     )
 
 
