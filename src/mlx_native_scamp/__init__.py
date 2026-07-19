@@ -3,6 +3,7 @@ from importlib.metadata import version as _distribution_version
 
 from .core import (
     abjoin,
+    abjoin_bidirectional,
     abjoin_knn,
     abjoin_matrix,
     abjoin_sum,
@@ -26,6 +27,7 @@ __version__ = _resolve_version()
 __all__ = [
     "__version__",
     "abjoin",
+    "abjoin_bidirectional",
     "abjoin_knn",
     "abjoin_matrix",
     "abjoin_sum",
