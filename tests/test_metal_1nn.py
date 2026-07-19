@@ -6,7 +6,7 @@ import numpy as np
 
 import mlx_native_scamp as mp
 from mlx_native_scamp import _metal_1nn
-from reference import distance_matrix, reduce_1nn_index
+from reference import distance_matrix, reduce_1nn_index, reduce_sum_thresh
 
 
 @unittest.skipUnless(mx.metal.is_available(), "Metal is unavailable")
@@ -56,6 +56,53 @@ class MetalDiagonal1NNTests(unittest.TestCase):
         kernel.assert_called_once()
         np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5, equal_nan=True)
         np.testing.assert_array_equal(actual_index, expected_index)
+
+    def test_non_multiple_of_four_exclusion_matches_reference_on_metal(self):
+        rng = np.random.default_rng(1)
+        series = np.cumsum(rng.normal(size=37)).astype(np.float32)
+
+        with mock.patch.object(
+            _metal_1nn,
+            "best_match",
+            wraps=_metal_1nn.best_match,
+        ) as kernel:
+            for m in (3, 5):
+                with self.subTest(m=m):
+                    dm = distance_matrix(series, None, m)
+                    expected_corr, expected_index = reduce_1nn_index(dm)
+                    expected_sum = reduce_sum_thresh(dm, -1.0)
+
+                    actual_corr, actual_index = mp.selfjoin(
+                        series,
+                        m,
+                        pearson=True,
+                        precision="single",
+                        gpus=[0],
+                    )
+                    actual_sum = mp.selfjoin_sum(
+                        series,
+                        m,
+                        threshold=-1.0,
+                        precision="single",
+                        gpus=[0],
+                    )
+
+                    np.testing.assert_allclose(
+                        actual_corr,
+                        expected_corr,
+                        rtol=2e-5,
+                        atol=2e-5,
+                        equal_nan=True,
+                    )
+                    np.testing.assert_array_equal(actual_index, expected_index)
+                    np.testing.assert_allclose(
+                        actual_sum,
+                        expected_sum,
+                        rtol=2e-5,
+                        atol=2e-5,
+                    )
+
+        self.assertEqual(2, kernel.call_count)
 
     def test_cpu_single_uses_portable_path(self):
         rng = np.random.default_rng(8)

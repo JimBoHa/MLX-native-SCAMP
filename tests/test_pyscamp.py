@@ -76,6 +76,46 @@ class PyScampCompatTests(unittest.TestCase):
         out = mp.selfjoin_sum(self.a, self.m, threshold=0.5, pearson=True)
         np.testing.assert_allclose(valid, out, rtol=1e-4, atol=1e-4)
 
+    def test_non_multiple_of_four_exclusion_matches_reference_on_cpu(self):
+        rng = np.random.default_rng(1)
+        series = np.cumsum(rng.normal(size=37)).astype(np.float32)
+
+        for m in (3, 5):
+            with self.subTest(m=m):
+                dm = distance_matrix(series, None, m)
+                expected_corr, expected_index = reduce_1nn_index(dm)
+                expected_sum = reduce_sum_thresh(dm, -1.0)
+
+                actual_corr, actual_index = mp.selfjoin(
+                    series,
+                    m,
+                    pearson=True,
+                    precision="double",
+                    gpus=[],
+                )
+                actual_sum = mp.selfjoin_sum(
+                    series,
+                    m,
+                    threshold=-1.0,
+                    precision="double",
+                    gpus=[],
+                )
+
+                np.testing.assert_allclose(
+                    actual_corr,
+                    expected_corr,
+                    rtol=1e-5,
+                    atol=1e-5,
+                    equal_nan=True,
+                )
+                np.testing.assert_array_equal(actual_index, expected_index)
+                np.testing.assert_allclose(
+                    actual_sum,
+                    expected_sum,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+
     def test_abjoin_sum_matches_reference(self):
         valid = reduce_sum_thresh(self.dm_ab, 0.5)
         out = mp.abjoin_sum(self.a, self.b, self.m, threshold=0.5, pearson=True)
