@@ -48,7 +48,7 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
   `(subsequences, window)` normalized-window matrix is not constructed.
 - The recurrence path is selected only when its conservative float32 bound is
   safe. Non-float32, unstable-precompute, and extreme-range inputs retain the
-  normalized-window path rather than risking overflow or corrupt results.
+  existing portable normalized-window path.
 - The 1NN kernel keeps profile output state linear in the series length, but it
   currently walks each diagonal in one Metal dispatch. Checkpointed/tiled
   dispatch—and integration with the separate `max_tile_size` work—remains a
