@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,20 @@ version = "0.1.0"
 description = "An MLX-native SCAMP-compatible matrix profile library for Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "JimBoHa" }
 ]
 dependencies = [
   "mlx>=0.23.2",
   "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+distributed = [
+  "grpcio>=1.62.3,<2",
+  "protobuf>=4.25.3,<6",
 ]
 
 [project.urls]
@@ -26,3 +33,6 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"mlx_native_scamp.distributed.proto" = ["*.proto"]

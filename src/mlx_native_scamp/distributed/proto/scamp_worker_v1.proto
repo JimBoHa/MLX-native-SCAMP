@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package mlx_native_scamp.distributed.v1;
+
+// Version 1 of the Apple/MLX worker protocol. Every request carries the API
+// version so incompatible workers fail explicitly instead of misreading work.
+service ScampWorker {
+  rpc GetCapabilities(VersionRequest) returns (WorkerCapabilities);
+  rpc CheckHealth(VersionRequest) returns (WorkerHealth);
+  rpc ExecuteProfileTile(ProfileTileRequest) returns (ProfileTileResult);
+}
+
+message VersionRequest {
+  uint32 api_version = 1;
+}
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_SERVING = 1;
+  WORKER_STATE_NOT_SERVING = 2;
+}
+
+enum DeviceBackend {
+  DEVICE_BACKEND_UNSPECIFIED = 0;
+  DEVICE_BACKEND_METAL = 1;
+  DEVICE_BACKEND_CPU = 2;
+}
+
+enum ProfileKind {
+  PROFILE_KIND_UNSPECIFIED = 0;
+  PROFILE_KIND_1NN_INDEX = 1;
+}
+
+enum Precision {
+  PRECISION_UNSPECIFIED = 0;
+  PRECISION_SINGLE = 1;
+}
+
+enum ArrayDType {
+  ARRAY_DTYPE_UNSPECIFIED = 0;
+  ARRAY_DTYPE_FLOAT32 = 1;
+  ARRAY_DTYPE_FLOAT64 = 2;
+  ARRAY_DTYPE_INT64 = 3;
+}
+
+// Array payloads use contiguous little-endian bytes. This is substantially
+// smaller than upstream's repeated-double representation and maps directly to
+// NumPy/MLX input buffers on Apple Silicon.
+message ArrayPayload {
+  ArrayDType dtype = 1;
+  uint64 length = 2;
+  bytes data = 3;
+}
+
+message WorkerCapabilities {
+  uint32 api_version = 1;
+  string worker_id = 2;
+  string hostname = 3;
+  string operating_system = 4;
+  string machine = 5;
+  bool apple_silicon = 6;
+  string mlx_version = 7;
+  DeviceBackend backend = 8;
+  string device_name = 9;
+  uint64 unified_memory_bytes = 10;
+  uint64 recommended_working_set_bytes = 11;
+  uint32 logical_cpu_count = 12;
+  repeated ProfileKind profile_kinds = 13;
+  repeated Precision precisions = 14;
+  uint64 max_message_bytes = 15;
+  uint64 max_tile_working_set_bytes = 16;
+}
+
+message WorkerHealth {
+  uint32 api_version = 1;
+  string worker_id = 2;
+  WorkerState state = 3;
+  uint64 uptime_millis = 4;
+  uint64 active_requests = 5;
+  uint64 completed_requests = 6;
+  uint64 failed_requests = 7;
+  string message = 8;
+}
+
+// A and B follow SCAMP's convention: A subsequences are columns and B
+// subsequences are rows. Payloads contain only the raw samples needed by the
+// requested bounds; their offsets locate those samples in the complete series.
+// A diagonal self-join tile may omit series_b and reuse series_a.
+message ProfileTileRequest {
+  uint32 api_version = 1;
+  string request_id = 2;
+  ArrayPayload series_a = 3;
+  ArrayPayload series_b = 4;
+  bool self_join = 5;
+  uint64 window = 6;
+  uint64 row_start = 7;
+  uint64 row_stop = 8;
+  uint64 column_start = 9;
+  uint64 column_stop = 10;
+  uint64 exclusion_zone = 11;
+  bool compute_rows = 12;
+  bool compute_columns = 13;
+  ProfileKind profile_kind = 14;
+  Precision precision = 15;
+  uint64 series_a_offset = 16;
+  uint64 series_b_offset = 17;
+}
+
+message ProfileSlice {
+  uint64 offset = 1;
+  ArrayPayload values = 2;
+  ArrayPayload indices = 3;
+}
+
+message ProfileTileResult {
+  uint32 api_version = 1;
+  string request_id = 2;
+  string worker_id = 3;
+  ProfileSlice column_profile = 4;
+  ProfileSlice row_profile = 5;
+  uint64 execution_nanos = 6;
+}

@@ -17,6 +17,7 @@ _SOURCE = r"""
     bool self_join = config[2] != 0;
     uint matrix_rows = config[3];
     uint matrix_cols = config[4];
+    bool apply_exclusion = config[5] != 0;
 
     int diagonal;
     if (self_join) {
@@ -33,22 +34,44 @@ _SOURCE = r"""
     }
     uint diagonal_length = metal::min(n_a - col, n_b - row);
 
+    uint row_bin_lower = 0;
+    uint row_bin_upper = matrix_rows;
+    while (row_bin_lower + 1 < row_bin_upper) {
+        uint middle = (row_bin_lower + row_bin_upper) / 2;
+        if (row >= row_edges[middle]) {
+            row_bin_lower = middle;
+        } else {
+            row_bin_upper = middle;
+        }
+    }
+    uint row_bin = row_bin_lower;
+
+    uint col_bin_lower = 0;
+    uint col_bin_upper = matrix_cols;
+    while (col_bin_lower + 1 < col_bin_upper) {
+        uint middle = (col_bin_lower + col_bin_upper) / 2;
+        if (col >= col_edges[middle]) {
+            col_bin_lower = middle;
+        } else {
+            col_bin_upper = middle;
+        }
+    }
+    uint col_bin = col_bin_lower;
+
     float covariance = 0.0f;
     for (uint k = 0; k < m; ++k) {
         covariance += (clean_a[col + k] - means_a[col]) *
                       (clean_b[row + k] - means_b[row]);
     }
 
-    for (uint step = 0; step < diagonal_length; ++step, ++col, ++row) {
+    for (uint step = 0; step < diagonal_length; ++step) {
+        bool excluded = apply_exclusion &&
+            metal::abs(int(col) - int(row)) < int(exclusion);
         float norm_product = inv_norm_a[col] * inv_norm_b[row];
-        if (norm_product > 0.0f) {
+        if (!excluded && norm_product > 0.0f) {
             float corr = covariance * norm_product;
             if (metal::isfinite(corr)) {
                 corr = metal::fmin(1.0f, metal::fmax(-1.0f, corr));
-                uint row_bin = metal::min(
-                    matrix_rows - 1, (row * matrix_rows) / n_b);
-                uint col_bin = metal::min(
-                    matrix_cols - 1, (col * matrix_cols) / n_a);
                 uint cell = row_bin * matrix_cols + col_bin;
                 uint bits = as_type<uint>(corr);
                 uint key = (bits & 0x80000000u) ? ~bits :
@@ -60,6 +83,16 @@ _SOURCE = r"""
         if (step + 1 < diagonal_length) {
             covariance += df_a[col] * dg_b[row] +
                           dg_a[col] * df_b[row];
+            ++col;
+            ++row;
+            if (row_bin + 1 < matrix_rows &&
+                row >= row_edges[row_bin + 1]) {
+                ++row_bin;
+            }
+            if (col_bin + 1 < matrix_cols &&
+                col >= col_edges[col_bin + 1]) {
+                ++col_bin;
+            }
         }
     }
 """
@@ -79,6 +112,8 @@ _KERNEL = mx.fast.metal_kernel(
         "dg_a",
         "dg_b",
         "config",
+        "row_edges",
+        "col_edges",
     ],
     output_names=["summary"],
     source=_SOURCE,
@@ -93,18 +128,20 @@ def matrix_summary(
     rows: int,
     cols: int,
     self_join: bool,
+    exclusion: int,
+    row_edges: np.ndarray,
+    col_edges: np.ndarray,
 ) -> np.ndarray:
     """Compute a pooled correlation matrix with SCAMP's recurrence."""
 
     n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
-    exclusion = (m + 3) // 4 if self_join else 0
     diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
     if diagonal_count <= 0:
         return np.full((rows, cols), -2.0, dtype=np.float32)
 
     config = mx.array(
-        [m, exclusion, int(self_join), rows, cols],
+        [m, exclusion, int(self_join), rows, cols, int(exclusion > 0)],
         dtype=mx.uint32,
     )
     inputs = [
@@ -119,6 +156,8 @@ def matrix_summary(
         prepared_a.recurrence_dg,
         prepared_b.recurrence_dg,
         config,
+        mx.array(np.asarray(row_edges, dtype=np.uint32)),
+        mx.array(np.asarray(col_edges, dtype=np.uint32)),
     ]
     threadgroup_width = min(256, diagonal_count)
     keys = _KERNEL(

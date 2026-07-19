@@ -5,7 +5,7 @@ import mlx.core as mx
 import numpy as np
 
 import mlx_native_scamp as mp
-from mlx_native_scamp import _metal_matrix
+from mlx_native_scamp import _metal_matrix, core
 
 
 @unittest.skipUnless(mx.metal.is_available(), "Metal is unavailable")
@@ -31,9 +31,20 @@ class MetalMatrixSummaryTests(unittest.TestCase):
             gpus=[],
         )
 
-        with mock.patch.object(
-            _metal_matrix, "_KERNEL", wraps=_metal_matrix._KERNEL
-        ) as kernel:
+        with (
+            mock.patch.object(
+                core,
+                "_prepare_series",
+                side_effect=AssertionError(
+                    "normalized windows were materialized"
+                ),
+            ),
+            mock.patch.object(
+                _metal_matrix,
+                "matrix_summary",
+                wraps=_metal_matrix.matrix_summary,
+            ) as kernel,
+        ):
             actual = mp.selfjoin_matrix(
                 series,
                 8,
@@ -46,47 +57,242 @@ class MetalMatrixSummaryTests(unittest.TestCase):
             )
 
         kernel.assert_called_once()
+        self.assertTrue(kernel.call_args.args[5])
+        self.assertEqual((8 + 3) // 4, kernel.call_args.args[6])
         np.testing.assert_allclose(
             actual, expected, rtol=2e-5, atol=2e-5, equal_nan=True
         )
+        finite = actual[np.isfinite(actual)]
+        self.assertTrue(np.all(finite >= -1.0))
+        self.assertTrue(np.all(finite <= 1.0))
 
-    def test_abjoin_matches_portable_with_invalid_windows(self):
+    def test_selfjoin_full_summary_preserves_upper_triangle(self):
+        rng = np.random.default_rng(73)
+        series = rng.normal(size=29).astype(np.float32)
+        m = 7
+        subsequences = series.size - m + 1
+        options = {
+            "mheight": subsequences,
+            "mwidth": subsequences,
+            "threshold": -1.0,
+            "pearson": True,
+            "precision": "single",
+        }
+        expected = mp.selfjoin_matrix(series, m, gpus=[], **options)
+        actual = mp.selfjoin_matrix(series, m, gpus=[0], **options)
+
+        np.testing.assert_allclose(
+            actual, expected, rtol=2e-5, atol=2e-5, equal_nan=True
+        )
+        lower_triangle = np.tril(
+            np.ones(actual.shape, dtype=bool),
+            k=0,
+        )
+        self.assertTrue(np.all(np.isnan(actual[lower_triangle])))
+
+    def test_abjoin_matches_portable_across_rectangular_bin_edges(self):
         rng = np.random.default_rng(919)
-        a = rng.normal(size=149).astype(np.float32)
-        b = rng.normal(size=121).astype(np.float32)
-        a[28] = np.nan
-        b[77] = np.inf
-        expected = mp.abjoin_matrix(
-            a,
-            b,
-            8,
-            mheight=9,
-            mwidth=7,
-            threshold=0.1,
-            pearson=False,
-            precision="single",
-            gpus=[],
-        )
-
-        actual = mp.abjoin_matrix(
-            a,
-            b,
-            8,
-            mheight=9,
-            mwidth=7,
-            threshold=0.1,
-            pearson=False,
-            precision="single",
-            gpus=[0],
-        )
+        a = rng.normal(size=29).astype(np.float32)
+        b = rng.normal(size=37).astype(np.float32)
+        a[14] = np.nan
+        b[23] = np.inf
+        options = {
+            "mheight": 7,
+            "mwidth": 6,
+            "threshold": 0.1,
+            "pearson": False,
+            "precision": "single",
+        }
+        expected = mp.abjoin_matrix(a, b, 5, gpus=[], **options)
+        actual = mp.abjoin_matrix(a, b, 5, gpus=[0], **options)
 
         np.testing.assert_allclose(
             actual, expected, rtol=2e-5, atol=2e-5, equal_nan=True
         )
 
-    def test_non_float32_input_keeps_portable_path(self):
-        series = np.linspace(1e8, 1e8 + 64, 65, dtype=np.float64)
-        with mock.patch.object(_metal_matrix, "_KERNEL") as kernel:
+    def test_integer_bin_edges_match_portable_ceil_definition(self):
+        for subsequences, bins in ((23, 7), (32, 32), (130, 11)):
+            with self.subTest(subsequences=subsequences, bins=bins):
+                expected = np.ceil(
+                    np.arange(bins + 1) * subsequences / bins
+                ).astype(np.int64)
+                np.testing.assert_array_equal(
+                    core._matrix_bin_edges(subsequences, bins),
+                    expected,
+                )
+
+    def test_all_invalid_bin_stays_nan(self):
+        a = np.array([1.0, np.nan, 2.0, 3.0], dtype=np.float32)
+        b = np.array([3.0, 1.0, 4.0, 2.0], dtype=np.float32)
+
+        with mock.patch.object(
+            _metal_matrix,
+            "matrix_summary",
+            wraps=_metal_matrix.matrix_summary,
+        ) as kernel:
+            actual = mp.abjoin_matrix(
+                a,
+                b,
+                4,
+                mheight=1,
+                mwidth=1,
+                threshold=-1.0,
+                pearson=True,
+                precision="single",
+                gpus=[0],
+            )
+
+        kernel.assert_called_once()
+        self.assertTrue(np.isnan(actual[0, 0]))
+
+    def test_aligned_abjoin_exclusion_matches_portable(self):
+        rng = np.random.default_rng(2112)
+        a = rng.normal(size=29).astype(np.float32)
+        b = a.copy()
+        m = 7
+        subsequences = a.size - m + 1
+        exclusion = (m + 3) // 4
+        options = {
+            "mheight": subsequences,
+            "mwidth": subsequences,
+            "threshold": -1.0,
+            "pearson": True,
+            "precision": "single",
+            "allow_trivial_match": False,
+        }
+        expected = mp.abjoin_matrix(a, b, m, gpus=[], **options)
+
+        with mock.patch.object(
+            _metal_matrix,
+            "matrix_summary",
+            wraps=_metal_matrix.matrix_summary,
+        ) as kernel:
+            actual = mp.abjoin_matrix(a, b, m, gpus=[0], **options)
+
+        kernel.assert_called_once()
+        self.assertFalse(kernel.call_args.args[5])
+        self.assertEqual(exclusion, kernel.call_args.args[6])
+        np.testing.assert_allclose(
+            actual, expected, rtol=2e-5, atol=2e-5, equal_nan=True
+        )
+        positions = np.arange(subsequences)
+        excluded = np.abs(positions[:, None] - positions[None, :]) < exclusion
+        self.assertTrue(np.all(np.isnan(actual[excluded])))
+
+    def test_threshold_equality_and_euclidean_conversion(self):
+        cases = (
+            (
+                1.0,
+                np.array([-1.0, 1.0, -1.0, 1.0], dtype=np.float32),
+                np.array([-1.0, 1.0, -1.0, 1.0], dtype=np.float32),
+            ),
+            (
+                0.0,
+                np.array([1.0, 1.0, -1.0, -1.0], dtype=np.float32),
+                np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32),
+            ),
+            (
+                -1.0,
+                np.array([-1.0, 1.0, -1.0, 1.0], dtype=np.float32),
+                np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32),
+            ),
+        )
+
+        for correlation, a, b in cases:
+            with self.subTest(correlation=correlation):
+                pearson = mp.abjoin_matrix(
+                    a,
+                    b,
+                    4,
+                    mheight=1,
+                    mwidth=1,
+                    threshold=correlation,
+                    pearson=True,
+                    precision="single",
+                    gpus=[0],
+                )
+                euclidean = mp.abjoin_matrix(
+                    a,
+                    b,
+                    4,
+                    mheight=1,
+                    mwidth=1,
+                    threshold=correlation,
+                    pearson=False,
+                    precision="single",
+                    gpus=[0],
+                )
+
+                self.assertAlmostEqual(correlation, float(pearson[0, 0]))
+                self.assertAlmostEqual(
+                    np.sqrt(8.0 * (1.0 - correlation)),
+                    float(euclidean[0, 0]),
+                )
+
+    def test_recurrence_storage_remains_linear(self):
+        rng = np.random.default_rng(1028)
+        series = rng.normal(size=10_000).astype(np.float32)
+        m = 1024
+        captured = {}
+
+        def inspect_preparation(
+            prepared_a,
+            prepared_b,
+            _m,
+            rows,
+            cols,
+            self_join,
+            exclusion,
+            _row_edges,
+            _col_edges,
+        ):
+            self.assertIs(prepared_a, prepared_b)
+            self.assertTrue(self_join)
+            self.assertEqual((m + 3) // 4, exclusion)
+            self.assertIsNone(prepared_a.windows)
+            self.assertIsNone(prepared_a.valid)
+            arrays = (
+                prepared_a.recurrence_clean,
+                prepared_a.recurrence_means,
+                prepared_a.recurrence_inv_norm,
+                prepared_a.recurrence_df,
+                prepared_a.recurrence_dg,
+            )
+            captured["elements"] = sum(int(array.size) for array in arrays)
+            return np.full((rows, cols), -2.0, dtype=np.float32)
+
+        with (
+            mock.patch.object(
+                core,
+                "_prepare_series",
+                side_effect=AssertionError(
+                    "normalized windows were materialized"
+                ),
+            ),
+            mock.patch.object(
+                _metal_matrix,
+                "matrix_summary",
+                side_effect=inspect_preparation,
+            ),
+        ):
+            summary = mp.selfjoin_matrix(
+                series,
+                m,
+                mheight=3,
+                mwidth=4,
+                threshold=-1.0,
+                pearson=True,
+                precision="single",
+                gpus=[0],
+            )
+
+        self.assertTrue(np.all(np.isnan(summary)))
+        self.assertLessEqual(captured["elements"], 5 * series.size)
+
+    def test_cpu_and_higher_precision_keep_portable_path(self):
+        series = np.random.default_rng(28).normal(size=64).astype(np.float32)
+
+        with mock.patch.object(_metal_matrix, "matrix_summary") as kernel:
             mp.selfjoin_matrix(
                 series,
                 8,
@@ -94,9 +300,66 @@ class MetalMatrixSummaryTests(unittest.TestCase):
                 mwidth=5,
                 pearson=True,
                 precision="single",
-                gpus=[0],
+                gpus=[],
             )
+            for precision in ("double", "ultra"):
+                mp.selfjoin_matrix(
+                    series,
+                    8,
+                    mheight=5,
+                    mwidth=5,
+                    pearson=True,
+                    precision=precision,
+                )
+
         kernel.assert_not_called()
+
+    def test_high_offset_non_float32_input_keeps_portable_path(self):
+        offsets = np.array(
+            [0, 16, 32, 64, 128, 80, 48, 144, 96, 176, 112, 208],
+            dtype=np.float64,
+        )
+        series = 1e8 + offsets
+        options = {
+            "mheight": 3,
+            "mwidth": 3,
+            "pearson": True,
+            "precision": "single",
+        }
+        expected = mp.selfjoin_matrix(series, 4, gpus=[], **options)
+
+        with mock.patch.object(_metal_matrix, "matrix_summary") as kernel:
+            actual = mp.selfjoin_matrix(series, 4, gpus=[0], **options)
+
+        kernel.assert_not_called()
+        np.testing.assert_allclose(actual, expected, equal_nan=True)
+
+    def test_extreme_float32_magnitudes_fall_back_safely(self):
+        a = np.array(
+            [1e20, -1e20, 5e19, -5e19, 8e19, -8e19, 3e19, -3e19],
+            dtype=np.float32,
+        )
+        b = a[::-1].copy()
+        options = {
+            "mheight": 2,
+            "mwidth": 2,
+            "threshold": -1.0,
+            "pearson": True,
+            "precision": "single",
+        }
+        expected = mp.abjoin_matrix(a, b, 4, gpus=[], **options)
+
+        with (
+            mock.patch.object(_metal_matrix, "matrix_summary") as kernel,
+            mock.patch.object(
+                core, "_prepare_series", wraps=core._prepare_series
+            ) as portable_preparation,
+        ):
+            actual = mp.abjoin_matrix(a, b, 4, gpus=[0], **options)
+
+        kernel.assert_not_called()
+        self.assertEqual(2, portable_preparation.call_count)
+        np.testing.assert_allclose(actual, expected, equal_nan=True)
 
 
 if __name__ == "__main__":
