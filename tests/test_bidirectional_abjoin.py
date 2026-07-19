@@ -39,7 +39,9 @@ class BidirectionalABJoinTests(_BidirectionalAssertions, unittest.TestCase):
         expected = self._directional_results(a, b, 8, **options)
 
         with mock.patch.object(
-            core, "_iterate_blocks", wraps=core._iterate_blocks
+            core,
+            "_iterate_tiled_blocks",
+            wraps=core._iterate_tiled_blocks,
         ) as traversal:
             actual = mp.abjoin_bidirectional(a, b, 8, **options)
 
@@ -71,14 +73,18 @@ class BidirectionalABJoinTests(_BidirectionalAssertions, unittest.TestCase):
         a = np.tile(pattern, 9)
         b = np.tile(pattern, 10)
 
-        result_a, result_b = mp.abjoin_bidirectional(
-            a,
-            b,
-            4,
-            pearson=True,
-            precision="double",
-            gpus=[],
-        )
+        with mock.patch.object(
+            core, "_similarity_tile_budget_bytes", return_value=8 * 1024
+        ):
+            result_a, result_b = mp.abjoin_bidirectional(
+                a,
+                b,
+                4,
+                pearson=True,
+                precision="double",
+                gpus=[],
+                max_tile_size=1024,
+            )
 
         np.testing.assert_array_equal(
             result_a[1], np.arange(result_a[1].size) % pattern.size
@@ -86,6 +92,67 @@ class BidirectionalABJoinTests(_BidirectionalAssertions, unittest.TestCase):
         np.testing.assert_array_equal(
             result_b[1], np.arange(result_b[1].size) % pattern.size
         )
+
+    def test_tiny_budget_bounds_both_axes_and_matches_directional_joins(self):
+        rng = np.random.default_rng(2723)
+        a = rng.normal(size=120).astype(np.float64)
+        b = rng.normal(size=136).astype(np.float64)
+        m = 16
+        budget = 8 * 1024
+        options = {
+            "pearson": True,
+            "precision": "double",
+            "gpus": [],
+            "max_tile_size": 1024,
+        }
+        expected = self._directional_results(a, b, m, **options)
+        tiles = []
+        original_iterator = core._iterate_tiled_blocks
+
+        def record_tiles(*args, **kwargs):
+            for tile in original_iterator(*args, **kwargs):
+                tiles.append(tile)
+                yield tile
+
+        with (
+            mock.patch.object(
+                core,
+                "_similarity_tile_budget_bytes",
+                return_value=budget,
+            ),
+            mock.patch.object(
+                core,
+                "_iterate_tiled_blocks",
+                side_effect=record_tiles,
+            ) as traversal,
+        ):
+            tile_rows, tile_columns = core._portable_tile_shape(
+                b.size - m + 1,
+                a.size - m + 1,
+                m,
+                mx.float64,
+                1024,
+            )
+            actual = mp.abjoin_bidirectional(a, b, m, **options)
+
+        traversal.assert_called_once()
+        self.assertGreater(len(tiles), 2)
+        self.assertLess(tile_rows, b.size - m + 1)
+        self.assertLess(tile_columns, a.size - m + 1)
+        for tile in tiles:
+            rows, columns = tile.values.shape
+            self.assertLessEqual(rows, tile_rows)
+            self.assertLessEqual(columns, tile_columns)
+            self.assertLessEqual(
+                core._estimate_similarity_tile_bytes(
+                    rows,
+                    columns,
+                    m,
+                    np.dtype(np.float64).itemsize,
+                ),
+                budget,
+            )
+        self._assert_matches_directional(actual, expected)
 
     def test_aligned_exclusion_matches_both_directional_joins(self):
         rng = np.random.default_rng(1313)
@@ -120,6 +187,8 @@ class BidirectionalABJoinTests(_BidirectionalAssertions, unittest.TestCase):
             mp.abjoin_bidirectional(a.reshape(4, 4), b, 3)
         with self.assertRaisesRegex(TypeError, "boolean-compatible"):
             mp.abjoin_bidirectional(a, b, 3, allow_trivial_match="false")
+        with self.assertRaisesRegex(ValueError, "must be at least 1024"):
+            mp.abjoin_bidirectional(a, b, 3, max_tile_size=1023)
         with self.assertRaisesRegex(ValueError, "Concurrent CPU and Metal"):
             mp.abjoin_bidirectional(a, b, 3, gpus=[0], threads=1)
 
@@ -215,6 +284,46 @@ class MetalBidirectionalABJoinTests(
         expected = self._directional_results(a, b, m, **options)
 
         self._assert_matches_directional(actual, expected)
+
+    def test_restrictive_and_default_tile_ceilings_bypass_join_wide_kernel(
+        self,
+    ):
+        a = np.arange(1025, dtype=np.float32)
+        b = np.arange(1031, dtype=np.float32)
+        options = {
+            "pearson": True,
+            "precision": "single",
+            "gpus": [0],
+        }
+
+        with mock.patch.object(
+            _metal_1nn,
+            "bidirectional_best_match",
+            side_effect=AssertionError("join-wide Metal bypassed ceiling"),
+        ) as explicit_kernel:
+            explicit = mp.abjoin_bidirectional(
+                a, b, 3, max_tile_size=1024, **options
+            )
+        explicit_kernel.assert_not_called()
+
+        with (
+            mock.patch.object(
+                core, "_default_max_tile_size", return_value=1024
+            ),
+            mock.patch.object(
+                _metal_1nn,
+                "bidirectional_best_match",
+                side_effect=AssertionError(
+                    "join-wide Metal bypassed default ceiling"
+                ),
+            ) as default_kernel,
+        ):
+            automatic = mp.abjoin_bidirectional(a, b, 3, **options)
+        default_kernel.assert_not_called()
+
+        self._assert_matches_directional(automatic, explicit)
+        self.assertEqual((a.size - 2,), explicit[0][0].shape)
+        self.assertEqual((b.size - 2,), explicit[1][0].shape)
 
 
 if __name__ == "__main__":
