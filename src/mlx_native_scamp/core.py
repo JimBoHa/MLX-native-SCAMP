@@ -1243,6 +1243,35 @@ def _sum_threshold_profile(
     )
 
 
+def _convert_matrix_summary(
+    summary: np.ndarray,
+    m: int,
+    pearson: bool,
+    threshold: float,
+) -> np.ndarray:
+    summary = np.asarray(summary, dtype=np.float32)
+    summary[summary < -1.0] = np.nan
+    summary[summary < threshold] = np.nan
+    if pearson:
+        return summary
+    out = np.sqrt(np.maximum(2.0 * m * (1.0 - summary), 0.0)).astype(np.float32)
+    out[np.isnan(summary)] = np.nan
+    return out
+
+
+def _matrix_bin_edges(subsequences: int, bins: int) -> np.ndarray:
+    """Return SCAMP's ceil-spaced matrix-summary bin boundaries."""
+
+    return np.fromiter(
+        (
+            (index * subsequences + bins - 1) // bins
+            for index in range(bins + 1)
+        ),
+        dtype=np.int64,
+        count=bins + 1,
+    )
+
+
 def _metal_sum_workload_is_worthwhile(
     column_subsequences: int,
     row_subsequences: int,
@@ -1394,8 +1423,8 @@ def _metal_sum_is_worthwhile(
 
 
 def _matrix_summary(
-    prepared_a: TiledSeries,
-    prepared_b: TiledSeries,
+    prepared_a: PreparedSeries | TiledSeries,
+    prepared_b: PreparedSeries | TiledSeries,
     m: int,
     pearson: bool,
     threshold: float,
@@ -1403,15 +1432,37 @@ def _matrix_summary(
     cols: int,
     self_join: bool,
     exclusion: int,
-    tile_rows: int,
-    tile_columns: int,
+    *,
+    use_metal_kernel: bool = False,
+    tile_rows: int | None = None,
+    tile_columns: int | None = None,
 ) -> np.ndarray:
-    row_edges = np.ceil(
-        np.arange(rows + 1) * prepared_b.subsequences / rows
-    ).astype(int)
-    col_edges = np.ceil(
-        np.arange(cols + 1) * prepared_a.subsequences / cols
-    ).astype(int)
+    row_edges = _matrix_bin_edges(prepared_b.subsequences, rows)
+    col_edges = _matrix_bin_edges(prepared_a.subsequences, cols)
+    if use_metal_kernel:
+        from ._metal_matrix import matrix_summary
+
+        summary = matrix_summary(
+            prepared_a,
+            prepared_b,
+            m,
+            rows,
+            cols,
+            self_join,
+            exclusion,
+            row_edges,
+            col_edges,
+        )
+        return _convert_matrix_summary(summary, m, pearson, threshold)
+
+    if not isinstance(prepared_a, TiledSeries) or not isinstance(
+        prepared_b, TiledSeries
+    ):
+        raise TypeError("portable matrix summaries require tiled series inputs")
+    if tile_rows is None or tile_columns is None:
+        raise TypeError(
+            "portable matrix summaries require explicit tile dimensions"
+        )
     col_ranges = [(int(col_edges[c]), int(col_edges[c + 1])) for c in range(cols)]
     summary = mx.full((rows, cols), SENTINEL, dtype=prepared_a.values.dtype)
     scheduler = ReducerScheduler()
@@ -1463,15 +1514,12 @@ def _matrix_summary(
         scheduler.schedule(summary)
 
     scheduler.finish()
-    summary = np.asarray(summary, dtype=np.float32)
-    summary[summary < -1.0] = np.nan
-    if threshold is not None:
-        summary[summary < threshold] = np.nan
-    if pearson:
-        return summary.astype(np.float32)
-    out = np.sqrt(np.maximum(2.0 * m * (1.0 - summary), 0.0)).astype(np.float32)
-    out[np.isnan(summary)] = np.nan
-    return out
+    return _convert_matrix_summary(
+        np.asarray(summary, dtype=np.float32),
+        m,
+        pearson,
+        threshold,
+    )
 
 
 def _knn_profile(
@@ -1578,6 +1626,7 @@ def _run_profile(
     k: int | None = None,
     max_tile_size: int | None = None,
     use_metal_1nn: bool = False,
+    use_metal_matrix: bool = False,
     use_metal_sum: bool = False,
 ):
     m = _normalize_window_size(m)
@@ -1648,12 +1697,30 @@ def _run_profile(
             self_join,
         )
     )
+    matrix_recurrence = (
+        profile == "matrix"
+        and use_metal_matrix
+        and float32_sources
+        and join_fits_tile
+    )
+    if matrix_recurrence:
+        from ._metal_matrix import indexing_is_safe
+
+        matrix_recurrence = indexing_is_safe(
+            subsequences_a,
+            subsequences_b,
+            m,
+            mheight,
+            mwidth,
+            self_join,
+            exclusion,
+        )
     if (
         profile in {"1nn", "1nn_value", "1nn_bidirectional"}
         and use_metal_1nn
         and float32_sources
         and join_fits_tile
-    ) or sum_recurrence:
+    ) or sum_recurrence or matrix_recurrence:
         recurrence_a = _prepare_metal_recurrence(series_a, m)
         recurrence_b = (
             recurrence_a
@@ -1694,14 +1761,27 @@ def _run_profile(
                     exclusion,
                     True,
                 )
-            return _sum_threshold_profile(
+            if profile == "sum":
+                return _sum_threshold_profile(
+                    recurrence_a,
+                    recurrence_b,
+                    m,
+                    threshold,
+                    self_join,
+                    exclusion,
+                    True,
+                )
+            return _matrix_summary(
                 recurrence_a,
                 recurrence_b,
                 m,
+                pearson,
                 threshold,
+                mheight,
+                mwidth,
                 self_join,
                 exclusion,
-                True,
+                use_metal_kernel=True,
             )
 
     # Portable reducers normalize only overlapping tile segments. The full
@@ -1777,8 +1857,8 @@ def _run_profile(
             mwidth,
             self_join,
             exclusion,
-            tile_rows,
-            tile_columns,
+            tile_rows=tile_rows,
+            tile_columns=tile_columns,
         )
     if profile == "knn":
         if k is None or k <= 0:
@@ -1833,6 +1913,7 @@ def _run_profile_with_resources(params: dict[str, Any], *args: Any, **kwargs: An
             precision=params["precision"],
             max_tile_size=params["max_tile_size"],
             use_metal_1nn=use_metal_1nn,
+            use_metal_matrix=use_metal_1nn,
             use_metal_sum=use_metal_1nn,
             **kwargs,
         )

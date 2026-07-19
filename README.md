@@ -106,6 +106,11 @@ remain follow-up work.
   custom Metal kernels that follow SCAMP's rolling-covariance diagonal
   algorithm. Other profiles and execution modes use the portable MLX
   implementation.
+- Single-precision matrix summaries whose inputs fit the active
+  `max_tile_size` ceiling also use the diagonal recurrence on Metal, atomically
+  reducing directly into the requested pooled matrix instead of materializing
+  similarity blocks. Oversized, CPU, and higher-precision summaries retain the
+  bounded portable implementation.
 - Eligible native float32 joins are translated by a finite per-series origin
   after quantization, then prepared with stable float64 CPU statistics. The
   rolling recurrence is vectorized in bounded NumPy blocks with high-accuracy
