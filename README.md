@@ -42,10 +42,13 @@ profile, index = mp.selfjoin(series, 128, pearson=True, precision="single")
 - Single-precision `selfjoin` and `abjoin` use a custom Metal kernel that
   follows SCAMP's rolling-covariance diagonal algorithm. Other profiles and
   execution modes use the portable MLX implementation.
-- The diagonal kernel is selected only for native float32 inputs whose raw
-  rolling covariance is safe in float32. Non-float32 and extreme-magnitude
-  inputs retain the normalized-window path so precision and overflow fixes can
-  be applied there without being bypassed.
+- Eligible native float32 joins are translated by a finite per-series origin
+  after quantization, then prepared with compensated float64 CPU statistics.
+  Only five linear-sized float32 recurrence arrays are sent to Metal; an
+  `(subsequences, window)` normalized-window matrix is not constructed.
+- The recurrence path is selected only when its conservative float32 bound is
+  safe. Non-float32, unstable-precompute, and extreme-range inputs retain the
+  normalized-window path rather than risking overflow or corrupt results.
 - The 1NN kernel keeps profile output state linear in the series length, but it
   currently walks each diagonal in one Metal dispatch. Checkpointed/tiled
   dispatch—and integration with the separate `max_tile_size` work—remains a
