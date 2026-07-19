@@ -134,6 +134,11 @@ remain follow-up work.
   allocator internals; the row/column dimensional ceilings are enforced.
   Linear input, recurrence, reducer, and output storage is outside this
   transient tile target.
+- `mlx_native_scamp.selfjoin_1nn` and `abjoin_1nn` expose SCAMP's index-free
+  `1NN` profile for native integrations. They use the same bounded tile
+  ceilings as indexed 1NN while omitting portable index reduction and Metal's
+  second index-selection pass. The strict `pyscamp` compatibility namespace
+  remains limited to the upstream Python exports.
 - The 1NN kernel keeps profile output state linear in the series length, but it
   currently walks each diagonal in one Metal dispatch. A `max_tile_size`
   ceiling that cannot contain the join selects the bounded portable path;
