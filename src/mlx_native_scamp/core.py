@@ -137,11 +137,19 @@ def _prepare_series(values: Any, m: int) -> PreparedSeries:
     finite = mx.isfinite(x)
     clean = mx.where(finite, x, mx.zeros_like(x))
     windows = _window_view(clean, m)
-    means = mx.mean(windows, axis=1, keepdims=True)
-    centered = windows - means
+    # Pearson correlation is invariant to an independent positive scale for
+    # each window.  Scaling per window prevents overflow without allowing one
+    # extreme value elsewhere in the series to underflow ordinary windows.
+    scales = mx.max(mx.abs(windows), axis=1, keepdims=True)
+    safe_scales = mx.where(scales > 0.0, scales, mx.ones_like(scales))
+    scaled_windows = windows / safe_scales
+    means = mx.mean(scaled_windows, axis=1, keepdims=True)
+    centered = scaled_windows - means
     norms_sq = mx.sum(centered * centered, axis=1)
-    valid = _sliding_valid_mask(finite, m) & (norms_sq > FLATNESS_EPSILON)
-    inv_norm = mx.where(valid, 1.0 / mx.sqrt(mx.maximum(norms_sq, FLATNESS_EPSILON)), 0.0)
+    scaled_flatness_limit = np.sqrt(FLATNESS_EPSILON) / safe_scales[:, 0]
+    valid = _sliding_valid_mask(finite, m) & (mx.sqrt(norms_sq) > scaled_flatness_limit)
+    safe_norms_sq = mx.where(valid, norms_sq, mx.ones_like(norms_sq))
+    inv_norm = mx.where(valid, 1.0 / mx.sqrt(safe_norms_sq), 0.0)
     normalized = centered * inv_norm[:, None]
     means = means[:, 0]
     df = mx.concatenate(
