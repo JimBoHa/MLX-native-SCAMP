@@ -5,6 +5,8 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from ._exclusion import self_join_exclusion
+
 
 _INPUT_NAMES = [
     "clean_a",
@@ -169,7 +171,7 @@ def best_match(
 
     n_a = prepared_a.subsequences
     n_b = prepared_b.subsequences
-    exclusion = (m + 3) // 4 if self_join else 0
+    exclusion = self_join_exclusion(m) if self_join else 0
     diagonal_count = n_a - exclusion if self_join else n_a + n_b - 1
     if diagonal_count <= 0:
         return (
