@@ -282,6 +282,14 @@ def _sysctl_text(name: str) -> str | None:
             return None
         libc = ctypes.CDLL(None, use_errno=True)
         sysctlbyname = libc.sysctlbyname
+        sysctlbyname.argtypes = (
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        )
+        sysctlbyname.restype = ctypes.c_int
         size = ctypes.c_size_t()
         encoded_name = name.encode("ascii")
         if sysctlbyname(
